@@ -1,0 +1,355 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Opname;
+use App\Models\Ingredient;
+use App\Models\Outlet;
+use Illuminate\Http\Request;
+
+class OpnameController extends Controller
+{
+    public function index(Request $request)
+    {
+        $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
+
+        $query = Opname::with(['ingredient', 'user', 'creator', 'updater', 'outlet'])
+            ->where('period_from', $request->from ?? now()->startOfMonth()->toDateString())
+            ->where('period_to',   $request->to   ?? now()->toDateString());
+
+        if ($outletId) {
+            $query->where('outlet_id', $outletId);
+        }
+
+        return response()->json($query->get()->keyBy('ingredient_id'));
+    }
+
+    public function upsert(Request $request)
+    {
+        $data = $request->validate([
+            'period_from'   => 'required|date',
+            'period_to'     => 'required|date|after_or_equal:period_from',
+            'ingredient_id' => 'required|exists:ingredients,id',
+            'outlet_id'     => 'nullable|exists:outlets,id',
+            'opname_no'     => 'nullable|string|max:50',
+            'opname_date'   => 'nullable|date',
+            'actual_qty'    => 'nullable|numeric|min:0',
+            'reason'        => 'nullable|string|max:255',
+            'approver'      => 'nullable|string|max:100',
+            'notes'         => 'nullable|string',
+            'is_closed'     => 'nullable|boolean',
+        ]);
+
+        $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? 1;
+
+        $existing = Opname::where('period_from', $data['period_from'])
+            ->where('period_to', $data['period_to'])
+            ->where('ingredient_id', $data['ingredient_id'])
+            ->where('outlet_id', $outletId)
+            ->first();
+
+        $opnameNo = $data['opname_no'] ?? ($existing?->opname_no);
+        if (!$opnameNo) {
+            $opnameDate = $data['opname_date'] ?? now()->toDateString();
+            $dateClean = str_replace('-', '', $opnameDate);
+            $countToday = Opname::whereDate('created_at', now()->toDateString())
+                ->whereNotNull('opname_no')
+                ->distinct('opname_no')
+                ->count('opname_no') + 1;
+            $opnameNo = 'OPN-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
+        }
+
+        $updateData = [
+            ...$data,
+            'opname_no'   => $opnameNo,
+            'opname_date' => $data['opname_date'] ?? ($existing?->opname_date ?? now()->toDateString()),
+            'outlet_id'   => $outletId,
+            'user_id'     => $request->user()->id,
+        ];
+
+        if ($existing) {
+            $updateData['updated_by'] = $request->user()->id;
+        } else {
+            $updateData['created_by'] = $request->user()->id;
+        }
+
+        $opname = Opname::updateOrCreate(
+            [
+                'period_from'   => $data['period_from'],
+                'period_to'     => $data['period_to'],
+                'ingredient_id' => $data['ingredient_id'],
+                'outlet_id'     => $outletId,
+            ],
+            $updateData
+        );
+
+        $opname->load(['ingredient', 'user', 'creator', 'updater', 'outlet']);
+        return response()->json($opname);
+    }
+
+    public function bulkUpsert(Request $request)
+    {
+        $request->validate([
+            'period_from'   => 'required|date',
+            'period_to'     => 'required|date',
+            'outlet_id'     => 'nullable|exists:outlets,id',
+            'opname_no'     => 'nullable|string|max:50',
+            'opname_date'   => 'nullable|date',
+            'approver'      => 'nullable|string|max:100',
+            'notes'         => 'nullable|string',
+            'items'         => 'required|array',
+            'items.*.ingredient_id' => 'required|exists:ingredients,id',
+            'items.*.actual_qty'    => 'nullable|numeric|min:0',
+            'items.*.reason'        => 'nullable|string',
+            'items.*.approver'      => 'nullable|string',
+            'items.*.notes'         => 'nullable|string',
+        ]);
+
+        $outletId = $request->outlet_id ?? $request->user()->outlet_id ?? 1;
+
+        // Check if any item in this period & outlet already has an opname_no
+        $existingSession = Opname::where('period_from', $request->period_from)
+            ->where('period_to', $request->period_to)
+            ->where('outlet_id', $outletId)
+            ->whereNotNull('opname_no')
+            ->first();
+
+        $opnameNo = $request->opname_no ?? ($existingSession?->opname_no);
+        $opnameDate = $request->opname_date ?? ($existingSession?->opname_date ?? now()->toDateString());
+
+        if (!$opnameNo) {
+            $dateClean = str_replace('-', '', $opnameDate);
+            $countToday = Opname::whereDate('created_at', now()->toDateString())
+                ->whereNotNull('opname_no')
+                ->distinct('opname_no')
+                ->count('opname_no') + 1;
+            $opnameNo = 'OPN-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
+        }
+
+        $results = [];
+        foreach ($request->items as $item) {
+            $existing = Opname::where('period_from', $request->period_from)
+                ->where('period_to', $request->period_to)
+                ->where('ingredient_id', $item['ingredient_id'])
+                ->where('outlet_id', $outletId)
+                ->first();
+
+            $updateData = [
+                'opname_no'   => $opnameNo,
+                'opname_date' => $opnameDate,
+                'actual_qty'  => $item['actual_qty'] ?? null,
+                'reason'      => $item['reason'] ?? ($request->reason ?? null),
+                'approver'    => $item['approver'] ?? ($request->approver ?? null),
+                'notes'       => $item['notes'] ?? ($request->notes ?? null),
+                'outlet_id'   => $outletId,
+                'user_id'     => $request->user()->id,
+            ];
+
+            if ($existing) {
+                $updateData['updated_by'] = $request->user()->id;
+            } else {
+                $updateData['created_by'] = $request->user()->id;
+            }
+
+            $opname = Opname::updateOrCreate(
+                [
+                    'period_from'   => $request->period_from,
+                    'period_to'     => $request->period_to,
+                    'ingredient_id' => $item['ingredient_id'],
+                    'outlet_id'     => $outletId,
+                ],
+                $updateData
+            );
+            $opname->load(['ingredient', 'user', 'creator', 'updater', 'outlet']);
+            $results[] = $opname;
+        }
+
+        return response()->json([
+            'message'    => 'Data opname fisik berhasil disimpan!',
+            'opname_no'  => $opnameNo,
+            'items'      => $results,
+        ]);
+    }
+
+    /**
+     * Get list of historical Opname sessions with summary variance
+     */
+    public function history(Request $request)
+    {
+        $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
+
+        $query = Opname::with(['outlet', 'creator', 'user'])
+            ->whereNotNull('opname_no')
+            ->orderByDesc('opname_date')
+            ->orderByDesc('id');
+
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $query->where('outlet_id', $outletId);
+        }
+
+        $allOpnames = $query->get();
+
+        // Group by opname_no
+        $grouped = $allOpnames->groupBy('opname_no');
+
+        $sessions = [];
+        $reportCtrl = app(ReportController::class);
+
+        foreach ($grouped as $opnameNo => $items) {
+            $first = $items->first();
+            $outId = $first->outlet_id;
+            $from = $first->period_from;
+            $to = $first->period_to;
+
+            // Compute quick variance metrics using report helper
+            $varianceRows = $reportCtrl->buildVarianceArray($from, $to, $outId);
+            $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
+
+            $totalItems = $items->count();
+            $itemsCounted = $items->filter(fn($i) => $i->actual_qty !== null)->count();
+            $surplusCount = 0;
+            $deficitCount = 0;
+            $matchCount = 0;
+            $netVarianceValue = 0;
+
+            foreach ($items as $it) {
+                $var = $varByIng->get($it->ingredient_id);
+                if ($var && $var['variance_value'] !== null) {
+                    $netVarianceValue += $var['variance_value'];
+                    if ($var['variance_qty'] > 0) {
+                        $surplusCount++;
+                    } elseif ($var['variance_qty'] < 0) {
+                        $deficitCount++;
+                    } else {
+                        $matchCount++;
+                    }
+                }
+            }
+
+            $sessions[] = [
+                'opname_no'          => $opnameNo,
+                'opname_date'        => $first->opname_date ?: $first->period_to,
+                'period_from'        => $from,
+                'period_to'          => $to,
+                'outlet_id'          => $outId,
+                'outlet_name'        => $first->outlet?->name ?? "Outlet #{$outId}",
+                'created_by_name'    => $first->creator?->name ?? ($first->user?->name ?? 'Staff Gudang'),
+                'approver'           => $first->approver,
+                'notes'              => $first->notes,
+                'total_items'        => $totalItems,
+                'items_counted'      => $itemsCounted,
+                'surplus_count'      => $surplusCount,
+                'deficit_count'      => $deficitCount,
+                'match_count'        => $matchCount,
+                'net_variance_value' => round($netVarianceValue, 0),
+                'is_closed'          => (bool) $first->is_closed,
+                'created_at'         => $first->created_at?->format('Y-m-d H:i:s'),
+            ];
+        }
+
+        return response()->json($sessions);
+    }
+
+    /**
+     * Get detailed Berita Acara session data for a specific opname_no
+     */
+    public function showSession($opnameNo)
+    {
+        $opnames = Opname::with(['ingredient', 'outlet', 'creator', 'user', 'updater'])
+            ->where('opname_no', $opnameNo)
+            ->get();
+
+        if ($opnames->isEmpty()) {
+            return response()->json(['message' => 'Dokumen sesi opname tidak ditemukan.'], 404);
+        }
+
+        $first = $opnames->first();
+        $outId = $first->outlet_id;
+        $from = $first->period_from;
+        $to = $first->period_to;
+
+        $reportCtrl = app(ReportController::class);
+        $varianceRows = $reportCtrl->buildVarianceArray($from, $to, $outId);
+
+        $opnamesByIng = $opnames->keyBy('ingredient_id');
+
+        $detailedItems = [];
+        $totalSurplusValue = 0;
+        $totalDeficitValue = 0;
+        $totalWasteValue = 0;
+        $totalVarianceValue = 0;
+        $statusCounts = ['NORMAL' => 0, 'WASPADA' => 0, 'TIDAK WAJAR' => 0];
+
+        foreach ($varianceRows as $vr) {
+            $ingId = $vr['ingredient']->id;
+            $opnRecord = $opnamesByIng->get($ingId);
+
+            $varVal = $vr['variance_value'] ?? 0;
+            $totalVarianceValue += $varVal;
+            if ($varVal > 0) $totalSurplusValue += $varVal;
+            if ($varVal < 0) $totalDeficitValue += abs($varVal);
+            if (isset($vr['waste_value'])) $totalWasteValue += $vr['waste_value'];
+            if ($vr['status'] && isset($statusCounts[$vr['status']])) {
+                $statusCounts[$vr['status']]++;
+            }
+
+            $detailedItems[] = [
+                'ingredient_id'        => $ingId,
+                'code'                 => $vr['ingredient']->code,
+                'name'                 => $vr['ingredient']->name,
+                'category'             => $vr['ingredient']->category,
+                'unit_pakai'           => $vr['ingredient']->unit_pakai,
+                'unit_beli'            => $vr['ingredient']->unit_beli,
+                'konversi'             => $vr['ingredient']->konversi,
+                'harga'                => $vr['ingredient']->harga,
+                'stok_awal_periode'    => $vr['stok_awal_periode'],
+                'pembelian'            => $vr['pembelian'],
+                'pemakaian_teoritis'   => $vr['pemakaian_teoritis'],
+                'waste'                => $vr['waste'],
+                'waste_value'          => $vr['waste_value'] ?? 0,
+                'transfer_in'          => $vr['transfer_in'],
+                'transfer_out'         => $vr['transfer_out'],
+                'stok_akhir_teoritis'  => $vr['stok_akhir_teoritis'],
+                'stok_akhir_aktual'    => $vr['stok_akhir_aktual'],
+                'variance_qty'         => $vr['variance_qty'],
+                'variance_pct'         => $vr['variance_pct'],
+                'variance_value'       => $vr['variance_value'],
+                'status'               => $vr['status'],
+                'reason'               => $opnRecord?->reason ?: $opnRecord?->notes,
+                'approver'             => $opnRecord?->approver,
+                'audit'                => [
+                    'created_at'      => $opnRecord?->created_at?->format('Y-m-d H:i:s'),
+                    'created_by_name' => $opnRecord?->created_by_name ?? ($opnRecord?->user?->name ?? 'Staff'),
+                    'updated_at'      => $opnRecord?->changed_at,
+                    'updated_by_name' => $opnRecord?->changed_by_name,
+                ],
+            ];
+        }
+
+        return response()->json([
+            'session' => [
+                'opname_no'       => $first->opname_no,
+                'opname_date'     => $first->opname_date ?: $first->period_to,
+                'period_from'     => $from,
+                'period_to'       => $to,
+                'outlet_id'       => $outId,
+                'outlet'          => $first->outlet,
+                'created_by_name' => $first->creator?->name ?? ($first->user?->name ?? 'Staff Gudang'),
+                'approver'        => $first->approver,
+                'notes'           => $first->notes,
+                'is_closed'       => (bool) $first->is_closed,
+                'created_at'      => $first->created_at?->format('Y-m-d H:i:s'),
+            ],
+            'summary' => [
+                'total_items'          => count($detailedItems),
+                'items_counted'        => collect($detailedItems)->filter(fn($i) => $i['stok_akhir_aktual'] !== null)->count(),
+                'total_variance_value' => round($totalVarianceValue, 0),
+                'total_surplus_value'  => round($totalSurplusValue, 0),
+                'total_deficit_value'  => round($totalDeficitValue, 0),
+                'total_waste_value'    => round($totalWasteValue, 0),
+                'status_counts'        => $statusCounts,
+            ],
+            'items' => $detailedItems,
+        ]);
+    }
+}

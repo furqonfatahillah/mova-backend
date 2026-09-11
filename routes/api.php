@@ -58,6 +58,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::apiResource('ingredients', IngredientController::class);
     Route::apiResource('menus', MenuController::class);
     Route::post('/menus/{menu}/recipes', [MenuController::class, 'storeRecipe']);
+    Route::post('/menus/{menu}/restock', [MenuController::class, 'restock']);
     Route::apiResource('outlets', OutletController::class);
 
     // Menu Modifiers / Options & Addons

@@ -196,12 +196,6 @@ class TransactionController extends Controller
                 $menu = Menu::findOrFail($it['menu_id']);
                 $recipe = $menu->activeRecipe($data['date']);
 
-                if (!$recipe) {
-                    return response()->json([
-                        'message' => "Menu '{$menu->name}' belum memiliki resep (recipe) aktif untuk tanggal {$data['date']}."
-                    ], 422);
-                }
-
                 $options = $this->resolveModifierOptions($it);
                 $modifierUnitPrice = (float)$options->sum('price');
                 $itemUnitPrice = (float)$menu->price + $modifierUnitPrice;
@@ -267,7 +261,7 @@ class TransactionController extends Controller
                         'date'            => $data['date'],
                         'menu_id'         => $menu->id,
                         'qty'             => $qty,
-                        'recipe_version'  => $recipe->version,
+                        'recipe_version'  => $recipe?->version ?? null,
                         'total_price'     => $prep['net_total'],
                         'subtotal'        => $prep['subtotal'],
                         'discount_id'     => $discInfo['discount_id'],
@@ -318,9 +312,22 @@ class TransactionController extends Controller
                         }
                     }
 
+                    // Deduct stock for DIRECT retail items
+                    if ($orderStatus === 'PAID') {
+                        if ($menu->item_type === 'DIRECT' && $menu->track_stock) {
+                            $menu->decrement('stock', $qty);
+                            if ($outletId) {
+                                $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                                if ($om) {
+                                    $om->decrement('stock', $qty);
+                                }
+                            }
+                        }
+                    }
+
                     // If NOT in a shift and PAID, deduct recipe ingredients immediately via StockMovement
                     // (If in shift, ingredients are aggregated at shift closing; if HOLD, not deducted yet)
-                    if ($orderStatus === 'PAID' && !$shiftId) {
+                    if ($orderStatus === 'PAID' && !$shiftId && $recipe) {
                         foreach ($recipe->items as $item) {
                             StockMovement::create([
                                 'date'           => $data['date'],
@@ -421,10 +428,6 @@ class TransactionController extends Controller
         $menu   = Menu::findOrFail($data['menu_id']);
         $recipe = $menu->activeRecipe($data['date']);
 
-        if (! $recipe) {
-            return response()->json(['message' => 'Menu belum punya recipe aktif.'], 422);
-        }
-
         // Find active shift if not explicitly provided
         $shiftId = $data['shift_id'] ?? null;
         if (!$shiftId) {
@@ -450,7 +453,7 @@ class TransactionController extends Controller
                 'date'           => $data['date'],
                 'menu_id'        => $menu->id,
                 'qty'            => $qty,
-                'recipe_version' => $recipe->version,
+                'recipe_version' => $recipe?->version ?? null,
                 'total_price'    => $totalItemPrice,
                 'amount_paid'    => $orderStatus === 'HOLD' ? 0 : ($data['amount_paid'] ?? null),
                 'change_amount'  => $orderStatus === 'HOLD' ? 0 : ($data['change_amount'] ?? null),
@@ -495,8 +498,21 @@ class TransactionController extends Controller
                 }
             }
 
+            // Deduct stock for DIRECT retail items
+            if ($orderStatus === 'PAID') {
+                if ($menu->item_type === 'DIRECT' && $menu->track_stock) {
+                    $menu->decrement('stock', $qty);
+                    if ($outletId) {
+                        $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                        if ($om) {
+                            $om->decrement('stock', $qty);
+                        }
+                    }
+                }
+            }
+
             // Only create per-transaction stock movement if NOT in a shift and PAID
-            if ($orderStatus === 'PAID' && !$shiftId) {
+            if ($orderStatus === 'PAID' && !$shiftId && $recipe) {
                 foreach ($recipe->items as $item) {
                     StockMovement::create([
                         'date'           => $data['date'],
@@ -714,6 +730,18 @@ class TransactionController extends Controller
                 $t->updated_by = $request->user()->id;
                 $t->save();
 
+                // Deduct stock for DIRECT retail items
+                $menu = $t->menu;
+                if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
+                    $menu->decrement('stock', $t->qty);
+                    if ($outletId) {
+                        $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                        if ($om) {
+                            $om->decrement('stock', $t->qty);
+                        }
+                    }
+                }
+
                 // If not in shift, deduct ingredients immediately via StockMovement
                 if (!$shiftId) {
                     $menu = $t->menu;
@@ -845,7 +873,7 @@ class TransactionController extends Controller
                     'date'           => $date,
                     'menu_id'        => $menu->id,
                     'qty'            => $qty,
-                    'recipe_version' => $recipe?->version ?? 1,
+                    'recipe_version' => $recipe?->version ?? null,
                     'total_price'    => $price * $qty,
                     'customer_name'  => $customerName,
                     'order_type'     => $orderType,
@@ -944,11 +972,23 @@ class TransactionController extends Controller
      */
     private function deductStockForTransaction(Transaction $t, string $orderRef, int $userId)
     {
+        $menu = $t->menu;
+        $outletId = $t->outlet_id;
+
+        // Deduct direct stock for DIRECT retail items
+        if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
+            $menu->decrement('stock', $t->qty);
+            if ($outletId) {
+                $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                if ($om) {
+                    $om->decrement('stock', $t->qty);
+                }
+            }
+        }
+
         if ($t->shift_id) return;
 
         $date = $t->date;
-        $outletId = $t->outlet_id;
-        $menu = $t->menu;
         $recipe = $menu?->activeRecipe($date);
 
         if ($recipe) {

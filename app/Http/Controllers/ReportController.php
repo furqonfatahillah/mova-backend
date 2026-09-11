@@ -186,13 +186,7 @@ class ReportController extends Controller
 
         $result = [];
         foreach ($menus as $m) {
-            $recipe = $m->activeRecipe();
-            $hpp = 0;
-            if ($recipe) {
-                foreach ($recipe->items as $item) {
-                    $hpp += $item->qty * ($item->ingredient->harga / max($item->ingredient->konversi, 1));
-                }
-            }
+            $hpp = (float)$m->calculateHpp();
             $qtyTerjual = $transactions->where('menu_id', $m->id)->sum('qty');
             $varValue   = $varByMenu[$m->id] ?? 0;
             $varPerPorsi = $qtyTerjual > 0 ? $varValue / $qtyTerjual : 0;
@@ -813,7 +807,16 @@ class ReportController extends Controller
         usort($topIngredientsUsage, fn($a, $b) => $b['cost'] <=> $a['cost']);
         $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 8);
 
-        $totalCogs = round($cogsRecipes + $cogsVariance, 2);
+        // Tambahkan HPP barang direct retail (non-resep)
+        $cogsDirectItems = 0.0;
+        foreach ($transactions as $t) {
+            $m = $t->menu;
+            if ($m && ($m->item_type === 'DIRECT' || (!$m->activeRecipe($t->date) && $m->cost_price > 0))) {
+                $cogsDirectItems += (float)($m->cost_price * $t->qty);
+            }
+        }
+
+        $totalCogs = round($cogsRecipes + $cogsVariance + $cogsDirectItems, 2);
         $cogsRatioPct = $netSales > 0 ? round(($totalCogs / $netSales) * 100, 1) : 0;
 
         // Gross Profit (Laba Kotor)

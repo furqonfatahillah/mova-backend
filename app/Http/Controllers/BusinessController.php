@@ -33,7 +33,9 @@ class BusinessController extends Controller
             return response()->json(['message' => 'Unauthorized. Hanya Superadmin Platform yang dapat mengakses seluruh penyewa.'], 403);
         }
 
-        $query = Business::query()->withCount(['outlets', 'users', 'menus', 'ingredients']);
+        $query = Business::query()
+            ->withCount(['outlets', 'users', 'menus', 'ingredients'])
+            ->with(['referredBy.business']);
 
         if ($request->filled('search')) {
             $s = $request->search;
@@ -41,12 +43,26 @@ class BusinessController extends Controller
                 $q->where('name', 'like', "%{$s}%")
                   ->orWhere('owner_name', 'like', "%{$s}%")
                   ->orWhere('email', 'like', "%{$s}%")
-                  ->orWhere('phone', 'like', "%{$s}%");
+                  ->orWhere('phone', 'like', "%{$s}%")
+                  ->orWhere('referral_code_used', 'like', "%{$s}%")
+                  ->orWhereHas('referredBy', function ($rq) use ($s) {
+                      $rq->where('name', 'like', "%{$s}%")
+                         ->orWhere('email', 'like', "%{$s}%")
+                         ->orWhere('referral_code', 'like', "%{$s}%");
+                  });
             });
         }
 
         if ($request->filled('status')) {
             $query->where('status', $request->status);
+        }
+
+        if ($request->filled('has_referral')) {
+            if ($request->has_referral === 'yes' || $request->has_referral === '1') {
+                $query->whereNotNull('referred_by_id');
+            } elseif ($request->has_referral === 'no' || $request->has_referral === '0') {
+                $query->whereNull('referred_by_id');
+            }
         }
 
         return response()->json($query->orderByDesc('id')->get());

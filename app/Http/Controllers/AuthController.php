@@ -27,11 +27,25 @@ class AuthController extends Controller
                 'business_phone'    => 'nullable|string|max:50',
                 'business_address'  => 'nullable|string|max:500',
                 'first_outlet_name' => 'nullable|string|max:255',
+                'referral_code'     => 'nullable|string|max:50',
             ], [
                 'business_name.required' => 'Nama usaha/bisnis wajib diisi.',
             ]);
 
-            $result = DB::transaction(function () use ($data) {
+            // Validate referral code if provided
+            $referrer = null;
+            $cleanReferralCode = null;
+            if (!empty($data['referral_code'])) {
+                $cleanReferralCode = strtoupper(trim($data['referral_code']));
+                $referrer = User::where('referral_code', $cleanReferralCode)->first();
+                if (!$referrer) {
+                    throw ValidationException::withMessages([
+                        'referral_code' => ["Kode referral '{$cleanReferralCode}' tidak ditemukan atau tidak valid."],
+                    ]);
+                }
+            }
+
+            $result = DB::transaction(function () use ($data, $referrer, $cleanReferralCode) {
                 $slug = Str::slug($data['business_name']);
                 $origSlug = $slug;
                 $c = 1;
@@ -42,16 +56,18 @@ class AuthController extends Controller
 
                 // 1. Buat Bisnis / Tenant
                 $business = Business::create([
-                    'name'         => $data['business_name'],
-                    'slug'         => $slug,
-                    'owner_name'   => $data['name'],
-                    'email'        => $data['email'],
-                    'phone'        => $data['business_phone'] ?? null,
-                    'address'      => $data['business_address'] ?? null,
-                    'package_type' => 'pro',
-                    'max_outlets'  => 5,
-                    'status'       => 'active',
-                    'expires_at'   => now()->addMonths(1), // Trial 30 hari
+                    'name'               => $data['business_name'],
+                    'slug'               => $slug,
+                    'owner_name'         => $data['name'],
+                    'email'              => $data['email'],
+                    'phone'              => $data['business_phone'] ?? null,
+                    'address'            => $data['business_address'] ?? null,
+                    'referred_by_id'     => $referrer?->id,
+                    'referral_code_used' => $cleanReferralCode,
+                    'package_type'       => 'pro',
+                    'max_outlets'        => 5,
+                    'status'             => 'active',
+                    'expires_at'         => now()->addMonths(1), // Trial 30 hari
                 ]);
 
                 // 2. Buat Cabang Pertama untuk Bisnis ini
@@ -72,14 +88,15 @@ class AuthController extends Controller
 
                 // 3. Buat User Owner Bisnis
                 $user = User::create([
-                    'business_id' => $business->id,
-                    'outlet_id'   => $outlet->id,
-                    'name'        => $data['name'],
-                    'email'       => $data['email'],
-                    'password'    => Hash::make($data['password']),
-                    'role'        => 'owner_bisnis',
-                    'status'      => 'active',
-                    'approved_at' => now(),
+                    'business_id'    => $business->id,
+                    'outlet_id'      => $outlet->id,
+                    'name'           => $data['name'],
+                    'email'          => $data['email'],
+                    'password'       => Hash::make($data['password']),
+                    'role'           => 'owner_bisnis',
+                    'status'         => 'active',
+                    'referred_by_id' => $referrer?->id,
+                    'approved_at'    => now(),
                 ]);
 
                 $business->update(['created_by' => $user->id]);
@@ -88,8 +105,8 @@ class AuthController extends Controller
                 $token = $user->createToken('pos-token')->plainTextToken;
 
                 return [
-                    'user'     => $user->load(['outlet', 'business']),
-                    'business' => $business,
+                    'user'     => $user->load(['outlet', 'business', 'referredBy']),
+                    'business' => $business->load(['referredBy']),
                     'outlet'   => $outlet,
                     'token'    => $token,
                 ];

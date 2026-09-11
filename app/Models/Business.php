@@ -19,6 +19,8 @@ class Business extends Model
         'package_type',
         'max_outlets',
         'status',
+        'referred_by_id',
+        'referral_code_used',
         'coin_balance',
         'coins_per_transaction',
         'low_coin_threshold',
@@ -44,6 +46,7 @@ class Business extends Model
         'remaining_transactions',
         'is_coin_low',
         'is_coin_out',
+        'referred_by_name',
     ];
 
     public function coinTransactions()
@@ -68,6 +71,16 @@ class Business extends Model
     public function getIsCoinOutAttribute(): bool
     {
         return $this->remaining_transactions <= 0;
+    }
+
+    public function referredBy()
+    {
+        return $this->belongsTo(User::class, 'referred_by_id');
+    }
+
+    public function getReferredByNameAttribute(): ?string
+    {
+        return $this->referredBy?->name;
     }
 
     public function outlets()

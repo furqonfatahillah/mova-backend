@@ -28,6 +28,7 @@ class CoinPlatformController extends Controller
         $this->authorizeSuperadmin($request);
 
         $businesses = Business::withCount('outlets')
+            ->with(['referredBy.business'])
             ->orderByDesc('id')
             ->get();
 

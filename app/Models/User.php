@@ -28,6 +28,8 @@ class User extends Authenticatable
         'approved_at',
         'outlet_id',
         'business_id',
+        'referral_code',
+        'referred_by_id',
     ];
 
     protected $appends = [
@@ -63,6 +65,39 @@ class User extends Authenticatable
             'approved_at'       => 'datetime',
             'password'          => 'hashed',
         ];
+    }
+
+    protected static function booted(): void
+    {
+        static::creating(function ($user) {
+            if (empty($user->referral_code)) {
+                $user->referral_code = static::generateUniqueReferralCode();
+            }
+        });
+    }
+
+    public static function generateUniqueReferralCode(): string
+    {
+        do {
+            $code = 'REF-' . strtoupper(\Illuminate\Support\Str::random(6));
+        } while (static::where('referral_code', $code)->exists());
+
+        return $code;
+    }
+
+    public function referredBy()
+    {
+        return $this->belongsTo(User::class, 'referred_by_id');
+    }
+
+    public function referredBusinesses()
+    {
+        return $this->hasMany(Business::class, 'referred_by_id');
+    }
+
+    public function referredUsers()
+    {
+        return $this->hasMany(User::class, 'referred_by_id');
     }
 
     public function approver()

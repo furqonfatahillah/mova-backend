@@ -317,10 +317,12 @@ class TransactionController extends Controller
                         if ($menu->item_type === 'DIRECT' && $menu->track_stock) {
                             $menu->decrement('stock', $qty);
                             if ($outletId) {
-                                $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                                if ($om) {
-                                    $om->decrement('stock', $qty);
-                                }
+                                try {
+                                    $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                                    if ($om) {
+                                        $om->decrement('stock', $qty);
+                                    }
+                                } catch (\Throwable $e) {}
                             }
                         }
                     }
@@ -503,10 +505,12 @@ class TransactionController extends Controller
                 if ($menu->item_type === 'DIRECT' && $menu->track_stock) {
                     $menu->decrement('stock', $qty);
                     if ($outletId) {
-                        $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                        if ($om) {
-                            $om->decrement('stock', $qty);
-                        }
+                        try {
+                            $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                            if ($om) {
+                                $om->decrement('stock', $qty);
+                            }
+                        } catch (\Throwable $e) {}
                     }
                 }
             }
@@ -735,10 +739,12 @@ class TransactionController extends Controller
                 if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
                     $menu->decrement('stock', $t->qty);
                     if ($outletId) {
-                        $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                        if ($om) {
-                            $om->decrement('stock', $t->qty);
-                        }
+                        try {
+                            $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                            if ($om) {
+                                $om->decrement('stock', $t->qty);
+                            }
+                        } catch (\Throwable $e) {}
                     }
                 }
 
@@ -979,10 +985,12 @@ class TransactionController extends Controller
         if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
             $menu->decrement('stock', $t->qty);
             if ($outletId) {
-                $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                if ($om) {
-                    $om->decrement('stock', $t->qty);
-                }
+                try {
+                    $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                    if ($om) {
+                        $om->decrement('stock', $t->qty);
+                    }
+                } catch (\Throwable $e) {}
             }
         }
 

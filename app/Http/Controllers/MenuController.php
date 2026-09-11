@@ -7,19 +7,24 @@ use App\Models\Recipe;
 use App\Models\RecipeItem;
 use App\Models\OutletMenu;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Schema;
 
 class MenuController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Menu::with([
+        $relations = [
             'creator',
             'updater',
-            'outletMenus',
             'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
             'modifierGroups.options.ingredient',
-        ])
-        ->orderBy('code');
+        ];
+
+        if (Schema::hasTable('outlet_menus')) {
+            $relations[] = 'outletMenus';
+        }
+
+        $query = Menu::with($relations)->orderBy('code');
 
         if ($request->filled('item_type') && in_array($request->item_type, ['RECIPE', 'DIRECT', 'SERVICE'])) {
             $query->where('item_type', $request->item_type);
@@ -68,19 +73,26 @@ class MenuController extends Controller
             );
         }
 
-        $menu->load(['creator', 'updater', 'outletMenus', 'modifierGroups.options.ingredient']);
+        $storeRelations = ['creator', 'updater', 'modifierGroups.options.ingredient'];
+        if (Schema::hasTable('outlet_menus')) {
+            $storeRelations[] = 'outletMenus';
+        }
+        $menu->load($storeRelations);
         return response()->json($menu, 201);
     }
 
     public function show(Menu $menu)
     {
-        $menu->load([
+        $showRelations = [
             'creator',
             'updater',
-            'outletMenus',
             'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
             'modifierGroups.options.ingredient',
-        ]);
+        ];
+        if (Schema::hasTable('outlet_menus')) {
+            $showRelations[] = 'outletMenus';
+        }
+        $menu->load($showRelations);
         return response()->json($menu);
     }
 
@@ -111,14 +123,18 @@ class MenuController extends Controller
         $menu->update($data);
 
         // Jika stok diupdate untuk outlet tertentu
-        if ($outletId && array_key_exists('stock', $data)) {
+        if ($outletId && array_key_exists('stock', $data) && Schema::hasTable('outlet_menus')) {
             OutletMenu::updateOrCreate(
                 ['outlet_id' => $outletId, 'menu_id' => $menu->id],
                 ['stock' => (float)$data['stock'], 'min_stock' => (float)($data['min_stock'] ?? $menu->min_stock)]
             );
         }
 
-        $menu->load(['creator', 'updater', 'outletMenus']);
+        $updateRelations = ['creator', 'updater'];
+        if (Schema::hasTable('outlet_menus')) {
+            $updateRelations[] = 'outletMenus';
+        }
+        $menu->load($updateRelations);
         return response()->json($menu);
     }
 
@@ -152,13 +168,15 @@ class MenuController extends Controller
         $menu->save();
 
         // Jika outlet spesifik, update atau buat record OutletMenu
-        if ($outletId && $outletId !== 'ALL') {
+        if ($outletId && $outletId !== 'ALL' && Schema::hasTable('outlet_menus')) {
             $outletMenu = OutletMenu::firstOrNew(['outlet_id' => $outletId, 'menu_id' => $menu->id]);
             $outletMenu->stock = (float)($outletMenu->stock ?? 0) + $qty;
             $outletMenu->save();
         }
 
-        $menu->load(['outletMenus']);
+        if (Schema::hasTable('outlet_menus')) {
+            $menu->load(['outletMenus']);
+        }
         return response()->json([
             'message'       => "Stok produk '{$menu->name}' berhasil ditambah sebanyak {$qty} {$menu->unit}.",
             'menu'          => $menu,

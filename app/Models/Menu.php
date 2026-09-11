@@ -86,36 +86,44 @@ class Menu extends Model
     public function stockForOutlet(?int $outletId): float
     {
         if (!$outletId || $outletId === 0) {
-            return (float)$this->stock;
+            return (float)($this->stock ?? 0);
         }
 
-        $outletRow = $this->outletMenus()->where('outlet_id', $outletId)->first();
-        if ($outletRow) {
-            return (float)$outletRow->stock;
+        try {
+            $outletRow = $this->outletMenus()->where('outlet_id', $outletId)->first();
+            if ($outletRow) {
+                return (float)$outletRow->stock;
+            }
+        } catch (\Throwable $e) {
+            // Fallback jika tabel outlet_menus belum dimigrasi di server
         }
 
-        return (float)$this->stock;
+        return (float)($this->stock ?? 0);
     }
 
     /** Hitung stok minimum spesifik per outlet */
     public function minStockForOutlet(?int $outletId): float
     {
         if (!$outletId || $outletId === 0) {
-            return (float)$this->min_stock;
+            return (float)($this->min_stock ?? 0);
         }
 
-        $outletRow = $this->outletMenus()->where('outlet_id', $outletId)->first();
-        if ($outletRow && $outletRow->min_stock !== null) {
-            return (float)$outletRow->min_stock;
+        try {
+            $outletRow = $this->outletMenus()->where('outlet_id', $outletId)->first();
+            if ($outletRow && $outletRow->min_stock !== null) {
+                return (float)$outletRow->min_stock;
+            }
+        } catch (\Throwable $e) {
+            // Fallback jika tabel outlet_menus belum dimigrasi di server
         }
 
-        return (float)$this->min_stock;
+        return (float)($this->min_stock ?? 0);
     }
 
     public function getCurrentStockAttribute(): float
     {
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()->outlet_id) {
+        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
             $outletId = auth()->user()->outlet_id;
         }
 
@@ -123,15 +131,23 @@ class Menu extends Model
             return $this->stockForOutlet((int)$outletId);
         }
 
-        // Konsolidasi seluruh outlet atau stok master
-        $outletSum = (float)$this->outletMenus()->sum('stock');
-        return $outletSum > 0 ? $outletSum : (float)$this->stock;
+        try {
+            // Konsolidasi seluruh outlet atau stok master
+            $outletSum = (float)$this->outletMenus()->sum('stock');
+            if ($outletSum > 0) {
+                return $outletSum;
+            }
+        } catch (\Throwable $e) {
+            // Fallback jika tabel outlet_menus belum dimigrasi di server
+        }
+
+        return (float)($this->stock ?? 0);
     }
 
     public function getCurrentMinStockAttribute(): float
     {
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()->outlet_id) {
+        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
             $outletId = auth()->user()->outlet_id;
         }
 
@@ -139,7 +155,7 @@ class Menu extends Model
             return $this->minStockForOutlet((int)$outletId);
         }
 
-        return (float)$this->min_stock;
+        return (float)($this->min_stock ?? 0);
     }
 
     public function getIsRecipeAttribute(): bool

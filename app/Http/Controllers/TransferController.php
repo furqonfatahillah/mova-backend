@@ -44,6 +44,10 @@ class TransferController extends Controller
             $query->where('status', $request->status);
         }
 
+        if ($request->user()?->business_id) {
+            $query->where('business_id', $request->user()->business_id);
+        }
+
         return response()->json($query->limit(200)->get());
     }
 
@@ -79,30 +83,60 @@ class TransferController extends Controller
         $hasDest = !empty($validated['destination_outlet_id']) || !empty(trim($validated['destination_name'] ?? ''));
 
         if (!$hasSource) {
-            return response()->json(['message' => 'Tentukan lokasi asal (pilih outlet terdaftar atau ketik nama lokasi asal).'], 422);
+            return response()->json(['message' => 'Tentukan cabang/lokasi asal pengirim barang.'], 422);
         }
         if (!$hasDest) {
-            return response()->json(['message' => 'Tentukan lokasi tujuan (pilih outlet terdaftar atau ketik nama lokasi tujuan).'], 422);
+            return response()->json(['message' => 'Tentukan cabang/lokasi tujuan penerima barang.'], 422);
         }
 
         $sourceOutletId = !empty($validated['source_outlet_id']) ? (int)$validated['source_outlet_id'] : null;
         $destOutletId   = !empty($validated['destination_outlet_id']) ? (int)$validated['destination_outlet_id'] : null;
 
         if ($sourceOutletId && $destOutletId && $sourceOutletId === $destOutletId) {
-            return response()->json(['message' => 'Outlet tujuan tidak boleh sama dengan outlet pengirim.'], 422);
+            return response()->json(['message' => 'Cabang tujuan tidak boleh sama dengan cabang pengirim.'], 422);
         }
 
-        $transfer = DB::transaction(function () use ($request, $validated, $sourceOutletId, $destOutletId) {
+        $user = $request->user();
+        $userBusinessId = $user?->business_id;
+
+        $sourceOutlet = $sourceOutletId ? Outlet::find($sourceOutletId) : null;
+        $destOutlet   = $destOutletId ? Outlet::find($destOutletId) : null;
+
+        if ($sourceOutletId && !$sourceOutlet) {
+            return response()->json(['message' => 'Cabang asal tidak ditemukan.'], 404);
+        }
+        if ($destOutletId && !$destOutlet) {
+            return response()->json(['message' => 'Cabang tujuan tidak ditemukan.'], 404);
+        }
+
+        // Kunci ketat: Transfer HANYA bisa dilakukan antar cabang di dalam satu perusahaan yang sama
+        if ($userBusinessId) {
+            if ($sourceOutlet && (int)$sourceOutlet->business_id !== (int)$userBusinessId) {
+                return response()->json(['message' => 'Cabang asal bukan milik perusahaan Anda.'], 403);
+            }
+            if ($destOutlet && (int)$destOutlet->business_id !== (int)$userBusinessId) {
+                return response()->json(['message' => 'Cabang tujuan bukan milik perusahaan Anda.'], 403);
+            }
+        }
+
+        if ($sourceOutlet && $destOutlet && (int)$sourceOutlet->business_id !== (int)$destOutlet->business_id) {
+            return response()->json(['message' => 'Transfer hanya dapat dilakukan antar cabang dalam satu perusahaan yang sama.'], 422);
+        }
+
+        $businessIdToAssign = $userBusinessId ?? $sourceOutlet?->business_id ?? $destOutlet?->business_id;
+
+        $transfer = DB::transaction(function () use ($request, $validated, $sourceOutlet, $destOutlet, $businessIdToAssign) {
             $date = $validated['date'];
             $dateClean = str_replace('-', '', $date);
-            $countToday = Transfer::whereDate('date', $date)->count() + 1;
+            $countQuery = Transfer::whereDate('date', $date);
+            if ($businessIdToAssign) {
+                $countQuery->where('business_id', $businessIdToAssign);
+            }
+            $countToday = $countQuery->count() + 1;
             $transferNo = 'TRF-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
 
-            $sourceOutlet = $sourceOutletId ? Outlet::find($sourceOutletId) : null;
-            $destOutlet   = $destOutletId ? Outlet::find($destOutletId) : null;
-
-            $sourceName = $sourceOutlet ? $sourceOutlet->name : trim($validated['source_name'] ?? 'Gudang Asal');
-            $destName   = $destOutlet ? $destOutlet->name : trim($validated['destination_name'] ?? 'Gudang Tujuan');
+            $sourceName = $sourceOutlet ? $sourceOutlet->name : trim($validated['source_name'] ?? 'Cabang Asal');
+            $destName   = $destOutlet ? $destOutlet->name : trim($validated['destination_name'] ?? 'Cabang Tujuan');
 
             // Tentukan transfer_type otomatis jika tidak diset
             $transferType = $validated['transfer_type'] ?? null;
@@ -121,6 +155,7 @@ class TransferController extends Controller
             $userId = $request->user()?->id;
 
             $transfer = Transfer::create([
+                'business_id'           => $businessIdToAssign,
                 'transfer_no'           => $transferNo,
                 'date'                  => $date,
                 'source_type'           => $sourceOutlet ? 'OUTLET' : ($validated['source_type'] ?? 'EXTERNAL'),

@@ -19,6 +19,7 @@ use App\Http\Controllers\WasteController;
 use App\Http\Controllers\DiscountController;
 use App\Http\Controllers\ExpenseController;
 use App\Http\Controllers\CashFlowController;
+use App\Http\Controllers\ShiftScheduleController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -46,7 +47,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/users/{user}/reject',    [UserController::class, 'reject']);
     Route::post('/users/{user}/suspend',   [UserController::class, 'suspend']);
 
-    // Shifts
+    // Shifts & Shift Schedules (Master Shift & Roster Jadwal Kasir)
+    Route::get('/shift-schedules/employees',      [ShiftScheduleController::class, 'employees']);
+    Route::apiResource('shift-schedules',         ShiftScheduleController::class);
     Route::get('/shifts',                        [ShiftController::class, 'index']);
     Route::get('/shifts/active',                 [ShiftController::class, 'active']);
     Route::post('/shifts/open',                  [ShiftController::class, 'open']);

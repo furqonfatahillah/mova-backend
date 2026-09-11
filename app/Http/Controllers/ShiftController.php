@@ -3,6 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\Shift;
+use App\Models\ShiftSchedule;
+use App\Models\Outlet;
 use App\Models\StockMovement;
 use App\Models\Transaction;
 use Illuminate\Http\Request;
@@ -15,7 +17,7 @@ class ShiftController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Shift::with(['user', 'closedByUser', 'creator', 'updater', 'outlet'])
+        $query = Shift::with(['user', 'closedByUser', 'creator', 'updater', 'outlet', 'shiftSchedule'])
             ->withCount('transactions')
             ->orderByDesc('opened_at')
             ->orderByDesc('id');
@@ -49,7 +51,7 @@ class ShiftController extends Controller
     public function active(Request $request)
     {
         $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
-        $query = Shift::with(['user', 'outlet'])->where('status', 'OPEN');
+        $query = Shift::with(['user', 'outlet', 'shiftSchedule'])->where('status', 'OPEN');
         if ($outletId) {
             $query->where('outlet_id', $outletId);
         }
@@ -76,21 +78,34 @@ class ShiftController extends Controller
     public function open(Request $request)
     {
         $data = $request->validate([
-            'shift_name'   => 'required|string|max:100',
-            'initial_cash' => 'nullable|numeric|min:0',
-            'notes'        => 'nullable|string|max:500',
-            'outlet_id'    => 'nullable|exists:outlets,id',
+            'shift_name'        => 'nullable|string|max:100',
+            'shift_schedule_id' => 'nullable|integer',
+            'initial_cash'      => 'nullable|numeric|min:0',
+            'notes'             => 'nullable|string|max:500',
+            'outlet_id'         => 'nullable|integer',
         ]);
 
-        $outletId = !empty($data['outlet_id']) ? (int)$data['outlet_id'] : ($request->user()->outlet_id ?? 1);
+        $user = $request->user();
+        $businessId = (int) $user->business_id;
+
+        $outletId = !empty($data['outlet_id']) ? (int)$data['outlet_id'] : ($user->outlet_id ?? 1);
 
         // If user is Owner Outlet or Pegawai with assigned outlet, lock to their outlet
-        if ($request->user()->isOwnerOutlet() && $request->user()->outlet_id) {
-            $outletId = (int)$request->user()->outlet_id;
+        if ($user->isOwnerOutlet() && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        }
+
+        // Single-company strict validation: verify outlet belongs to this business
+        $outlet = Outlet::where('id', $outletId)->where('business_id', $businessId)->first();
+        if (!$outlet) {
+            return response()->json([
+                'message' => 'Outlet tidak valid atau tidak terdaftar dalam perusahaan Anda.'
+            ], 422);
         }
 
         // Check if there is already an open shift for this outlet
         $existing = Shift::where('status', 'OPEN')
+            ->where('business_id', $businessId)
             ->where('outlet_id', $outletId)
             ->first();
 
@@ -101,19 +116,73 @@ class ShiftController extends Controller
             ], 422);
         }
 
+        $shiftScheduleId = null;
+        $shiftName = $data['shift_name'] ?? null;
+        $isOwner = $user->isOwnerBisnis() || $user->isSuperadminPlatform();
+
+        // 1. If explicit shift_schedule_id provided
+        if (!empty($data['shift_schedule_id'])) {
+            $schedule = ShiftSchedule::where('business_id', $businessId)
+                ->where('outlet_id', $outletId)
+                ->find($data['shift_schedule_id']);
+
+            if (!$schedule) {
+                return response()->json([
+                    'message' => 'Jadwal shift yang dipilih tidak valid atau tidak sesuai dengan outlet perusahaan Anda.'
+                ], 422);
+            }
+
+            // Strict enforcement: only assigned cashiers or Owners can open
+            if ($schedule->is_strict && !$isOwner) {
+                $assignedIds = $schedule->assigned_user_ids ?? [];
+                if (!in_array($user->id, $assignedIds)) {
+                    return response()->json([
+                        'message' => "Akses Ditolak: Anda ({$user->name}) tidak dijadwalkan pada '{$schedule->shift_name}'. Berdasarkan pengaturan Owner, shift ini hanya boleh dibuka oleh kasir yang ditugaskan."
+                    ], 403);
+                }
+            }
+
+            $shiftScheduleId = $schedule->id;
+            $shiftName = $schedule->shift_name;
+        } else {
+            // 2. If no shift_schedule_id was sent, check if shift_name matches any scheduled shift in this outlet
+            if ($shiftName) {
+                $matchedSchedule = ShiftSchedule::where('business_id', $businessId)
+                    ->where('outlet_id', $outletId)
+                    ->where('shift_name', $shiftName)
+                    ->first();
+
+                if ($matchedSchedule) {
+                    if ($matchedSchedule->is_strict && !$isOwner) {
+                        $assignedIds = $matchedSchedule->assigned_user_ids ?? [];
+                        if (!in_array($user->id, $assignedIds)) {
+                            return response()->json([
+                                'message' => "Akses Ditolak: Anda ({$user->name}) tidak dijadwalkan pada '{$matchedSchedule->shift_name}'. Berdasarkan pengaturan Owner, shift ini hanya boleh dibuka oleh kasir yang ditugaskan."
+                            ], 403);
+                        }
+                    }
+                    $shiftScheduleId = $matchedSchedule->id;
+                }
+            } else {
+                $shiftName = 'Shift 1 (Pagi)';
+            }
+        }
+
         $shift = Shift::create([
-            'shift_name'   => $data['shift_name'],
-            'user_id'      => $request->user()->id,
-            'created_by'   => $request->user()->id,
-            'opened_at'    => now(),
-            'initial_cash' => $data['initial_cash'] ?? 0,
-            'system_cash'  => 0,
-            'status'       => 'OPEN',
-            'notes'        => $data['notes'] ?? null,
-            'outlet_id'    => $outletId,
+            'business_id'       => $businessId,
+            'outlet_id'         => $outletId,
+            'shift_schedule_id' => $shiftScheduleId,
+            'shift_name'        => $shiftName,
+            'user_id'           => $user->id,
+            'created_by'        => $user->id,
+            'opened_at'         => now(),
+            'initial_cash'      => $data['initial_cash'] ?? 0,
+            'system_cash'       => 0,
+            'status'            => 'OPEN',
+            'notes'             => $data['notes'] ?? null,
         ]);
 
-        $shift->load(['user', 'outlet', 'creator', 'updater']);
+        $shift->load(['user', 'outlet', 'creator', 'updater', 'shiftSchedule']);
 
         return response()->json($shift, 201);
     }

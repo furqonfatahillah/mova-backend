@@ -16,6 +16,7 @@ class Shift extends Model
     protected $fillable = [
         'business_id',
         'outlet_id',
+        'shift_schedule_id',
         'shift_name',
         'user_id',
         'opened_at',
@@ -48,6 +49,11 @@ class Shift extends Model
             'closing_cash'    => 'float',
             'cash_difference' => 'float',
         ];
+    }
+
+    public function shiftSchedule(): BelongsTo
+    {
+        return $this->belongsTo(ShiftSchedule::class);
     }
 
     public function user(): BelongsTo

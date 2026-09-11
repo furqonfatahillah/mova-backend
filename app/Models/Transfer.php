@@ -14,8 +14,13 @@ class Transfer extends Model
         'business_id',
         'transfer_no',
         'date',
+        'source_type',       // 'OUTLET', 'WAREHOUSE', 'EXTERNAL'
+        'source_name',
         'source_outlet_id',
+        'destination_type',  // 'OUTLET', 'WAREHOUSE', 'EXTERNAL'
+        'destination_name',
         'destination_outlet_id',
+        'transfer_type',     // 'INTER_OUTLET', 'INBOUND', 'OUTBOUND', 'EXTERNAL'
         'status',
         'notes',
         'driver_name',
@@ -30,6 +35,8 @@ class Transfer extends Model
         'updated_by_name',
         'changed_at',
         'changed_by_name',
+        'source_display_name',
+        'destination_display_name',
     ];
 
     public function sourceOutlet()
@@ -50,5 +57,21 @@ class Transfer extends Model
     public function stockMovements()
     {
         return $this->hasMany(StockMovement::class);
+    }
+
+    public function getSourceDisplayNameAttribute(): string
+    {
+        if ($this->sourceOutlet) {
+            return $this->sourceOutlet->name;
+        }
+        return $this->source_name ?: 'Lokasi Asal';
+    }
+
+    public function getDestinationDisplayNameAttribute(): string
+    {
+        if ($this->destinationOutlet) {
+            return $this->destinationOutlet->name;
+        }
+        return $this->destination_name ?: 'Lokasi Tujuan';
     }
 }

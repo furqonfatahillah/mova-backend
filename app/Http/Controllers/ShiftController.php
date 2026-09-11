@@ -160,6 +160,23 @@ class ShiftController extends Controller
         // Calculate ingredient usage
         $ingredientUsages = $shift->calculateIngredientUsage();
 
+        // Active Open Bills on this outlet (grouped by order_number & customer_name)
+        $openBills = Transaction::where('outlet_id', $shift->outlet_id)
+            ->where('status', 'HOLD')
+            ->select(
+                'order_number',
+                'customer_name',
+                'notes',
+                DB::raw('SUM(total_price) as total_amount'),
+                DB::raw('SUM(qty) as total_items'),
+                DB::raw('MIN(created_at) as created_at')
+            )
+            ->groupBy('order_number', 'customer_name', 'notes')
+            ->get();
+
+        $openBillsCount = $openBills->count();
+        $openBillsTotal = (float)$openBills->sum('total_amount');
+
         return response()->json([
             'shift'              => $shift,
             'total_transactions' => $totalTransactions,
@@ -167,6 +184,9 @@ class ShiftController extends Controller
             'expected_cash'      => (float)$shift->initial_cash + $totalSales,
             'menus_sold'         => array_values($menuSummary),
             'ingredient_usages'  => $ingredientUsages,
+            'open_bills_count'   => $openBillsCount,
+            'open_bills_total'   => $openBillsTotal,
+            'open_bills'         => $openBills,
         ]);
     }
 
@@ -179,15 +199,30 @@ class ShiftController extends Controller
             return response()->json(['message' => 'Shift ini sudah ditutup sebelumnya.'], 422);
         }
 
-        // Prevent closing if there are still active OPEN BILLS in HOLD status
-        $openBillsCount = Transaction::where('outlet_id', $shift->outlet_id)
+        // Check active OPEN BILLS in HOLD status for this outlet
+        $openBills = Transaction::where('outlet_id', $shift->outlet_id)
             ->where('status', 'HOLD')
-            ->distinct('order_number')
-            ->count('order_number');
+            ->select(
+                'order_number',
+                'customer_name',
+                'notes',
+                DB::raw('SUM(total_price) as total_amount'),
+                DB::raw('SUM(qty) as total_items')
+            )
+            ->groupBy('order_number', 'customer_name', 'notes')
+            ->get();
 
-        if ($openBillsCount > 0) {
+        $openBillsCount = $openBills->count();
+        $openBillsTotal = (float)$openBills->sum('total_amount');
+        $allowCarryOver = $request->boolean('allow_carry_over');
+
+        if ($openBillsCount > 0 && !$allowCarryOver) {
             return response()->json([
-                'message' => "Masih ada {$openBillsCount} tagihan terbuka / meja terisi (Open Bill) di outlet ini. Harap selesaikan pembayaran atau batalkan tagihan tersebut sebelum closing shift.",
+                'has_open_bills'   => true,
+                'open_bills_count' => $openBillsCount,
+                'open_bills_total' => $openBillsTotal,
+                'open_bills'       => $openBills,
+                'message'          => "Masih ada {$openBillsCount} tagihan terbuka atas nama pelanggan (Open Bill) senilai Rp " . number_format($openBillsTotal, 0, ',', '.') . " di outlet ini. Anda dapat mengalihkan tagihan ke shift berikutnya atau menyelesaikan pembayarannya terlebih dahulu.",
             ], 422);
         }
 
@@ -196,7 +231,7 @@ class ShiftController extends Controller
             'notes'        => 'nullable|string|max:500',
         ]);
 
-        $result = DB::transaction(function () use ($request, $shift, $data) {
+        $result = DB::transaction(function () use ($request, $shift, $data, $openBillsCount, $openBillsTotal, $allowCarryOver) {
             $systemSales = (float)$shift->transactions()->where('status', 'PAID')->sum('total_price');
             $closingCash = (float)$data['closing_cash'];
             $expectedCash = (float)$shift->initial_cash + $systemSales;
@@ -224,8 +259,12 @@ class ShiftController extends Controller
                 $createdMovements[] = $m;
             }
 
-            // 3. Update shift to CLOSED
+            // 3. Update shift to CLOSED with carry-over notes if any
             $combinedNotes = $shift->notes;
+            if ($openBillsCount > 0 && $allowCarryOver) {
+                $carryNote = "Open Bill Dialihkan ke Shift Berikutnya: {$openBillsCount} tagihan pelanggan (Rp " . number_format($openBillsTotal, 0, ',', '.') . ")";
+                $combinedNotes = $combinedNotes ? $combinedNotes . "\n" . $carryNote : $carryNote;
+            }
             if (!empty($data['notes'])) {
                 $combinedNotes = $combinedNotes ? $combinedNotes . "\nClosing: " . $data['notes'] : $data['notes'];
             }
@@ -242,12 +281,17 @@ class ShiftController extends Controller
             ]);
 
             return [
-                'shift'           => $shift->fresh(['user', 'closedByUser', 'creator', 'updater']),
-                'movements_count' => count($createdMovements),
-                'total_sales'     => $systemSales,
-                'cash_difference' => $cashDiff,
+                'message'          => 'Shift berhasil ditutup.' . ($openBillsCount > 0 ? " {$openBillsCount} tagihan pelanggan dialihkan ke shift berikutnya." : ''),
+                'shift'            => $shift->fresh(['user', 'closedByUser', 'creator', 'updater']),
+                'movements_count'  => count($createdMovements),
+                'total_sales'      => $systemSales,
+                'cash_difference'  => $cashDiff,
+                'carry_over_count' => $openBillsCount,
+                'carry_over_total' => $openBillsTotal,
             ];
         });
+
+        return response()->json($result);
 
         return response()->json($result);
     }

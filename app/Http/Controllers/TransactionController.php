@@ -699,9 +699,15 @@ class TransactionController extends Controller
 
         DB::transaction(function () use ($transactions, $data, $request, $amountPaid, $changeAmount, $orderNumber, $discInfo, $grossSubtotal) {
             $first = $transactions->first();
-            $shiftId = $first->shift_id;
             $outletId = $first->outlet_id;
             $date = $first->date;
+
+            // Cari shift kasir yang sedang aktif saat pelunasan (bisa jadi shift baru hasil carry-over)
+            $activeShift = \App\Models\Shift::where('outlet_id', $outletId)
+                ->where('status', 'OPEN')
+                ->latest()
+                ->first();
+            $shiftId = $activeShift ? $activeShift->id : $first->shift_id;
 
             $accumulatedDisc = 0;
             $itemsCount = $transactions->count();
@@ -726,6 +732,8 @@ class TransactionController extends Controller
                     $t->total_price = $itemNet;
                 }
 
+                $t->shift_id = $shiftId;
+                $t->user_id = $request->user()->id;
                 $t->status = 'PAID';
                 $t->payment_method = $data['payment_method'];
                 $t->amount_paid = $amountPaid;
@@ -1333,6 +1341,12 @@ class TransactionController extends Controller
             $transactions, $first, $orderNumber, $subOrderNumber, $splitIndex, $totalSplits, $splitAmount,
             $amountPaid, $changeAmount, $data, $customerName, $isTableClosed, $request
         ) {
+            $activeShift = \App\Models\Shift::where('outlet_id', $first->outlet_id)
+                ->where('status', 'OPEN')
+                ->latest()
+                ->first();
+            $splitShiftId = $activeShift ? $activeShift->id : $first->shift_id;
+
             // Create a payment record for this equal split installment
             Transaction::create([
                 'order_number'        => $subOrderNumber,
@@ -1356,16 +1370,17 @@ class TransactionController extends Controller
                 'payment_method'      => $data['payment_method'],
                 'notes'               => "Split Evenly ({$splitIndex}/{$totalSplits})" . (!empty($data['notes']) ? " - {$data['notes']}" : ""),
                 'user_id'             => $request->user()->id,
-                'shift_id'            => $first->shift_id,
+                'shift_id'            => $splitShiftId,
                 'outlet_id'           => $first->outlet_id,
                 'created_by'          => $request->user()->id,
             ]);
 
-            // If this is the final split, mark the original HOLD transactions as SPLIT_CLOSED to close the table
+            // If this is the final split, mark the original HOLD transactions as SPLIT_CLOSED to close the order
             if ($isTableClosed) {
                 foreach ($transactions as $t) {
                     $t->update([
                         'status'     => 'SPLIT_CLOSED',
+                        'shift_id'   => $splitShiftId,
                         'updated_by' => $request->user()->id,
                     ]);
                     $this->deductStockForTransaction($t, $orderNumber, $request->user()->id);

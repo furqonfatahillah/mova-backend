@@ -19,14 +19,20 @@ class Business extends Model
         'package_type',
         'max_outlets',
         'status',
+        'coin_balance',
+        'coins_per_transaction',
+        'low_coin_threshold',
         'expires_at',
         'created_by',
         'updated_by',
     ];
 
     protected $casts = [
-        'expires_at'  => 'datetime',
-        'max_outlets' => 'integer',
+        'expires_at'             => 'datetime',
+        'max_outlets'            => 'integer',
+        'coin_balance'           => 'float',
+        'coins_per_transaction'  => 'float',
+        'low_coin_threshold'     => 'integer',
     ];
 
     protected $appends = [
@@ -35,7 +41,34 @@ class Business extends Model
         'changed_at',
         'changed_by_name',
         'is_active',
+        'remaining_transactions',
+        'is_coin_low',
+        'is_coin_out',
     ];
+
+    public function coinTransactions()
+    {
+        return $this->hasMany(CoinTransaction::class);
+    }
+
+    public function getRemainingTransactionsAttribute(): int
+    {
+        $rate = (float)($this->coins_per_transaction ?: 1.00);
+        if ($rate <= 0) return 999999;
+        $balance = (float)($this->coin_balance ?: 0.00);
+        return (int) floor($balance / $rate);
+    }
+
+    public function getIsCoinLowAttribute(): bool
+    {
+        $threshold = (int)($this->low_coin_threshold ?: 20);
+        return $this->remaining_transactions <= $threshold && $this->remaining_transactions > 0;
+    }
+
+    public function getIsCoinOutAttribute(): bool
+    {
+        return $this->remaining_transactions <= 0;
+    }
 
     public function outlets()
     {

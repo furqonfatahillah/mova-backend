@@ -20,6 +20,7 @@ use App\Http\Controllers\DiscountController;
 use App\Http\Controllers\ExpenseController;
 use App\Http\Controllers\CashFlowController;
 use App\Http\Controllers\ShiftScheduleController;
+use App\Http\Controllers\CoinPlatformController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -35,7 +36,14 @@ Route::middleware('auth:sanctum')->group(function () {
     // SaaS Tenants & Business Management
     Route::apiResource('businesses', BusinessController::class);
     Route::get('/my-business',       [BusinessController::class, 'myBusiness']);
+    Route::get('/my-business/coins', [BusinessController::class, 'myCoins']);
     Route::put('/my-business',       [BusinessController::class, 'updateMyBusiness']);
+
+    // SaaS Platform Coin Top-Up & Rate Management (Website Owner / Superadmin Platform)
+    Route::get('/platform/coins/overview', [CoinPlatformController::class, 'overview']);
+    Route::post('/platform/coins/topup',   [CoinPlatformController::class, 'topUp']);
+    Route::put('/platform/coins/rate',     [CoinPlatformController::class, 'updateRate']);
+    Route::get('/platform/coins/history',  [CoinPlatformController::class, 'history']);
 
     // User Management & Approval Workflow
     Route::get('/users',                   [UserController::class, 'index']);

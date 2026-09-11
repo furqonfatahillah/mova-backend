@@ -176,4 +176,41 @@ class BusinessController extends Controller
 
         return response()->json($business);
     }
+
+    /**
+     * Get current business coin balance, rate, remaining transactions and alert status.
+     */
+    public function myCoins(Request $request)
+    {
+        $user = $request->user();
+        $businessId = $user->business_id;
+
+        if ($user->isSuperadminPlatform()) {
+            $businessId = (int) ($request->header('X-Business-Id') ?? $request->business_id ?? $user->business_id ?? 1);
+        }
+
+        if (!$businessId) {
+            return response()->json(['message' => 'User tidak terikat dengan bisnis.'], 404);
+        }
+
+        $business = Business::findOrFail($businessId);
+
+        $recentMutations = \App\Models\CoinTransaction::where('business_id', $businessId)
+            ->with(['outlet:id,name', 'creator:id,name'])
+            ->orderByDesc('id')
+            ->limit(10)
+            ->get();
+
+        return response()->json([
+            'business_id'            => $business->id,
+            'business_name'          => $business->name,
+            'coin_balance'           => $business->coin_balance,
+            'coins_per_transaction'  => $business->coins_per_transaction,
+            'remaining_transactions' => $business->remaining_transactions,
+            'low_coin_threshold'     => $business->low_coin_threshold ?: 20,
+            'is_coin_low'            => $business->is_coin_low,
+            'is_coin_out'            => $business->is_coin_out,
+            'recent_mutations'       => $recentMutations,
+        ]);
+    }
 }

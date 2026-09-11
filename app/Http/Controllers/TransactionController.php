@@ -8,6 +8,7 @@ use App\Models\StockMovement;
 use App\Models\ModifierOption;
 use App\Models\TransactionModifier;
 use App\Models\Discount;
+use App\Services\CoinService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -175,15 +176,28 @@ class TransactionController extends Controller
 
             $orderStatus = $data['status'] ?? 'PAID';
 
+            // Resolve Outlet ID & Business ID
+            $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
+            $businessId = (int)($request->user()->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
+
+            // Pre-check SaaS coin balance if order is finalized as PAID
+            if ($orderStatus === 'PAID') {
+                $coinCheck = CoinService::canTransact($businessId);
+                if (!$coinCheck['allowed']) {
+                    return response()->json([
+                        'message'    => $coinCheck['message'],
+                        'coin_error' => true,
+                        'coin_data'  => $coinCheck,
+                    ], 402);
+                }
+            }
+
             // Resolve Active Shift
             $shiftId = $data['shift_id'] ?? null;
             if (!$shiftId) {
                 $activeShift = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->first();
                 $shiftId = $activeShift?->id;
             }
-
-            // Resolve Outlet ID
-            $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
 
             // Generate Unique Order Number: e.g. TRX-20260906-0001
             $orderNumber = $this->generateOrderNumber($data['date']);
@@ -246,7 +260,7 @@ class TransactionController extends Controller
             unset($prep);
 
             $createdTransactions = DB::transaction(function () use (
-                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $outletId, $request, $discInfo
+                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $outletId, $businessId, $request, $discInfo
             ) {
                 $results = [];
 
@@ -354,6 +368,11 @@ class TransactionController extends Controller
                     $discInfo['model']->increment('used_count');
                 }
 
+                // Deduct SaaS platform coins for completed nota
+                if ($orderStatus === 'PAID') {
+                    CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
+                }
+
                 return $results;
             });
 
@@ -430,14 +449,27 @@ class TransactionController extends Controller
         $menu   = Menu::findOrFail($data['menu_id']);
         $recipe = $menu->activeRecipe($data['date']);
 
+        $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
+        $businessId = (int)($request->user()->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
+
+        // Pre-check SaaS coin balance if order is finalized as PAID
+        if ($orderStatus === 'PAID') {
+            $coinCheck = CoinService::canTransact($businessId);
+            if (!$coinCheck['allowed']) {
+                return response()->json([
+                    'message'    => $coinCheck['message'],
+                    'coin_error' => true,
+                    'coin_data'  => $coinCheck,
+                ], 402);
+            }
+        }
+
         // Find active shift if not explicitly provided
         $shiftId = $data['shift_id'] ?? null;
         if (!$shiftId) {
             $activeShift = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->first();
             $shiftId = $activeShift?->id;
         }
-
-        $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
 
         // Generate Unique Order Number: e.g. TRX-20260906-0001
         $orderNumber = $this->generateOrderNumber($data['date']);
@@ -447,7 +479,7 @@ class TransactionController extends Controller
         $itemUnitPrice = (float)$menu->price + $modifierUnitPrice;
         $totalItemPrice = $itemUnitPrice * (int)$data['qty'];
 
-        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $outletId, $orderNumber, $orderStatus) {
+        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $outletId, $businessId, $orderNumber, $orderStatus) {
             $qty = (int)$data['qty'];
             $trx = Transaction::create([
                 'order_number'   => $orderNumber,
@@ -530,6 +562,11 @@ class TransactionController extends Controller
                         'created_by'     => $request->user()->id,
                     ]);
                 }
+            }
+
+            // Deduct SaaS platform coins for completed nota
+            if ($orderStatus === 'PAID') {
+                CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
             }
 
             return $trx;
@@ -673,6 +710,19 @@ class TransactionController extends Controller
         }
 
         $first = $transactions->first();
+        $outletId = $first->outlet_id;
+        $businessId = (int)($request->user()->business_id ?: ($first->business_id ?: ($first->outlet?->business_id ?: 1)));
+
+        // Pre-check SaaS coin balance
+        $coinCheck = CoinService::canTransact($businessId);
+        if (!$coinCheck['allowed']) {
+            return response()->json([
+                'message'    => $coinCheck['message'],
+                'coin_error' => true,
+                'coin_data'  => $coinCheck,
+            ], 402);
+        }
+
         $grossSubtotal = (float)$transactions->sum(fn($t) => $t->subtotal ?: $t->total_price);
         $hasDiscountInput = !empty($data['discount_id']) || !empty($data['discount_code']) || (!empty($data['discount_amount']) && (float)$data['discount_amount'] > 0);
 
@@ -683,7 +733,7 @@ class TransactionController extends Controller
                 $grossSubtotal,
                 $first->outlet_id,
                 $first->date,
-                (int)($request->user()->business_id ?? 1)
+                $businessId
             );
         }
 
@@ -697,7 +747,7 @@ class TransactionController extends Controller
 
         $changeAmount = (float)($data['change_amount'] ?? max(0, $amountPaid - $totalOrder));
 
-        DB::transaction(function () use ($transactions, $data, $request, $amountPaid, $changeAmount, $orderNumber, $discInfo, $grossSubtotal) {
+        DB::transaction(function () use ($transactions, $data, $request, $amountPaid, $changeAmount, $orderNumber, $discInfo, $grossSubtotal, $businessId) {
             $first = $transactions->first();
             $outletId = $first->outlet_id;
             $date = $first->date;
@@ -798,6 +848,9 @@ class TransactionController extends Controller
             if ($discInfo && $discInfo['model']) {
                 $discInfo['model']->increment('used_count');
             }
+
+            // Deduct SaaS platform coins for completed nota
+            CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
         });
 
         $first = $transactions->first();
@@ -1134,10 +1187,21 @@ class TransactionController extends Controller
         $shiftId = $first->shift_id;
         $tableNumber = $first->table_number;
         $customerName = !empty($data['customer_name']) ? trim($data['customer_name']) : ($first->customer_name ? "{$first->customer_name} (Bagian {$splitIndex})" : "Tamu {$splitIndex}");
+        $businessId = (int)($request->user()->business_id ?: ($first->business_id ?: ($first->outlet?->business_id ?: 1)));
+
+        // Pre-check SaaS coin balance
+        $coinCheck = CoinService::canTransact($businessId);
+        if (!$coinCheck['allowed']) {
+            return response()->json([
+                'message'    => $coinCheck['message'],
+                'coin_error' => true,
+                'coin_data'  => $coinCheck,
+            ], 402);
+        }
 
         $paidResult = DB::transaction(function () use (
             $requestedItems, $orderNumber, $subOrderNumber, $splitIndex, $data, $amountPaid, $changeAmount,
-            $date, $outletId, $shiftId, $tableNumber, $customerName, $request
+            $date, $outletId, $shiftId, $tableNumber, $customerName, $businessId, $request
         ) {
             $paidRows = [];
 
@@ -1231,6 +1295,9 @@ class TransactionController extends Controller
                 }
             }
 
+            // Deduct SaaS platform coins for completed split sub-nota
+            CoinService::deductForOrder($businessId, $subOrderNumber, $outletId, $request->user()->id);
+
             return $paidRows;
         });
 
@@ -1313,6 +1380,18 @@ class TransactionController extends Controller
         }
 
         $first = $transactions->first();
+        $businessId = (int)($request->user()->business_id ?: ($first->business_id ?: ($first->outlet?->business_id ?: 1)));
+
+        // Pre-check SaaS coin balance
+        $coinCheck = CoinService::canTransact($businessId);
+        if (!$coinCheck['allowed']) {
+            return response()->json([
+                'message'    => $coinCheck['message'],
+                'coin_error' => true,
+                'coin_data'  => $coinCheck,
+            ], 402);
+        }
+
         $tableTotal = (float)$transactions->sum('total_price');
         $splitAmount = (float)$data['split_amount'];
         $amountPaid = (float)$data['amount_paid'];
@@ -1339,7 +1418,7 @@ class TransactionController extends Controller
 
         DB::transaction(function () use (
             $transactions, $first, $orderNumber, $subOrderNumber, $splitIndex, $totalSplits, $splitAmount,
-            $amountPaid, $changeAmount, $data, $customerName, $isTableClosed, $request
+            $amountPaid, $changeAmount, $data, $customerName, $isTableClosed, $businessId, $request
         ) {
             $activeShift = \App\Models\Shift::where('outlet_id', $first->outlet_id)
                 ->where('status', 'OPEN')
@@ -1386,6 +1465,9 @@ class TransactionController extends Controller
                     $this->deductStockForTransaction($t, $orderNumber, $request->user()->id);
                 }
             }
+
+            // Deduct SaaS platform coins for completed split sub-nota
+            CoinService::deductForOrder($businessId, $subOrderNumber, $first->outlet_id, $request->user()->id);
         });
 
         $remainingTotal = max(0, $tableTotal - ($splitAmount * $newPaidSplitsCount));

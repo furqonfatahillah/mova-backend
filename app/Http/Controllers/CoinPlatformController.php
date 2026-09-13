@@ -60,6 +60,12 @@ class CoinPlatformController extends Controller
     {
         $this->authorizeSuperadmin($request);
 
+        $coinsVal = $request->input('amount_coins') ?? $request->input('coins');
+        $request->merge([
+            'amount_coins' => $coinsVal,
+            'coins'        => $coinsVal,
+        ]);
+
         $data = $request->validate([
             'business_id'       => 'required|exists:businesses,id',
             'amount_coins'      => 'required|numeric|min:1',

@@ -32,11 +32,14 @@ class CoinPlatformController extends Controller
             ->orderByDesc('id')
             ->get();
 
-        $totalCirculating = (float) Business::sum('coin_balance');
-        $totalTopupCoins = (float) CoinTransaction::where('type', 'TOPUP')->sum('amount');
-        $totalTopupRupiah = (float) CoinTransaction::where('type', 'TOPUP')->sum('payment_amount');
-        $totalNotasDeducted = CoinTransaction::where('type', 'USAGE')->count();
-        $criticalCount = $businesses->filter(fn($b) => $b->is_coin_low || $b->is_coin_out)->count();
+        $hasCoinCol = \Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coin_balance');
+        $hasCoinTx = \Illuminate\Support\Facades\Schema::hasTable('coin_transactions');
+
+        $totalCirculating = $hasCoinCol ? (float) Business::sum('coin_balance') : 0.0;
+        $totalTopupCoins = $hasCoinTx ? (float) CoinTransaction::where('type', 'TOPUP')->sum('amount') : 0.0;
+        $totalTopupRupiah = $hasCoinTx ? (float) CoinTransaction::where('type', 'TOPUP')->sum('payment_amount') : 0.0;
+        $totalNotasDeducted = $hasCoinTx ? CoinTransaction::where('type', 'USAGE')->count() : 0;
+        $criticalCount = $hasCoinCol ? $businesses->filter(fn($b) => $b->is_coin_low || $b->is_coin_out)->count() : 0;
 
         return response()->json([
             'metrics' => [

@@ -211,21 +211,26 @@ class BusinessController extends Controller
 
         $business = Business::findOrFail($businessId);
 
-        $recentMutations = \App\Models\CoinTransaction::where('business_id', $businessId)
-            ->with(['outlet:id,name', 'creator:id,name'])
-            ->orderByDesc('id')
-            ->limit(10)
-            ->get();
+        $hasCoinCol = \Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coin_balance');
+        $hasCoinTx = \Illuminate\Support\Facades\Schema::hasTable('coin_transactions');
+
+        $recentMutations = $hasCoinTx
+            ? \App\Models\CoinTransaction::where('business_id', $businessId)
+                ->with(['outlet:id,name', 'creator:id,name'])
+                ->orderByDesc('id')
+                ->limit(10)
+                ->get()
+            : [];
 
         return response()->json([
             'business_id'            => $business->id,
             'business_name'          => $business->name,
-            'coin_balance'           => $business->coin_balance,
-            'coins_per_transaction'  => $business->coins_per_transaction,
-            'remaining_transactions' => $business->remaining_transactions,
-            'low_coin_threshold'     => $business->low_coin_threshold ?: 20,
-            'is_coin_low'            => $business->is_coin_low,
-            'is_coin_out'            => $business->is_coin_out,
+            'coin_balance'           => $hasCoinCol ? $business->coin_balance : 0,
+            'coins_per_transaction'  => $hasCoinCol ? $business->coins_per_transaction : 1,
+            'remaining_transactions' => $hasCoinCol ? $business->remaining_transactions : 0,
+            'low_coin_threshold'     => $hasCoinCol ? ($business->low_coin_threshold ?: 20) : 20,
+            'is_coin_low'            => $hasCoinCol ? $business->is_coin_low : false,
+            'is_coin_out'            => $hasCoinCol ? $business->is_coin_out : false,
             'recent_mutations'       => $recentMutations,
         ]);
     }

@@ -167,17 +167,17 @@ class User extends Authenticatable
 
     public function isSuperadminPlatform(): bool
     {
-        return in_array($this->role, ['superadmin_platform', 'superadmin', 'owner_website', 'owner_bisnis', 'owner', 'admin']);
-    }
-
-    public function isOwnerBisnis(): bool
-    {
-        return in_array($this->role, ['owner_bisnis', 'owner_website', 'owner']);
+        return in_array($this->role, ['superadmin_platform', 'superadmin']);
     }
 
     public function isOwnerWebsite(): bool
     {
-        return $this->isOwnerBisnis() || $this->isSuperadminPlatform();
+        return $this->role === 'owner_website' || $this->isSuperadminPlatform();
+    }
+
+    public function isOwnerBisnis(): bool
+    {
+        return in_array($this->role, ['owner_bisnis', 'owner', 'admin']) || $this->isOwnerWebsite();
     }
 
     public function isOwnerOutlet(): bool
@@ -192,7 +192,6 @@ class User extends Authenticatable
 
     public function canManage(User $target): bool
     {
-        if ($this->id === $target->id) return true;
         if ($this->isSuperadminPlatform()) return true;
 
         // User dari tenant lain tidak bisa dikelola
@@ -200,12 +199,20 @@ class User extends Authenticatable
             return false;
         }
 
-        // Owner bisnis bisa mengelola seluruh user di bisnisnya (kecuali superadmin)
-        if ($this->isOwnerBisnis()) {
+        // Owner Website bisa mengelola seluruh user di bisnisnya (kecuali Superadmin Platform)
+        if ($this->isOwnerWebsite()) {
             return !$target->isSuperadminPlatform();
         }
 
-        // Manager outlet hanya bisa mengelola kasir di outletnya
+        // Owner Bisnis HANYA bisa mengelola owner outlet dan pegawai di bisnisnya.
+        // TIDAK BISA mengelola superadmin_platform, owner_website, atau owner_bisnis.
+        if ($this->isOwnerBisnis()) {
+            return !$target->isSuperadminPlatform()
+                && !$target->isOwnerWebsite()
+                && !in_array($target->role, ['owner_bisnis', 'owner', 'admin']);
+        }
+
+        // Manager outlet / Owner outlet hanya bisa mengelola pegawai di outletnya
         if ($this->isOwnerOutlet()) {
             return (int)$this->outlet_id === (int)$target->outlet_id && $target->isPegawai();
         }

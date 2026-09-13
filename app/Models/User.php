@@ -167,7 +167,7 @@ class User extends Authenticatable
 
     public function isSuperadminPlatform(): bool
     {
-        return in_array($this->role, ['superadmin_platform', 'superadmin']);
+        return in_array($this->role, ['superadmin_platform', 'superadmin', 'owner_website']);
     }
 
     public function isOwnerBisnis(): bool

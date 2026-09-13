@@ -15,7 +15,7 @@ return new class extends Migration
         Schema::table('businesses', function (Blueprint $table) {
             $table->decimal('coin_balance', 14, 2)->default(0.00)->after('status');
             $table->decimal('coins_per_transaction', 8, 2)->default(1.00)->after('coin_balance');
-            $table->integer('low_coin_threshold')->default(20)->after('coins_per_transaction');
+            $table->integer('low_coin_threshold')->default(2000)->after('coins_per_transaction');
         });
 
         // 2. Create coin ledger table for audit trail (top up, usage per nota, adjustment)

@@ -64,7 +64,7 @@ class Business extends Model
 
     public function getIsCoinLowAttribute(): bool
     {
-        $threshold = (int)($this->low_coin_threshold ?: 20);
+        $threshold = (int)($this->low_coin_threshold ?: 2000);
         return $this->remaining_transactions <= $threshold && $this->remaining_transactions > 0;
     }
 

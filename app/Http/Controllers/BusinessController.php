@@ -228,7 +228,7 @@ class BusinessController extends Controller
             'coin_balance'           => $hasCoinCol ? $business->coin_balance : 0,
             'coins_per_transaction'  => $hasCoinCol ? $business->coins_per_transaction : 1,
             'remaining_transactions' => $hasCoinCol ? $business->remaining_transactions : 0,
-            'low_coin_threshold'     => $hasCoinCol ? ($business->low_coin_threshold ?: 20) : 20,
+            'low_coin_threshold'     => $hasCoinCol ? ($business->low_coin_threshold ?: 2000) : 2000,
             'is_coin_low'            => $hasCoinCol ? $business->is_coin_low : false,
             'is_coin_out'            => $hasCoinCol ? $business->is_coin_out : false,
             'recent_mutations'       => $recentMutations,

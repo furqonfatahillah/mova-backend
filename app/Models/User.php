@@ -70,14 +70,20 @@ class User extends Authenticatable
     protected static function booted(): void
     {
         static::creating(function ($user) {
-            if (empty($user->referral_code)) {
-                $user->referral_code = static::generateUniqueReferralCode();
+            if (\Illuminate\Support\Facades\Schema::hasColumn('users', 'referral_code')) {
+                if (empty($user->referral_code)) {
+                    $user->referral_code = static::generateUniqueReferralCode();
+                }
             }
         });
     }
 
     public static function generateUniqueReferralCode(): string
     {
+        if (!\Illuminate\Support\Facades\Schema::hasColumn('users', 'referral_code')) {
+            return 'REF-' . strtoupper(\Illuminate\Support\Str::random(6));
+        }
+
         do {
             $code = 'REF-' . strtoupper(\Illuminate\Support\Str::random(6));
         } while (static::where('referral_code', $code)->exists());

@@ -50,8 +50,12 @@ class CoinService
     /**
      * Deduct coins when an order nota is completed (PAID) using atomic row lock.
      */
-    public static function deductForOrder(int $businessId, string $orderNumber, ?int $outletId = null, ?int $userId = null): CoinTransaction
+    public static function deductForOrder(int $businessId, string $orderNumber, ?int $outletId = null, ?int $userId = null): ?CoinTransaction
     {
+        if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coin_balance')) {
+            return null;
+        }
+
         return DB::transaction(function () use ($businessId, $orderNumber, $outletId, $userId) {
             $business = Business::where('id', $businessId)->lockForUpdate()->firstOrFail();
 
@@ -93,6 +97,10 @@ class CoinService
         ?string $notes = null,
         ?int $adminId = null
     ): CoinTransaction {
+        if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coin_balance')) {
+            throw new \Exception("Tabel koin belum dibuat di database server produksi. Silakan jalankan 'php artisan migrate --force' di terminal VPS server produksi Anda.");
+        }
+
         if ($coins <= 0) {
             throw new \InvalidArgumentException('Jumlah koin top-up harus lebih besar dari 0.');
         }
@@ -127,6 +135,10 @@ class CoinService
      */
     public static function updateRate(int $businessId, float $coinsPerTx, ?int $adminId = null): void
     {
+        if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coins_per_transaction')) {
+            throw new \Exception("Tabel koin belum dibuat di database server produksi. Silakan jalankan 'php artisan migrate --force' di terminal VPS server produksi Anda.");
+        }
+
         if ($coinsPerTx < 0) {
             throw new \InvalidArgumentException('Tarif koin per nota tidak boleh negatif.');
         }

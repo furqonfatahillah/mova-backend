@@ -180,6 +180,12 @@ class TransactionController extends Controller
             $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
             $businessId = (int)($request->user()->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
 
+            if (!$outletId || $outletId === 'ALL' || $outletId === 'all') {
+                $outletId = \App\Models\Outlet::where('business_id', $businessId)->where('is_main', true)->value('id')
+                         ?? \App\Models\Outlet::where('business_id', $businessId)->value('id')
+                         ?? 1;
+            }
+
             // Pre-check SaaS coin balance if order is finalized as PAID
             if ($orderStatus === 'PAID') {
                 $coinCheck = CoinService::canTransact($businessId);
@@ -508,6 +514,12 @@ class TransactionController extends Controller
 
         $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
         $businessId = (int)($request->user()->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
+
+        if (!$outletId || $outletId === 'ALL' || $outletId === 'all') {
+            $outletId = \App\Models\Outlet::where('business_id', $businessId)->where('is_main', true)->value('id')
+                     ?? \App\Models\Outlet::where('business_id', $businessId)->value('id')
+                     ?? 1;
+        }
 
         // Pre-check SaaS coin balance if order is finalized as PAID
         if ($orderStatus === 'PAID') {

@@ -17,6 +17,8 @@ class MenuController extends Controller
             'creator',
             'updater',
             'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
+            'bundleItems.bundledMenu',
+            'bundleItems.ingredient',
             'modifierGroups.options.ingredient',
         ];
 
@@ -26,7 +28,7 @@ class MenuController extends Controller
 
         $query = Menu::with($relations)->orderBy('code');
 
-        if ($request->filled('item_type') && in_array($request->item_type, ['RECIPE', 'DIRECT', 'SERVICE'])) {
+        if ($request->filled('item_type') && in_array($request->item_type, ['RECIPE', 'DIRECT', 'SERVICE', 'BUNDLE'])) {
             $query->where('item_type', $request->item_type);
         }
 
@@ -41,7 +43,7 @@ class MenuController extends Controller
             'name'        => 'required|string|max:255',
             'description' => 'nullable|string',
             'category'    => 'nullable|string|max:100',
-            'item_type'   => 'nullable|string|in:RECIPE,DIRECT,SERVICE',
+            'item_type'   => 'nullable|string|in:RECIPE,DIRECT,SERVICE,BUNDLE',
             'track_stock' => 'nullable|boolean',
             'stock'       => 'nullable|numeric|min:0',
             'min_stock'   => 'nullable|numeric|min:0',
@@ -50,20 +52,30 @@ class MenuController extends Controller
             'unit'        => 'nullable|string|max:20',
             'active'      => 'nullable|boolean',
             'outlet_id'   => 'nullable|integer',
+            'bundle_items'                  => 'nullable|array',
+            'bundle_items.*.bundled_menu_id'=> 'nullable|exists:menus,id',
+            'bundle_items.*.ingredient_id'  => 'nullable|exists:ingredients,id',
+            'bundle_items.*.qty'            => 'required|numeric|min:0.001',
+            'bundle_items.*.unit'           => 'nullable|string',
         ]);
 
         $data['item_type'] = $data['item_type'] ?? 'RECIPE';
-        $data['track_stock'] = $data['track_stock'] ?? ($data['item_type'] !== 'SERVICE');
+        $data['track_stock'] = $data['track_stock'] ?? ($data['item_type'] !== 'SERVICE' && $data['item_type'] !== 'BUNDLE');
         $data['stock'] = (float)($data['stock'] ?? 0);
         $data['min_stock'] = (float)($data['min_stock'] ?? 0);
         $data['cost_price'] = (float)($data['cost_price'] ?? 0);
-        $data['unit'] = $data['unit'] ?? ($data['item_type'] === 'DIRECT' ? 'pcs' : ($data['item_type'] === 'SERVICE' ? 'layanan' : 'porsi'));
+        $data['unit'] = $data['unit'] ?? ($data['item_type'] === 'DIRECT' ? 'pcs' : ($data['item_type'] === 'SERVICE' ? 'layanan' : ($data['item_type'] === 'BUNDLE' ? 'paket' : 'porsi')));
         $data['created_by'] = $request->user()?->id;
 
         $outletId = $data['outlet_id'] ?? null;
-        unset($data['outlet_id']);
+        $bundleItems = $data['bundle_items'] ?? null;
+        unset($data['outlet_id'], $data['bundle_items']);
 
         $menu = Menu::create($data);
+
+        if ($bundleItems && is_array($bundleItems)) {
+            $this->syncBundleItems($menu, $bundleItems);
+        }
 
         // Jika outlet_id diberikan dan tipe barang adalah DIRECT, set stok awal outlet
         if ($outletId && $menu->item_type === 'DIRECT') {
@@ -73,7 +85,7 @@ class MenuController extends Controller
             );
         }
 
-        $storeRelations = ['creator', 'updater', 'modifierGroups.options.ingredient'];
+        $storeRelations = ['creator', 'updater', 'bundleItems.bundledMenu', 'bundleItems.ingredient', 'modifierGroups.options.ingredient'];
         if (Schema::hasTable('outlet_menus')) {
             $storeRelations[] = 'outletMenus';
         }
@@ -87,6 +99,8 @@ class MenuController extends Controller
             'creator',
             'updater',
             'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
+            'bundleItems.bundledMenu',
+            'bundleItems.ingredient',
             'modifierGroups.options.ingredient',
         ];
         if (Schema::hasTable('outlet_menus')) {
@@ -104,7 +118,7 @@ class MenuController extends Controller
             'name'        => 'sometimes|string|max:255',
             'description' => 'nullable|string',
             'category'    => 'nullable|string|max:100',
-            'item_type'   => 'nullable|string|in:RECIPE,DIRECT,SERVICE',
+            'item_type'   => 'nullable|string|in:RECIPE,DIRECT,SERVICE,BUNDLE',
             'track_stock' => 'nullable|boolean',
             'stock'       => 'nullable|numeric|min:0',
             'min_stock'   => 'nullable|numeric|min:0',
@@ -113,14 +127,24 @@ class MenuController extends Controller
             'unit'        => 'nullable|string|max:20',
             'active'      => 'nullable|boolean',
             'outlet_id'   => 'nullable|integer',
+            'bundle_items'                  => 'nullable|array',
+            'bundle_items.*.bundled_menu_id'=> 'nullable|exists:menus,id',
+            'bundle_items.*.ingredient_id'  => 'nullable|exists:ingredients,id',
+            'bundle_items.*.qty'            => 'required|numeric|min:0.001',
+            'bundle_items.*.unit'           => 'nullable|string',
         ]);
 
         $outletId = $data['outlet_id'] ?? null;
-        unset($data['outlet_id']);
+        $bundleItems = $data['bundle_items'] ?? null;
+        unset($data['outlet_id'], $data['bundle_items']);
 
         $data['updated_by'] = $request->user()?->id;
 
         $menu->update($data);
+
+        if ($bundleItems !== null && is_array($bundleItems)) {
+            $this->syncBundleItems($menu, $bundleItems);
+        }
 
         // Jika stok diupdate untuk outlet tertentu
         if ($outletId && array_key_exists('stock', $data) && Schema::hasTable('outlet_menus')) {
@@ -130,12 +154,29 @@ class MenuController extends Controller
             );
         }
 
-        $updateRelations = ['creator', 'updater'];
+        $updateRelations = ['creator', 'updater', 'bundleItems.bundledMenu', 'bundleItems.ingredient', 'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version')];
         if (Schema::hasTable('outlet_menus')) {
             $updateRelations[] = 'outletMenus';
         }
         $menu->load($updateRelations);
         return response()->json($menu);
+    }
+
+    private function syncBundleItems(Menu $menu, array $items)
+    {
+        $menu->bundleItems()->delete();
+        foreach ($items as $it) {
+            if (!empty($it['bundled_menu_id']) || !empty($it['ingredient_id'])) {
+                \App\Models\BundleItem::create([
+                    'menu_id'         => $menu->id,
+                    'bundled_menu_id' => $it['bundled_menu_id'] ?? null,
+                    'ingredient_id'   => $it['ingredient_id'] ?? null,
+                    'qty'             => (float)($it['qty'] ?? 1),
+                    'unit'            => $it['unit'] ?? null,
+                ]);
+            }
+        }
+    }
     }
 
     public function destroy(Menu $menu)

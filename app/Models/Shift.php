@@ -96,14 +96,19 @@ class Shift extends Model
                         });
                 })->orWhere('status', 'SPLIT_CLOSED');
             })
-            ->with(['menu.recipes.items.ingredient', 'modifiers.ingredient'])
+            ->with([
+                'menu.recipes.items.ingredient',
+                'menu.bundleItems.bundledMenu.recipes.items.ingredient',
+                'menu.bundleItems.ingredient',
+                'modifiers.ingredient'
+            ])
             ->get();
         $usageByIngredient = [];
 
         foreach ($transactions as $trx) {
             $menu = $trx->menu;
             if ($menu) {
-                // Find the recipe version matching transaction
+                // 1. Regular Recipe items
                 $recipe = $menu->recipes->firstWhere('version', $trx->recipe_version) 
                     ?: $menu->recipes->first();
 
@@ -129,6 +134,64 @@ class Shift extends Model
 
                         $usageByIngredient[$ingId]['total_qty'] += $usedQty;
                         $usageByIngredient[$ingId]['total_cost'] += $usedQty * $usageByIngredient[$ingId]['harga_satuan'];
+                    }
+                }
+
+                // 2. BUNDLE items (multi-component package / Buy 1 Get 1)
+                if ($menu->item_type === 'BUNDLE' || $menu->bundleItems->count() > 0) {
+                    foreach ($menu->bundleItems as $bi) {
+                        $bundledQty = (float)($bi->qty * (int)$trx->qty);
+
+                        // Bundled menu recipe ingredients
+                        if ($bi->bundledMenu) {
+                            $bmRecipe = $bi->bundledMenu->activeRecipe();
+                            if ($bmRecipe) {
+                                foreach ($bmRecipe->items as $item) {
+                                    $ingId = $item->ingredient_id;
+                                    $ing = $item->ingredient;
+                                    if (!$ing) continue;
+
+                                    $usedQty = (float)$item->qty * $bundledQty;
+
+                                    if (!isset($usageByIngredient[$ingId])) {
+                                        $usageByIngredient[$ingId] = [
+                                            'ingredient_id'   => $ingId,
+                                            'ingredient_code' => $ing->code,
+                                            'ingredient_name' => $ing->name,
+                                            'unit'            => $item->unit ?: $ing->unit_pakai,
+                                            'total_qty'       => 0.0,
+                                            'harga_satuan'    => (float)$ing->harga / max((float)$ing->konversi, 1),
+                                            'total_cost'      => 0.0,
+                                        ];
+                                    }
+
+                                    $usageByIngredient[$ingId]['total_qty'] += $usedQty;
+                                    $usageByIngredient[$ingId]['total_cost'] += $usedQty * $usageByIngredient[$ingId]['harga_satuan'];
+                                }
+                            }
+                        }
+
+                        // Direct ingredient inside bundle
+                        if ($bi->ingredient_id && $bi->ingredient) {
+                            $ingId = $bi->ingredient_id;
+                            $ing = $bi->ingredient;
+                            $usedQty = $bundledQty;
+
+                            if (!isset($usageByIngredient[$ingId])) {
+                                $usageByIngredient[$ingId] = [
+                                    'ingredient_id'   => $ingId,
+                                    'ingredient_code' => $ing->code,
+                                    'ingredient_name' => $ing->name,
+                                    'unit'            => $bi->unit ?: $ing->unit_pakai,
+                                    'total_qty'       => 0.0,
+                                    'harga_satuan'    => (float)$ing->harga / max((float)$ing->konversi, 1),
+                                    'total_cost'      => 0.0,
+                                ];
+                            }
+
+                            $usageByIngredient[$ingId]['total_qty'] += $usedQty;
+                            $usageByIngredient[$ingId]['total_cost'] += $usedQty * $usageByIngredient[$ingId]['harga_satuan'];
+                        }
                     }
                 }
             }

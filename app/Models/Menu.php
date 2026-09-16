@@ -39,6 +39,7 @@ class Menu extends Model
         'is_recipe',
         'is_direct',
         'is_service',
+        'is_bundle',
     ];
 
     protected $casts = [
@@ -53,6 +54,11 @@ class Menu extends Model
     public function recipes()
     {
         return $this->hasMany(Recipe::class);
+    }
+
+    public function bundleItems()
+    {
+        return $this->hasMany(BundleItem::class, 'menu_id')->with(['bundledMenu', 'ingredient']);
     }
 
     public function transactions()
@@ -173,17 +179,37 @@ class Menu extends Model
         return $this->item_type === 'SERVICE';
     }
 
+    public function getIsBundleAttribute(): bool
+    {
+        return $this->item_type === 'BUNDLE';
+    }
+
     /**
      * Hitung HPP / Cost of Goods Sold untuk produk ini
      */
     public function calculateHpp(?string $date = null): float
     {
-        // 1. Jika barang retail direct atau jasa, gunakan cost_price langsung
+        // 1. Jika menu bertipe BUNDLE / Combo, hitung total HPP dari seluruh item di dalamnya
+        if ($this->is_bundle) {
+            $sum = 0.0;
+            foreach ($this->bundleItems as $bi) {
+                if ($bi->bundledMenu) {
+                    $sum += $bi->bundledMenu->calculateHpp($date) * (float)$bi->qty;
+                } elseif ($bi->ingredient) {
+                    $ing = $bi->ingredient;
+                    $hargaPakai = (float)$ing->harga / max((float)$ing->konversi, 1);
+                    $sum += (float)$bi->qty * $hargaPakai;
+                }
+            }
+            return round($sum, 2);
+        }
+
+        // 2. Jika barang retail direct atau jasa, gunakan cost_price langsung
         if ($this->is_direct || $this->is_service) {
             return (float)$this->cost_price;
         }
 
-        // 2. Jika olahan resep (RECIPE), hitung total harga bahan baku
+        // 3. Jika olahan resep (RECIPE), hitung total harga bahan baku
         $recipe = $this->activeRecipe($date);
         if ($recipe) {
             $sum = 0.0;

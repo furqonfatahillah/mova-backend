@@ -359,6 +359,63 @@ class TransactionController extends Controller
                         }
                     }
 
+                    // Deduct stock for BUNDLE / Promo items (multi-component package / Buy 1 Get 1)
+                    if ($orderStatus === 'PAID' && ($menu->item_type === 'BUNDLE' || $menu->bundleItems->count() > 0)) {
+                        foreach ($menu->bundleItems as $bi) {
+                            $bundledQty = (float)($bi->qty * $qty);
+
+                            // 1. Bundled Menu (Recipe or Direct)
+                            if ($bi->bundledMenu) {
+                                $bm = $bi->bundledMenu;
+                                if ($bm->item_type === 'DIRECT' && $bm->track_stock) {
+                                    $bm->decrement('stock', $bundledQty);
+                                    if ($outletId) {
+                                        try {
+                                            $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $bm->id)->first();
+                                            if ($om) {
+                                                $om->decrement('stock', $bundledQty);
+                                            }
+                                        } catch (\Throwable $e) {}
+                                    }
+                                }
+
+                                if (!$shiftId) {
+                                    $bmRecipe = $bm->activeRecipe($data['date']);
+                                    if ($bmRecipe) {
+                                        foreach ($bmRecipe->items as $item) {
+                                            StockMovement::create([
+                                                'date'           => $data['date'],
+                                                'ingredient_id'  => $item->ingredient_id,
+                                                'type'           => 'SALE_USAGE',
+                                                'qty'            => (float)($item->qty * $bundledQty),
+                                                'note'           => "{$orderNumber} – Bundling {$menu->name} (x{$qty}) → {$bm->name} (x{$bi->qty})",
+                                                'transaction_id' => $trx->id,
+                                                'outlet_id'      => $outletId,
+                                                'user_id'        => $request->user()->id,
+                                                'created_by'     => $request->user()->id,
+                                            ]);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 2. Direct Ingredient in Bundle
+                            if ($bi->ingredient_id && !$shiftId) {
+                                StockMovement::create([
+                                    'date'           => $data['date'],
+                                    'ingredient_id'  => $bi->ingredient_id,
+                                    'type'           => 'SALE_USAGE',
+                                    'qty'            => (float)($bi->qty * $qty),
+                                    'note'           => "{$orderNumber} – Bundling {$menu->name} (x{$qty}) → Bahan #{$bi->ingredient_id}",
+                                    'transaction_id' => $trx->id,
+                                    'outlet_id'      => $outletId,
+                                    'user_id'        => $request->user()->id,
+                                    'created_by'     => $request->user()->id,
+                                ]);
+                            }
+                        }
+                    }
+
                     $trx->load(['menu', 'modifiers.ingredient', 'discount']);
                     $results[] = $trx;
                 }

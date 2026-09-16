@@ -23,7 +23,8 @@ class TransferController extends Controller
             'items.ingredient',
             'items.menu',
             'creator',
-            'updater'
+            'updater',
+            'receiver'
         ])
         ->orderByDesc('date')
         ->orderByDesc('id');
@@ -62,6 +63,7 @@ class TransferController extends Controller
             'destination_outlet_id' => 'nullable|exists:outlets,id',
             'destination_name'      => 'nullable|string|max:150',
             'transfer_type'         => 'nullable|string|in:INTER_OUTLET,INBOUND,OUTBOUND,EXTERNAL',
+            'status'                => 'nullable|string|in:IN_TRANSIT,PENDING,COMPLETED',
             'notes'                 => 'nullable|string|max:500',
             'driver_name'           => 'nullable|string|max:100',
             'vehicle_no'            => 'nullable|string|max:50',
@@ -125,7 +127,9 @@ class TransferController extends Controller
 
         $businessIdToAssign = $userBusinessId ?? $sourceOutlet?->business_id ?? $destOutlet?->business_id;
 
-        $transfer = DB::transaction(function () use ($request, $validated, $sourceOutlet, $destOutlet, $businessIdToAssign) {
+        $initialStatus = $validated['status'] ?? 'IN_TRANSIT';
+
+        $transfer = DB::transaction(function () use ($request, $validated, $sourceOutlet, $destOutlet, $businessIdToAssign, $initialStatus) {
             $date = $validated['date'];
             $dateClean = str_replace('-', '', $date);
             $countQuery = Transfer::whereDate('date', $date);
@@ -165,7 +169,7 @@ class TransferController extends Controller
                 'destination_name'      => $destName,
                 'destination_outlet_id' => $destOutlet?->id,
                 'transfer_type'         => $transferType,
-                'status'                => 'COMPLETED',
+                'status'                => $initialStatus,
                 'notes'                 => $validated['notes'] ?? null,
                 'driver_name'           => $validated['driver_name'] ?? null,
                 'vehicle_no'            => $validated['vehicle_no'] ?? null,
@@ -196,7 +200,7 @@ class TransferController extends Controller
                         'notes'       => $itemData['notes'] ?? null,
                     ]);
 
-                    // Mutasi stok retail outlet asal (jika outlet terdaftar)
+                    // Mutasi potong stok retail outlet asal (langsung dipotong saat dikirim/diproses)
                     if ($sourceOutlet && $menu->track_stock) {
                         try {
                             if (Schema::hasTable('outlet_menus')) {
@@ -210,8 +214,8 @@ class TransferController extends Controller
                         $menu->decrement('stock', $qty);
                     }
 
-                    // Mutasi stok retail outlet tujuan (jika outlet terdaftar)
-                    if ($destOutlet && $menu->track_stock) {
+                    // Mutasi tambah stok retail outlet tujuan (hanya jika langsung status COMPLETED)
+                    if ($initialStatus === 'COMPLETED' && $destOutlet && $menu->track_stock) {
                         try {
                             if (Schema::hasTable('outlet_menus')) {
                                 $destOm = OutletMenu::firstOrCreate(
@@ -261,7 +265,7 @@ class TransferController extends Controller
 
                     $noteSuffix = $canConvert ? " ({$inputQty} {$inputUnit} ≈ " . number_format($baseQty, 0, ',', '.') . " {$baseUnit})" : "";
 
-                    // 1. Mutasi TRANSFER_OUT dari outlet asal (jika outlet terdaftar)
+                    // 1. Mutasi TRANSFER_OUT dari outlet asal (langsung terpotong saat dikirim)
                     if ($sourceOutlet) {
                         StockMovement::create([
                             'date'          => $date,
@@ -276,8 +280,8 @@ class TransferController extends Controller
                         ]);
                     }
 
-                    // 2. Mutasi TRANSFER_IN ke outlet tujuan (jika outlet terdaftar)
-                    if ($destOutlet) {
+                    // 2. Mutasi TRANSFER_IN ke outlet tujuan (hanya jika langsung status COMPLETED)
+                    if ($initialStatus === 'COMPLETED' && $destOutlet) {
                         StockMovement::create([
                             'date'          => $date,
                             'ingredient_id' => $ingredient->id,
@@ -303,6 +307,7 @@ class TransferController extends Controller
             'items.menu',
             'creator',
             'updater',
+            'receiver',
             'stockMovements'
         ]);
 
@@ -318,9 +323,99 @@ class TransferController extends Controller
             'items.menu',
             'creator',
             'updater',
+            'receiver',
             'stockMovements'
         ]);
         return response()->json($transfer);
+    }
+
+    /**
+     * Fitur Receive / Terima Transfer Barang di Cabang Tujuan
+     */
+    public function receive(Request $request, Transfer $transfer)
+    {
+        if ($transfer->status === 'COMPLETED') {
+            return response()->json(['message' => 'Transfer ini sudah diterima sebelumnya.'], 422);
+        }
+        if ($transfer->status === 'CANCELLED') {
+            return response()->json(['message' => 'Transfer ini sudah dibatalkan dan tidak dapat diterima.'], 422);
+        }
+
+        $validated = $request->validate([
+            'received_notes' => 'nullable|string|max:500',
+        ]);
+
+        $destOutlet = $transfer->destinationOutlet;
+        $sourceName = $transfer->source_display_name;
+        $destName   = $transfer->destination_display_name;
+        $userId     = $request->user()?->id;
+        $receiveDate = date('Y-m-d');
+
+        DB::transaction(function () use ($transfer, $destOutlet, $sourceName, $destName, $userId, $receiveDate, $validated) {
+            foreach ($transfer->items as $item) {
+                if ($item->item_type === 'PRODUCT' && $item->menu_id) {
+                    $menu = Menu::find($item->menu_id);
+                    if ($menu && $menu->track_stock && $destOutlet) {
+                        $qty = (float)$item->qty;
+                        try {
+                            if (Schema::hasTable('outlet_menus')) {
+                                $destOm = OutletMenu::firstOrCreate(
+                                    ['outlet_id' => $destOutlet->id, 'menu_id' => $menu->id],
+                                    ['stock' => 0, 'min_stock' => $menu->min_stock]
+                                );
+                                $destOm->increment('stock', $qty);
+                            }
+                        } catch (\Throwable $e) {}
+                        $menu->increment('stock', $qty);
+                    }
+                } elseif ($item->item_type === 'INGREDIENT' && $item->ingredient_id) {
+                    $ingredient = Ingredient::find($item->ingredient_id);
+                    if ($ingredient && $destOutlet) {
+                        $baseQty = (float)$item->qty;
+                        $inputQty = (float)($item->input_qty ?: $baseQty);
+                        $inputUnit = $item->input_unit ?: $item->unit;
+                        $canConvert = $inputUnit !== $item->unit && $inputQty > 0;
+                        $noteSuffix = $canConvert ? " ({$inputQty} {$inputUnit} ≈ " . number_format($baseQty, 0, ',', '.') . " {$item->unit})" : "";
+
+                        StockMovement::create([
+                            'date'          => $receiveDate,
+                            'ingredient_id' => $ingredient->id,
+                            'type'          => 'TRANSFER_IN',
+                            'qty'           => $baseQty,
+                            'note'          => "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})",
+                            'transfer_id'   => $transfer->id,
+                            'outlet_id'     => $destOutlet->id,
+                            'user_id'       => $userId,
+                            'created_by'    => $userId,
+                        ]);
+                    }
+                }
+            }
+
+            $transfer->update([
+                'status'         => 'COMPLETED',
+                'received_at'    => now(),
+                'received_by'    => $userId,
+                'received_notes' => $validated['received_notes'] ?? null,
+                'updated_by'     => $userId,
+            ]);
+        });
+
+        $transfer->load([
+            'sourceOutlet',
+            'destinationOutlet',
+            'items.ingredient',
+            'items.menu',
+            'creator',
+            'updater',
+            'receiver',
+            'stockMovements'
+        ]);
+
+        return response()->json([
+            'message'  => "Transfer {$transfer->transfer_no} berhasil diterima! Stok cabang tujuan telah diperbarui.",
+            'transfer' => $transfer,
+        ]);
     }
 
     public function cancel(Request $request, Transfer $transfer)
@@ -329,8 +424,10 @@ class TransferController extends Controller
             return response()->json(['message' => 'Transfer ini sudah dibatalkan sebelumnya.'], 422);
         }
 
-        DB::transaction(function () use ($request, $transfer) {
-            // 1. Hapus atau batalkan mutasi bahan baku
+        $wasCompleted = $transfer->status === 'COMPLETED';
+
+        DB::transaction(function () use ($request, $transfer, $wasCompleted) {
+            // 1. Hapus atau batalkan mutasi bahan baku yang tercatat untuk transfer ini
             StockMovement::where('transfer_id', $transfer->id)->delete();
 
             // 2. Kembalikan saldo mutasi produk retail (PRODUCT)
@@ -340,7 +437,7 @@ class TransferController extends Controller
                     if ($menu && $menu->track_stock) {
                         $qty = (float)$item->qty;
 
-                        // Kembalikan ke outlet asal
+                        // Kembalikan stok ke outlet asal (karena saat pengiriman stok asal selalu dipotong)
                         if ($transfer->source_outlet_id) {
                             try {
                                 if (Schema::hasTable('outlet_menus')) {
@@ -354,8 +451,8 @@ class TransferController extends Controller
                             $menu->increment('stock', $qty);
                         }
 
-                        // Tarik kembali dari outlet tujuan
-                        if ($transfer->destination_outlet_id) {
+                        // Tarik kembali stok dari outlet tujuan HANYA jika transfer sempat berstatus COMPLETED
+                        if ($wasCompleted && $transfer->destination_outlet_id) {
                             try {
                                 if (Schema::hasTable('outlet_menus')) {
                                     $destOm = OutletMenu::where('outlet_id', $transfer->destination_outlet_id)
@@ -383,7 +480,8 @@ class TransferController extends Controller
             'items.ingredient',
             'items.menu',
             'creator',
-            'updater'
+            'updater',
+            'receiver'
         ]);
 
         return response()->json([

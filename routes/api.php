@@ -92,6 +92,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/transfers',                     [TransferController::class, 'index']);
     Route::post('/transfers',                    [TransferController::class, 'store']);
     Route::get('/transfers/{transfer}',          [TransferController::class, 'show']);
+    Route::post('/transfers/{transfer}/receive', [TransferController::class, 'receive']);
     Route::post('/transfers/{transfer}/cancel',  [TransferController::class, 'cancel']);
 
     // POS & Open Bills (Dine-in Table Management)

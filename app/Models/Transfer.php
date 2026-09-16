@@ -25,6 +25,11 @@ class Transfer extends Model
         'received_at',
         'received_by',
         'received_notes',
+        'returned_at',
+        'returned_by',
+        'return_reason',
+        'return_disposition',
+        'return_notes',
         'notes',
         'driver_name',
         'vehicle_no',
@@ -37,6 +42,7 @@ class Transfer extends Model
         'created_by_name',
         'updated_by_name',
         'received_by_name',
+        'returned_by_name',
         'changed_at',
         'changed_by_name',
         'source_display_name',
@@ -58,6 +64,11 @@ class Transfer extends Model
         return $this->belongsTo(User::class, 'received_by');
     }
 
+    public function returner()
+    {
+        return $this->belongsTo(User::class, 'returned_by');
+    }
+
     public function items()
     {
         return $this->hasMany(TransferItem::class);
@@ -71,6 +82,11 @@ class Transfer extends Model
     public function getReceivedByNameAttribute(): ?string
     {
         return $this->receiver?->name;
+    }
+
+    public function getReturnedByNameAttribute(): ?string
+    {
+        return $this->returner?->name;
     }
 
     public function getSourceDisplayNameAttribute(): string

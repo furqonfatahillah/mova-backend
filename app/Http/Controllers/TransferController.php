@@ -9,6 +9,7 @@ use App\Models\Outlet;
 use App\Models\Ingredient;
 use App\Models\Menu;
 use App\Models\OutletMenu;
+use App\Models\WasteLog;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -24,7 +25,8 @@ class TransferController extends Controller
             'items.menu',
             'creator',
             'updater',
-            'receiver'
+            'receiver',
+            'returner'
         ])
         ->orderByDesc('date')
         ->orderByDesc('id');
@@ -481,11 +483,200 @@ class TransferController extends Controller
             'items.menu',
             'creator',
             'updater',
-            'receiver'
+            'receiver',
+            'returner'
         ]);
 
         return response()->json([
             'message'  => 'Transfer berhasil dibatalkan dan saldo stok telah dikembalikan.',
+            'transfer' => $transfer,
+        ]);
+    }
+
+    /**
+     * Fitur Retur Transfer Barang (Rusak di Jalan / Pengembalian ke Asal / Kerugian Waste)
+     */
+    public function returnTransfer(Request $request, Transfer $transfer)
+    {
+        if ($transfer->status === 'CANCELLED') {
+            return response()->json(['message' => 'Transfer yang sudah dibatalkan tidak dapat diretur.'], 422);
+        }
+
+        $validated = $request->validate([
+            'return_disposition'   => 'required|string|in:RECORD_AS_WASTE,RETURN_TO_SOURCE',
+            'return_reason'        => 'required|string|max:255',
+            'return_notes'         => 'nullable|string|max:500',
+            'items'                => 'required|array|min:1',
+            'items.*.id'           => 'required|exists:transfer_items,id',
+            'items.*.returned_qty' => 'required|numeric|min:0',
+            'items.*.reason'       => 'nullable|string|max:255',
+        ]);
+
+        $userId = $request->user()?->id;
+        $businessId = $request->user()?->business_id ?? $transfer->business_id;
+        $returnDate = date('Y-m-d');
+        $disposition = $validated['return_disposition'];
+        $returnReason = $validated['return_reason'];
+
+        $totalReturned = 0;
+        $totalOriginal = 0;
+
+        DB::transaction(function () use ($transfer, $validated, $userId, $businessId, $returnDate, $disposition, $returnReason, &$totalReturned, &$totalOriginal) {
+            $itemsMap = collect($validated['items'])->keyBy('id');
+
+            foreach ($transfer->items as $item) {
+                $itemInput = $itemsMap->get($item->id);
+                if (!$itemInput) continue;
+
+                $returnedQty = (float)($itemInput['returned_qty'] ?? 0);
+                $originalQty = (float)($item->input_qty ?? $item->qty);
+                $totalOriginal += $originalQty;
+                $totalReturned += $returnedQty;
+
+                if ($returnedQty > $originalQty) {
+                    throw new \InvalidArgumentException("Jumlah retur untuk item {$item->item_name} ({$returnedQty}) tidak boleh melebihi jumlah kirim ({$originalQty}).");
+                }
+
+                $itemReason = !empty($itemInput['reason']) ? trim($itemInput['reason']) : $returnReason;
+                $receivedQty = max(0, $originalQty - $returnedQty);
+
+                // Update item transfer record
+                $item->update([
+                    'returned_qty'  => $returnedQty,
+                    'received_qty'  => $receivedQty,
+                    'return_reason' => $itemReason,
+                ]);
+
+                if ($returnedQty <= 0) {
+                    continue;
+                }
+
+                // Kalkulasi base qty untuk retur jika satuan beli beda dari satuan pakai
+                $ratio = ($originalQty > 0) ? ($item->qty / $originalQty) : 1;
+                $returnedBaseQty = round($returnedQty * $ratio, 4);
+
+                if ($disposition === 'RECORD_AS_WASTE') {
+                    // DISPOSISI A: RUSAK DI JALAN -> Catat Kerugian Waste Logs
+                    $costPerUnit = 0;
+                    $ingredientId = null;
+                    $menuId = null;
+
+                    if ($item->item_type === 'INGREDIENT' && $item->ingredient_id) {
+                        $ing = Ingredient::find($item->ingredient_id);
+                        $ingredientId = $ing?->id;
+                        $costPerUnit = (float)($ing?->cost_per_unit ?? $ing?->harga_beli ?? 0);
+                    } elseif ($item->item_type === 'PRODUCT' && $item->menu_id) {
+                        $menu = Menu::find($item->menu_id);
+                        $menuId = $menu?->id;
+                        $costPerUnit = (float)($menu?->hpp ?? $menu?->cogs ?? $menu?->price ?? 0);
+                    }
+
+                    $lossCost = round($returnedBaseQty * $costPerUnit, 2);
+                    $wasteNo = 'WST-TRF-' . date('Ymd') . '-' . str_pad(rand(1, 9999), 4, '0', STR_PAD_LEFT);
+
+                    if (Schema::hasTable('waste_logs')) {
+                        WasteLog::create([
+                            'business_id'     => $businessId,
+                            'waste_no'        => $wasteNo,
+                            'date'            => $returnDate,
+                            'ingredient_id'   => $ingredientId,
+                            'menu_id'         => $menuId,
+                            'outlet_id'       => $transfer->destination_outlet_id ?: $transfer->source_outlet_id,
+                            'qty'             => $returnedQty,
+                            'unit_type'       => $item->input_unit ?: $item->unit ?: 'PAKAI',
+                            'qty_pakai'       => $returnedBaseQty,
+                            'cost_per_unit'   => $costPerUnit,
+                            'loss_cost'       => $lossCost,
+                            'reason_category' => 'DELIVERY_DAMAGE',
+                            'notes'           => "Retur Transfer {$transfer->transfer_no} (Rusak di jalan): {$itemReason}",
+                            'action_taken'    => 'Dibuang / Retur Pengiriman Rusak',
+                            'user_id'         => $userId,
+                            'created_by'      => $userId,
+                            'updated_by'      => $userId,
+                        ]);
+                    }
+
+                    // Pencatatan StockMovement WASTE untuk outlet asal
+                    if ($item->item_type === 'INGREDIENT' && $ingredientId) {
+                        StockMovement::create([
+                            'date'          => $returnDate,
+                            'ingredient_id' => $ingredientId,
+                            'type'          => 'WASTE',
+                            'qty'           => -$returnedBaseQty,
+                            'note'          => "Kerugian retur rusak di jalan ({$transfer->transfer_no}): {$itemReason}",
+                            'transfer_id'   => $transfer->id,
+                            'outlet_id'     => $transfer->source_outlet_id,
+                            'user_id'       => $userId,
+                            'created_by'    => $userId,
+                        ]);
+                    }
+
+                } elseif ($disposition === 'RETURN_TO_SOURCE') {
+                    // DISPOSISI B: RETUR KE CABANG ASAL -> Pulihkan stok ke outlet asal
+                    if ($item->item_type === 'PRODUCT' && $item->menu_id) {
+                        $menu = Menu::find($item->menu_id);
+                        if ($menu && $menu->track_stock && $transfer->source_outlet_id) {
+                            try {
+                                if (Schema::hasTable('outlet_menus')) {
+                                    $sourceOm = OutletMenu::firstOrCreate(
+                                        ['outlet_id' => $transfer->source_outlet_id, 'menu_id' => $menu->id],
+                                        ['stock' => 0, 'min_stock' => $menu->min_stock]
+                                    );
+                                    $sourceOm->increment('stock', $returnedQty);
+                                }
+                            } catch (\Throwable $e) {}
+                            $menu->increment('stock', $returnedQty);
+                        }
+                    } elseif ($item->item_type === 'INGREDIENT' && $item->ingredient_id) {
+                        $ing = Ingredient::find($item->ingredient_id);
+                        if ($ing && $transfer->source_outlet_id) {
+                            StockMovement::create([
+                                'date'          => $returnDate,
+                                'ingredient_id' => $ing->id,
+                                'type'          => 'TRANSFER_IN',
+                                'qty'           => $returnedBaseQty,
+                                'note'          => "Retur masuk kembali ke cabang asal dari {$transfer->destination_display_name} ({$transfer->transfer_no}) - Alasan: {$itemReason}",
+                                'transfer_id'   => $transfer->id,
+                                'outlet_id'     => $transfer->source_outlet_id,
+                                'user_id'       => $userId,
+                                'created_by'    => $userId,
+                            ]);
+                        }
+                    }
+                }
+            }
+
+            // Tentukan status transfer akhir
+            $newStatus = ($totalReturned >= $totalOriginal && $totalOriginal > 0) ? 'RETURNED' : 'PARTIALLY_RETURNED';
+
+            $transfer->update([
+                'status'             => $newStatus,
+                'returned_at'        => now(),
+                'returned_by'        => $userId,
+                'return_reason'      => $returnReason,
+                'return_disposition' => $disposition,
+                'return_notes'       => $validated['return_notes'] ?? null,
+                'updated_by'         => $userId,
+            ]);
+        });
+
+        $transfer->load([
+            'sourceOutlet',
+            'destinationOutlet',
+            'items.ingredient',
+            'items.menu',
+            'creator',
+            'updater',
+            'receiver',
+            'returner',
+            'stockMovements'
+        ]);
+
+        $statusText = $transfer->status === 'RETURNED' ? 'Retur Total (Seluruh Item)' : 'Retur Parsial (Sebagian Item)';
+        $dispText = $disposition === 'RECORD_AS_WASTE' ? 'Kerugian Waste (Barang Rusak)' : 'Dikembalikan ke Stok Cabang Asal';
+
+        return response()->json([
+            'message'  => "Retur Dokumen Transfer {$transfer->transfer_no} berhasil diproses ({$statusText} — Disposisi: {$dispText}).",
             'transfer' => $transfer,
         ]);
     }

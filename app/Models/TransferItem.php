@@ -15,12 +15,17 @@ class TransferItem extends Model
         'unit',
         'input_qty',
         'input_unit',
+        'returned_qty',
+        'received_qty',
+        'return_reason',
         'notes',
     ];
 
     protected $casts = [
-        'qty'       => 'float',
-        'input_qty' => 'float',
+        'qty'          => 'float',
+        'input_qty'    => 'float',
+        'returned_qty' => 'float',
+        'received_qty' => 'float',
     ];
 
     protected $appends = [

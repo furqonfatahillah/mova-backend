@@ -13,11 +13,19 @@ class ExpenseController extends Controller
      */
     public function index(Request $request)
     {
+        $user = $request->user();
+        $isOwnerWebsite = $user->role === 'superadmin' || $user->role === 'superadmin_platform' || $user->role === 'owner_website' || $user->is_superadmin_platform || $user->is_owner_website;
+        $isOwnerBisnis  = $isOwnerWebsite || $user->role === 'owner_bisnis' || $user->role === 'owner' || $user->role === 'admin' || $user->is_owner_bisnis;
+
         $query = OperatingExpense::with(['outlet', 'user'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        if (!$isOwnerBisnis && $user->outlet_id) {
+            $query->where(function ($q) use ($user) {
+                $q->where('outlet_id', $user->outlet_id)->orWhereNull('outlet_id');
+            });
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', $request->outlet_id);
         }
 
@@ -55,9 +63,17 @@ class ExpenseController extends Controller
      */
     public function summary(Request $request)
     {
+        $user = $request->user();
+        $isOwnerWebsite = $user->role === 'superadmin' || $user->role === 'superadmin_platform' || $user->role === 'owner_website' || $user->is_superadmin_platform || $user->is_owner_website;
+        $isOwnerBisnis  = $isOwnerWebsite || $user->role === 'owner_bisnis' || $user->role === 'owner' || $user->role === 'admin' || $user->is_owner_bisnis;
+
         $query = OperatingExpense::query();
 
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        if (!$isOwnerBisnis && $user->outlet_id) {
+            $query->where(function ($q) use ($user) {
+                $q->where('outlet_id', $user->outlet_id)->orWhereNull('outlet_id');
+            });
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', $request->outlet_id);
         }
 
@@ -145,11 +161,13 @@ class ExpenseController extends Controller
         $businessId = $user->business_id ?? null;
         $paymentMethod = $data['payment_method'] ?? 'CASH';
 
+        $outletId = !empty($data['outlet_id']) ? $data['outlet_id'] : ($user->outlet_id ?? null);
+
         $expenseNo = OperatingExpense::generateExpenseNo($businessId, $data['date']);
 
         $expense = OperatingExpense::create([
             'business_id'    => $businessId,
-            'outlet_id'      => $data['outlet_id'] ?? null,
+            'outlet_id'      => $outletId,
             'expense_no'     => $expenseNo,
             'date'           => $data['date'],
             'category'       => $data['category'],

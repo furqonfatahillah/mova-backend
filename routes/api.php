@@ -128,11 +128,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::apiResource('discounts', DiscountController::class);
 
     // Opname
-    Route::get('/opnames/history',              [OpnameController::class, 'history']);
-    Route::get('/opnames/sessions/{opname_no}', [OpnameController::class, 'showSession']);
-    Route::get('/opnames',                      [OpnameController::class, 'index']);
-    Route::post('/opnames',                     [OpnameController::class, 'upsert']);
-    Route::post('/opnames/bulk',                [OpnameController::class, 'bulkUpsert']);
+    Route::get('/opnames/history',                      [OpnameController::class, 'history']);
+    Route::get('/opnames/sessions/{opname_no}',         [OpnameController::class, 'showSession']);
+    Route::post('/opnames/sessions/{opname_no}/release', [OpnameController::class, 'releaseSession']);
+    Route::get('/opnames',                              [OpnameController::class, 'index']);
+    Route::post('/opnames',                             [OpnameController::class, 'upsert']);
+    Route::post('/opnames/bulk',                        [OpnameController::class, 'bulkUpsert']);
 
     // Beban Operasional (OPEX / Operating Expenses)
     Route::get('/expenses/summary',             [ExpenseController::class, 'summary']);

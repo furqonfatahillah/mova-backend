@@ -17,7 +17,7 @@ class OpnameController extends Controller
             ->where('period_from', $request->from ?? now()->startOfMonth()->toDateString())
             ->where('period_to',   $request->to   ?? now()->toDateString());
 
-        if ($outletId) {
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
         }
 
@@ -38,9 +38,20 @@ class OpnameController extends Controller
             'approver'      => 'nullable|string|max:100',
             'notes'         => 'nullable|string',
             'is_closed'     => 'nullable|boolean',
+            'action'        => 'nullable|string',
         ]);
 
+        $opnameDate = $data['opname_date'] ?? now()->toDateString();
+        $today = now()->toDateString();
+        if ($opnameDate < $today) {
+            return response()->json([
+                'message' => 'Tanggal pelaksanaan opname tidak boleh tanggal mundur (sebelum hari ini).'
+            ], 422);
+        }
+
         $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? 1;
+        $user = $request->user();
+        $isOwnerOrManager = in_array(strtoupper($user?->role ?? ''), ['OWNER', 'SUPERADMIN', 'ADMIN', 'MANAGER']) || ($user?->is_owner ?? false) || ($user?->is_superadmin ?? false);
 
         $existing = Opname::where('period_from', $data['period_from'])
             ->where('period_to', $data['period_to'])
@@ -50,7 +61,6 @@ class OpnameController extends Controller
 
         $opnameNo = $data['opname_no'] ?? ($existing?->opname_no);
         if (!$opnameNo) {
-            $opnameDate = $data['opname_date'] ?? now()->toDateString();
             $dateClean = str_replace('-', '', $opnameDate);
             $countToday = Opname::whereDate('created_at', now()->toDateString())
                 ->whereNotNull('opname_no')
@@ -59,18 +69,21 @@ class OpnameController extends Controller
             $opnameNo = 'OPN-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
         }
 
+        $isClosed = ($isOwnerOrManager && (($data['action'] ?? '') === 'RELEASE' || !empty($data['is_closed'])));
+
         $updateData = [
             ...$data,
             'opname_no'   => $opnameNo,
-            'opname_date' => $data['opname_date'] ?? ($existing?->opname_date ?? now()->toDateString()),
+            'opname_date' => $opnameDate,
             'outlet_id'   => $outletId,
-            'user_id'     => $request->user()->id,
+            'user_id'     => $user->id,
+            'is_closed'   => $isClosed,
         ];
 
         if ($existing) {
-            $updateData['updated_by'] = $request->user()->id;
+            $updateData['updated_by'] = $user->id;
         } else {
-            $updateData['created_by'] = $request->user()->id;
+            $updateData['created_by'] = $user->id;
         }
 
         $opname = Opname::updateOrCreate(
@@ -97,6 +110,8 @@ class OpnameController extends Controller
             'opname_date'   => 'nullable|date',
             'approver'      => 'nullable|string|max:100',
             'notes'         => 'nullable|string',
+            'action'        => 'nullable|string',
+            'is_closed'     => 'nullable|boolean',
             'items'         => 'required|array',
             'items.*.ingredient_id' => 'required|exists:ingredients,id',
             'items.*.actual_qty'    => 'nullable|numeric|min:0',
@@ -105,7 +120,20 @@ class OpnameController extends Controller
             'items.*.notes'         => 'nullable|string',
         ]);
 
+        $opnameDate = $request->opname_date ?? now()->toDateString();
+        $today = now()->toDateString();
+        if ($opnameDate < $today) {
+            return response()->json([
+                'message' => 'Tanggal pelaksanaan opname tidak boleh di-inputkan tanggal mundur (sebelum hari ini).'
+            ], 422);
+        }
+
         $outletId = $request->outlet_id ?? $request->user()->outlet_id ?? 1;
+        $user = $request->user();
+        $isOwnerOrManager = in_array(strtoupper($user?->role ?? ''), ['OWNER', 'SUPERADMIN', 'ADMIN', 'MANAGER']) || ($user?->is_owner ?? false) || ($user?->is_superadmin ?? false);
+
+        // Determine if this opname session is RELEASED or DRAFT
+        $isClosed = ($isOwnerOrManager && ($request->action === 'RELEASE' || $request->is_closed));
 
         // Check if any item in this period & outlet already has an opname_no
         $existingSession = Opname::where('period_from', $request->period_from)
@@ -115,8 +143,6 @@ class OpnameController extends Controller
             ->first();
 
         $opnameNo = $request->opname_no ?? ($existingSession?->opname_no);
-        $opnameDate = $request->opname_date ?? ($existingSession?->opname_date ?? now()->toDateString());
-
         if (!$opnameNo) {
             $dateClean = str_replace('-', '', $opnameDate);
             $countToday = Opname::whereDate('created_at', now()->toDateString())
@@ -142,13 +168,14 @@ class OpnameController extends Controller
                 'approver'    => $item['approver'] ?? ($request->approver ?? null),
                 'notes'       => $item['notes'] ?? ($request->notes ?? null),
                 'outlet_id'   => $outletId,
-                'user_id'     => $request->user()->id,
+                'user_id'     => $user->id,
+                'is_closed'   => $isClosed,
             ];
 
             if ($existing) {
-                $updateData['updated_by'] = $request->user()->id;
+                $updateData['updated_by'] = $user->id;
             } else {
-                $updateData['created_by'] = $request->user()->id;
+                $updateData['created_by'] = $user->id;
             }
 
             $opname = Opname::updateOrCreate(
@@ -164,10 +191,55 @@ class OpnameController extends Controller
             $results[] = $opname;
         }
 
+        $statusMessage = $isClosed
+            ? "Data opname fisik ({$opnameNo}) berhasil di-release & disetujui!"
+            : "Data opname fisik ({$opnameNo}) berhasil disimpan sebagai DRAFT (Menunggu Release Owner).";
+
         return response()->json([
-            'message'    => 'Data opname fisik berhasil disimpan!',
+            'message'    => $statusMessage,
             'opname_no'  => $opnameNo,
+            'is_closed'  => $isClosed,
+            'status'     => $isClosed ? 'RELEASED' : 'DRAFT',
             'items'      => $results,
+        ]);
+    }
+
+    /**
+     * Release / Approve a Draft Opname session (Owner / Store Manager only)
+     */
+    public function releaseSession(Request $request, $opnameNo)
+    {
+        $user = $request->user();
+        $isOwnerOrManager = in_array(strtoupper($user?->role ?? ''), ['OWNER', 'SUPERADMIN', 'ADMIN', 'MANAGER']) || ($user?->is_owner ?? false) || ($user?->is_superadmin ?? false);
+
+        if (!$isOwnerOrManager) {
+            return response()->json([
+                'message' => 'Hanya Owner atau Store Manager yang berhak merilis (Release) dokumen opname.'
+            ], 403);
+        }
+
+        $opnames = Opname::where('opname_no', $opnameNo)->get();
+        if ($opnames->isEmpty()) {
+            return response()->json(['message' => 'Dokumen sesi opname tidak ditemukan.'], 404);
+        }
+
+        $approverName = $request->approver ?: ($user->name ?? 'Owner Bisnis');
+
+        foreach ($opnames as $opn) {
+            $opn->is_closed  = true;
+            $opn->approver   = $approverName;
+            if ($request->filled('notes')) {
+                $opn->notes = $request->notes;
+            }
+            $opn->updated_by = $user->id;
+            $opn->save();
+        }
+
+        return response()->json([
+            'message'   => "Sesi Opname {$opnameNo} berhasil di-release dan disetujui oleh Owner ({$approverName})!",
+            'opname_no' => $opnameNo,
+            'is_closed' => true,
+            'status'    => 'RELEASED',
         ]);
     }
 
@@ -188,8 +260,6 @@ class OpnameController extends Controller
         }
 
         $allOpnames = $query->get();
-
-        // Group by opname_no
         $grouped = $allOpnames->groupBy('opname_no');
 
         $sessions = [];
@@ -201,7 +271,6 @@ class OpnameController extends Controller
             $from = $first->period_from;
             $to = $first->period_to;
 
-            // Compute quick variance metrics using report helper
             $varianceRows = $reportCtrl->buildVarianceArray($from, $to, $outId);
             $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
 
@@ -243,6 +312,7 @@ class OpnameController extends Controller
                 'match_count'        => $matchCount,
                 'net_variance_value' => round($netVarianceValue, 0),
                 'is_closed'          => (bool) $first->is_closed,
+                'status'             => $first->is_closed ? 'RELEASED' : 'DRAFT',
                 'created_at'         => $first->created_at?->format('Y-m-d H:i:s'),
             ];
         }
@@ -338,6 +408,7 @@ class OpnameController extends Controller
                 'approver'        => $first->approver,
                 'notes'           => $first->notes,
                 'is_closed'       => (bool) $first->is_closed,
+                'status'          => $first->is_closed ? 'RELEASED' : 'DRAFT',
                 'created_at'      => $first->created_at?->format('Y-m-d H:i:s'),
             ],
             'summary' => [

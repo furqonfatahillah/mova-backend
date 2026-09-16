@@ -14,7 +14,9 @@ class WasteLog extends Model
         'business_id',
         'waste_no',
         'date',
+        'item_type',
         'ingredient_id',
+        'menu_id',
         'outlet_id',
         'shift_id',
         'qty',
@@ -41,6 +43,8 @@ class WasteLog extends Model
     protected $appends = [
         'reason_label',
         'ingredient_name',
+        'menu_name',
+        'item_name',
         'unit_pakai',
         'outlet_name',
         'reporter_name',
@@ -66,6 +70,11 @@ class WasteLog extends Model
     public function ingredient()
     {
         return $this->belongsTo(Ingredient::class);
+    }
+
+    public function menu()
+    {
+        return $this->belongsTo(Menu::class);
     }
 
     public function outlet()
@@ -99,8 +108,24 @@ class WasteLog extends Model
         return $this->ingredient?->name;
     }
 
+    public function getMenuNameAttribute(): ?string
+    {
+        return $this->menu?->name;
+    }
+
+    public function getItemNameAttribute(): string
+    {
+        if ($this->item_type === 'MENU' && $this->menu) {
+            return $this->menu->name . ' (Menu)';
+        }
+        return $this->ingredient?->name ?? ($this->menu?->name ?? 'Terbuang');
+    }
+
     public function getUnitPakaiAttribute(): ?string
     {
+        if ($this->item_type === 'MENU' && $this->menu) {
+            return $this->menu->unit || 'porsi';
+        }
         return $this->ingredient?->unit_pakai;
     }
 

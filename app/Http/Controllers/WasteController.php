@@ -4,9 +4,12 @@ namespace App\Http\Controllers;
 
 use App\Models\WasteLog;
 use App\Models\Ingredient;
+use App\Models\Menu;
+use App\Models\OutletMenu;
 use App\Models\StockMovement;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 
 class WasteController extends Controller
 {
@@ -15,7 +18,7 @@ class WasteController extends Controller
      */
     public function index(Request $request)
     {
-        $query = WasteLog::with(['ingredient', 'outlet', 'shift', 'user', 'creator', 'stockMovement'])
+        $query = WasteLog::with(['ingredient', 'menu', 'outlet', 'shift', 'user', 'creator', 'stockMovement'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
@@ -31,12 +34,20 @@ class WasteController extends Controller
             $query->where('date', '<=', $request->to);
         }
 
+        if ($request->filled('item_type') && in_array($request->item_type, ['INGREDIENT', 'MENU'])) {
+            $query->where('item_type', $request->item_type);
+        }
+
         if ($request->filled('reason_category') && $request->reason_category !== 'ALL') {
             $query->where('reason_category', $request->reason_category);
         }
 
         if ($request->filled('ingredient_id')) {
             $query->where('ingredient_id', $request->ingredient_id);
+        }
+
+        if ($request->filled('menu_id')) {
+            $query->where('menu_id', $request->menu_id);
         }
 
         return response()->json($query->limit(300)->get());
@@ -61,7 +72,7 @@ class WasteController extends Controller
             $query->where('date', '<=', $request->to);
         }
 
-        $logs = $query->with('ingredient')->get();
+        $logs = $query->with(['ingredient', 'menu'])->get();
 
         $totalLossCost = (float)$logs->sum('loss_cost');
         $totalEntries = $logs->count();
@@ -87,25 +98,28 @@ class WasteController extends Controller
             ];
         }
 
-        // Sort reasons by loss cost desc
         usort($byReason, fn($a, $b) => $b['loss_cost'] <=> $a['loss_cost']);
 
-        // Top 5 most costly wasted ingredients
-        $byIngredientGroup = $logs->groupBy('ingredient_id');
+        // Top 5 most costly wasted items (ingredients or menus)
+        $byItemGroup = $logs->groupBy(fn($l) => $l->item_type === 'MENU' ? "MENU_{$l->menu_id}" : "ING_{$l->ingredient_id}");
         $topIngredients = [];
 
-        foreach ($byIngredientGroup as $ingId => $ingLogs) {
-            $ing = $ingLogs->first()->ingredient;
-            $cost = (float)$ingLogs->sum('loss_cost');
-            $qty = (float)$ingLogs->sum('qty_pakai');
+        foreach ($byItemGroup as $key => $itemLogs) {
+            $first = $itemLogs->first();
+            $name = $first->item_name;
+            $unit = $first->unit_pakai ?? 'satuan';
+            $cost = (float)$itemLogs->sum('loss_cost');
+            $qty = (float)$itemLogs->sum('qty_pakai');
 
             $topIngredients[] = [
-                'ingredient_id'   => $ingId,
-                'ingredient_name' => $ing?->name ?? "Bahan #{$ingId}",
-                'unit'            => $ing?->unit_pakai ?? 'satuan',
+                'ingredient_id'   => $first->ingredient_id,
+                'menu_id'         => $first->menu_id,
+                'item_type'       => $first->item_type,
+                'ingredient_name' => $name,
+                'unit'            => $unit,
                 'loss_cost'       => $cost,
                 'total_qty'       => $qty,
-                'entries_count'   => $ingLogs->count(),
+                'entries_count'   => $itemLogs->count(),
             ];
         }
 
@@ -122,15 +136,17 @@ class WasteController extends Controller
     }
 
     /**
-     * Store a new waste log and automatically deduct stock via StockMovement.
+     * Store a new waste log and automatically deduct stock via StockMovement / Menu stock.
      */
     public function store(Request $request)
     {
         $data = $request->validate([
             'date'            => 'required|date',
-            'ingredient_id'   => 'required|exists:ingredients,id',
+            'item_type'       => 'nullable|string|in:INGREDIENT,MENU',
+            'ingredient_id'   => 'nullable|required_if:item_type,INGREDIENT|exists:ingredients,id',
+            'menu_id'         => 'nullable|required_if:item_type,MENU|exists:menus,id',
             'qty'             => 'required|numeric|min:0.001',
-            'unit_type'       => 'required|in:BELI,PAKAI',
+            'unit_type'       => 'nullable|string|in:BELI,PAKAI',
             'reason_category' => 'required|string|max:50',
             'notes'           => 'nullable|string|max:500',
             'action_taken'    => 'nullable|string|max:255',
@@ -138,22 +154,9 @@ class WasteController extends Controller
             'shift_id'        => 'nullable|exists:shifts,id',
         ]);
 
+        $itemType = $data['item_type'] ?? ($request->filled('menu_id') ? 'MENU' : 'INGREDIENT');
         $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? 1;
-        $ingredient = Ingredient::findOrFail($data['ingredient_id']);
-        $konversi = max((float)$ingredient->konversi, 1);
 
-        // Calculate quantities and unit costs
-        $isUnitBeli = ($data['unit_type'] === 'BELI');
-        $qtyPakai = $isUnitBeli ? round((float)$data['qty'] * $konversi, 3) : (float)$data['qty'];
-        
-        $costPerPakai = (float)$ingredient->harga / $konversi;
-        if ($costPerPakai <= 0 && (float)$ingredient->last_purchase_price > 0) {
-            $costPerPakai = (float)$ingredient->last_purchase_price / $konversi;
-        }
-
-        $lossCost = round($qtyPakai * $costPerPakai, 2);
-
-        // Generate unique waste reference number: WST-YYYYMMDD-XXXX
         $datePrefix = date('Ymd', strtotime($data['date']));
         $latest = WasteLog::where('waste_no', 'like', "WST-{$datePrefix}-%")
             ->orderByDesc('id')
@@ -169,50 +172,159 @@ class WasteController extends Controller
         $reasonLabel = $categories[$data['reason_category']] ?? $data['reason_category'];
 
         $wasteLog = DB::transaction(function () use (
-            $data, $outletId, $ingredient, $qtyPakai, $costPerPakai, $lossCost, $wasteNo, $reasonLabel, $request
+            $data, $itemType, $outletId, $wasteNo, $reasonLabel, $request
         ) {
-            // 1. Create StockMovement of type WASTE (automatically subtracts stock in signedQty())
-            $movement = StockMovement::create([
-                'date'          => $data['date'],
-                'ingredient_id' => $ingredient->id,
-                'outlet_id'     => $outletId,
-                'type'          => 'WASTE',
-                'waste_reason'  => $data['reason_category'],
-                'qty'           => $qtyPakai,
-                'unit_price'    => $costPerPakai,
-                'total_price'   => $lossCost,
-                'cost_before'   => $costPerPakai,
-                'cost_after'    => $costPerPakai,
-                'note'          => "Waste [{$wasteNo}] {$reasonLabel}" . (!empty($data['notes']) ? " — {$data['notes']}" : ''),
-                'shift_id'      => $data['shift_id'] ?? null,
-                'user_id'       => $request->user()->id,
-                'created_by'    => $request->user()->id,
-            ]);
+            $movementId = null;
+            $qtyPakai = (float)$data['qty'];
+            $costPerUnit = 0;
 
-            // 2. Create WasteLog record
-            $log = WasteLog::create([
-                'waste_no'          => $wasteNo,
-                'date'              => $data['date'],
-                'ingredient_id'     => $ingredient->id,
-                'outlet_id'         => $outletId,
-                'shift_id'          => $data['shift_id'] ?? null,
-                'qty'               => (float)$data['qty'],
-                'unit_type'         => $data['unit_type'],
-                'qty_pakai'         => $qtyPakai,
-                'cost_per_unit'     => $costPerPakai,
-                'loss_cost'         => $lossCost,
-                'reason_category'   => $data['reason_category'],
-                'notes'             => $data['notes'] ?? null,
-                'action_taken'      => $data['action_taken'] ?? null,
-                'user_id'           => $request->user()->id,
-                'stock_movement_id' => $movement->id,
-                'created_by'        => $request->user()->id,
-            ]);
+            if ($itemType === 'MENU') {
+                $menu = Menu::with(['recipes.items.ingredient', 'bundleItems.bundledMenu', 'bundleItems.ingredient'])->findOrFail($data['menu_id']);
+                
+                // Determine Menu cost price (HPP or Price)
+                $costPerUnit = (float)($menu->cost_price > 0 ? $menu->cost_price : ($menu->hpp > 0 ? $menu->hpp : $menu->price));
+                $lossCost = round($qtyPakai * $costPerUnit, 2);
 
-            return $log;
+                // Reduce stock based on Menu item type
+                if ($menu->item_type === 'DIRECT') {
+                    // Deduct direct retail menu stock
+                    $menu->stock = max(0, (float)$menu->stock - $qtyPakai);
+                    $menu->save();
+
+                    if ($outletId && Schema::hasTable('outlet_menus')) {
+                        $om = OutletMenu::firstOrNew(['outlet_id' => $outletId, 'menu_id' => $menu->id]);
+                        $om->stock = max(0, (float)($om->stock ?? 0) - $qtyPakai);
+                        $om->save();
+                    }
+                } elseif ($menu->item_type === 'RECIPE') {
+                    // Deduct ingredients for active recipe
+                    $recipe = $menu->recipes->sortByDesc('version')->first();
+                    if ($recipe && $recipe->items) {
+                        foreach ($recipe.items as $rItem) {
+                            $ingCost = (float)($rItem->ingredient?->harga / max((float)($rItem->ingredient?->konversi ?? 1), 1));
+                            $ingQty = (float)$rItem->qty * $qtyPakai;
+                            
+                            $mov = StockMovement::create([
+                                'date'          => $data['date'],
+                                'ingredient_id' => $rItem->ingredient_id,
+                                'outlet_id'     => $outletId,
+                                'type'          => 'WASTE',
+                                'waste_reason'  => $data['reason_category'],
+                                'qty'           => $ingQty,
+                                'unit_price'    => $ingCost,
+                                'total_price'   => round($ingQty * $ingCost, 2),
+                                'note'          => "Waste Menu [{$menu->name} x {$qtyPakai}] {$reasonLabel}" . (!empty($data['notes']) ? " — {$data['notes']}" : ''),
+                                'shift_id'      => $data['shift_id'] ?? null,
+                                'user_id'       => $request->user()->id,
+                                'created_by'    => $request->user()->id,
+                            ]);
+                            if (!$movementId) $movementId = $mov->id;
+                        }
+                    }
+                } elseif ($menu->item_type === 'BUNDLE') {
+                    // Deduct items inside bundle
+                    if ($menu->bundleItems) {
+                        foreach ($menu->bundleItems as $bItem) {
+                            $bQty = (float)$bItem->qty * $qtyPakai;
+                            if ($bItem->ingredient_id) {
+                                StockMovement::create([
+                                    'date'          => $data['date'],
+                                    'ingredient_id' => $bItem->ingredient_id,
+                                    'outlet_id'     => $outletId,
+                                    'type'          => 'WASTE',
+                                    'waste_reason'  => $data['reason_category'],
+                                    'qty'           => $bQty,
+                                    'note'          => "Waste Paket Bundling [{$menu->name} x {$qtyPakai}] {$reasonLabel}",
+                                    'shift_id'      => $data['shift_id'] ?? null,
+                                    'user_id'       => $request->user()->id,
+                                    'created_by'    => $request->user()->id,
+                                ]);
+                            }
+                        }
+                    }
+                }
+
+                $log = WasteLog::create([
+                    'waste_no'          => $wasteNo,
+                    'date'              => $data['date'],
+                    'item_type'         => 'MENU',
+                    'menu_id'           => $menu->id,
+                    'ingredient_id'     => null,
+                    'outlet_id'         => $outletId,
+                    'shift_id'          => $data['shift_id'] ?? null,
+                    'qty'               => (float)$data['qty'],
+                    'unit_type'         => 'PAKAI',
+                    'qty_pakai'         => $qtyPakai,
+                    'cost_per_unit'     => $costPerUnit,
+                    'loss_cost'         => $lossCost,
+                    'reason_category'   => $data['reason_category'],
+                    'notes'             => $data['notes'] ?? null,
+                    'action_taken'      => $data['action_taken'] ?? null,
+                    'user_id'           => $request->user()->id,
+                    'stock_movement_id' => $movementId,
+                    'created_by'        => $request->user()->id,
+                ]);
+
+                return $log;
+            } else {
+                // INGREDIENT Waste
+                $ingredient = Ingredient::findOrFail($data['ingredient_id']);
+                $konversi = max((float)$ingredient->konversi, 1);
+
+                $unitType = $data['unit_type'] ?? 'PAKAI';
+                $isUnitBeli = ($unitType === 'BELI');
+                $qtyPakai = $isUnitBeli ? round((float)$data['qty'] * $konversi, 3) : (float)$data['qty'];
+                
+                $costPerPakai = (float)$ingredient->harga / $konversi;
+                if ($costPerPakai <= 0 && (float)$ingredient->last_purchase_price > 0) {
+                    $costPerPakai = (float)$ingredient->last_purchase_price / $konversi;
+                }
+
+                $lossCost = round($qtyPakai * $costPerPakai, 2);
+
+                $movement = StockMovement::create([
+                    'date'          => $data['date'],
+                    'ingredient_id' => $ingredient->id,
+                    'outlet_id'     => $outletId,
+                    'type'          => 'WASTE',
+                    'waste_reason'  => $data['reason_category'],
+                    'qty'           => $qtyPakai,
+                    'unit_price'    => $costPerPakai,
+                    'total_price'   => $lossCost,
+                    'cost_before'   => $costPerPakai,
+                    'cost_after'    => $costPerPakai,
+                    'note'          => "Waste [{$wasteNo}] {$reasonLabel}" . (!empty($data['notes']) ? " — {$data['notes']}" : ''),
+                    'shift_id'      => $data['shift_id'] ?? null,
+                    'user_id'       => $request->user()->id,
+                    'created_by'    => $request->user()->id,
+                ]);
+
+                $log = WasteLog::create([
+                    'waste_no'          => $wasteNo,
+                    'date'              => $data['date'],
+                    'item_type'         => 'INGREDIENT',
+                    'ingredient_id'     => $ingredient->id,
+                    'menu_id'           => null,
+                    'outlet_id'         => $outletId,
+                    'shift_id'          => $data['shift_id'] ?? null,
+                    'qty'               => (float)$data['qty'],
+                    'unit_type'         => $unitType,
+                    'qty_pakai'         => $qtyPakai,
+                    'cost_per_unit'     => $costPerPakai,
+                    'loss_cost'         => $lossCost,
+                    'reason_category'   => $data['reason_category'],
+                    'notes'             => $data['notes'] ?? null,
+                    'action_taken'      => $data['action_taken'] ?? null,
+                    'user_id'           => $request->user()->id,
+                    'stock_movement_id' => $movement->id,
+                    'created_by'        => $request->user()->id,
+                ]);
+
+                return $log;
+            }
         });
 
-        $wasteLog->load(['ingredient', 'outlet', 'shift', 'user', 'creator', 'stockMovement']);
+        $wasteLog->load(['ingredient', 'menu', 'outlet', 'shift', 'user', 'creator', 'stockMovement']);
         return response()->json($wasteLog, 201);
     }
 
@@ -229,7 +341,7 @@ class WasteController extends Controller
         });
 
         return response()->json([
-            'message' => "Catatan bahan terbuang {$wasteLog->waste_no} berhasil dibatalkan dan stok dikembalikan.",
+            'message' => "Catatan terbuang {$wasteLog->waste_no} berhasil dibatalkan.",
         ]);
     }
 }

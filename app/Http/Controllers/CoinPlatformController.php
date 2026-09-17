@@ -15,8 +15,8 @@ class CoinPlatformController extends Controller
     protected function authorizeSuperadmin(Request $request): void
     {
         $user = $request->user();
-        if (!$user || !$user->isSuperadminPlatform()) {
-            abort(403, 'Akses Ditolak: Hanya Pemilik Website (Superadmin Platform) yang memiliki izin untuk manajemen koin.');
+        if (!$user || !$user->isOwnerWebsite()) {
+            abort(403, 'Akses Ditolak: Hanya Pemilik Website yang memiliki izin untuk manajemen koin.');
         }
     }
 

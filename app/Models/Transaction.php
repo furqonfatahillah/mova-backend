@@ -35,6 +35,8 @@ class Transaction extends Model
         'order_type',
         'table_number',
         'payment_method',
+        'is_urgent_note',
+        'urgent_status',
         'notes',
         'user_id',
         'shift_id',
@@ -76,6 +78,7 @@ class Transaction extends Model
         'change_amount'  => 'float',
         'split_index'    => 'integer',
         'split_total'    => 'integer',
+        'is_urgent_note' => 'boolean',
     ];
 
     public function menu()
@@ -111,5 +114,10 @@ class Transaction extends Model
     public function discount()
     {
         return $this->belongsTo(Discount::class);
+    }
+
+    public function urgentNotes()
+    {
+        return $this->hasMany(UrgentNote::class);
     }
 }

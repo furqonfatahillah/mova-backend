@@ -100,7 +100,8 @@ class Shift extends Model
                 'menu.recipes.items.ingredient',
                 'menu.bundleItems.bundledMenu.recipes.items.ingredient',
                 'menu.bundleItems.ingredient',
-                'modifiers.ingredient'
+                'modifiers.ingredient',
+                'urgentNotes'
             ])
             ->get();
         $usageByIngredient = [];
@@ -119,6 +120,16 @@ class Shift extends Model
                         if (!$ing) continue;
 
                         $usedQty = (float)$item->qty * (int)$trx->qty;
+
+                        // If transaction is an urgent note with pending deficit for this ingredient, deduct only the physical stock available
+                        if ($trx->is_urgent_note && $trx->urgentNotes) {
+                            $pendingUrgent = $trx->urgentNotes->firstWhere(fn($u) => $u->ingredient_id == $ingId && $u->status === 'PENDING');
+                            if ($pendingUrgent) {
+                                $usedQty = (float)$pendingUrgent->deducted_qty;
+                            }
+                        }
+
+                        if ($usedQty <= 0) continue;
 
                         if (!isset($usageByIngredient[$ingId])) {
                             $usageByIngredient[$ingId] = [

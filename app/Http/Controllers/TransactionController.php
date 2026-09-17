@@ -8,12 +8,156 @@ use App\Models\StockMovement;
 use App\Models\ModifierOption;
 use App\Models\TransactionModifier;
 use App\Models\Discount;
+use App\Models\UrgentNote;
+use App\Models\OutletMenu;
 use App\Services\CoinService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
 class TransactionController extends Controller
 {
+    /**
+     * Helper to process ingredient stock deduction with Urgent Note support.
+     * If available stock is less than required, deducts available portion (if > 0)
+     * and records the shortfall as a pending Urgent Note.
+     */
+    private function processIngredientStockDeduction(
+        int $businessId,
+        int $outletId,
+        Transaction $trx,
+        string $orderNumber,
+        string $date,
+        \App\Models\Ingredient $ing,
+        float $requiredQty,
+        string $itemName,
+        string $itemType,
+        ?int $menuId,
+        bool $isShiftActive,
+        bool $isPaid,
+        int $userId,
+        ?string $unit = null
+    ): array {
+        $currentStock = $ing->stockForOutlet($outletId);
+        $unit = $unit ?: $ing->unit_pakai ?: 'satuan';
+        $isDeficit = $currentStock < $requiredQty;
+
+        $deductedQty = $isDeficit ? max(0.0, min($currentStock, $requiredQty)) : $requiredQty;
+        $pendingQty = $isDeficit ? round($requiredQty - $deductedQty, 3) : 0.0;
+
+        // 1. If not in shift and PAID, post stock movement for the physically available deducted_qty
+        if ($isPaid && !$isShiftActive && $deductedQty > 0) {
+            $noteText = $isDeficit
+                ? "{$orderNumber} – {$itemName} [Nota Urgent: Terpotong {$deductedQty} {$unit}, Tergantung {$pendingQty} {$unit}]"
+                : "{$orderNumber} – {$itemName}";
+
+            StockMovement::create([
+                'business_id'    => $businessId,
+                'outlet_id'      => $outletId,
+                'ingredient_id'  => $ing->id,
+                'date'           => $date,
+                'type'           => 'SALE_USAGE',
+                'qty'            => $deductedQty,
+                'note'           => $noteText,
+                'transaction_id' => $trx->id,
+                'user_id'        => $userId,
+                'created_by'     => $userId,
+            ]);
+        }
+
+        // 2. If deficit, create UrgentNote record
+        if ($isDeficit && $pendingQty > 0) {
+            UrgentNote::create([
+                'business_id'    => $businessId,
+                'outlet_id'      => $outletId,
+                'transaction_id' => $trx->id,
+                'order_number'   => $orderNumber,
+                'menu_id'        => $menuId,
+                'ingredient_id'  => $ing->id,
+                'item_type'      => $itemType,
+                'item_name'      => "{$ing->name} ({$itemName})",
+                'required_qty'   => $requiredQty,
+                'deducted_qty'   => $deductedQty,
+                'pending_qty'    => $pendingQty,
+                'unit'           => $unit,
+                'status'         => 'PENDING',
+                'notes'          => "Kebutuhan {$requiredQty} {$unit}, terpotong {$deductedQty} {$unit}, sisa kekurangan {$pendingQty} {$unit} tergantung.",
+                'created_by'     => $userId,
+            ]);
+
+            $trx->is_urgent_note = true;
+            $trx->urgent_status = 'PENDING';
+            $trx->save();
+        }
+
+        return [
+            'is_deficit'   => $isDeficit,
+            'deducted_qty' => $deductedQty,
+            'pending_qty'  => $pendingQty,
+        ];
+    }
+
+    /**
+     * Helper to process direct retail product stock deduction with Urgent Note support.
+     */
+    private function processDirectProductStockDeduction(
+        int $businessId,
+        int $outletId,
+        Transaction $trx,
+        string $orderNumber,
+        \App\Models\Menu $menu,
+        int $qty,
+        int $userId
+    ): void {
+        if ($menu->item_type !== 'DIRECT' || !$menu->track_stock) {
+            return;
+        }
+
+        $om = null;
+        if ($outletId) {
+            try {
+                $om = OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+            } catch (\Throwable $e) {}
+        }
+
+        $currentStock = $om ? (float)$om->stock : (float)$menu->stock;
+        $requiredQty = (float)$qty;
+        $isDeficit = $currentStock < $requiredQty;
+
+        $deductedQty = $isDeficit ? max(0.0, min($currentStock, $requiredQty)) : $requiredQty;
+        $pendingQty = $isDeficit ? round($requiredQty - $deductedQty, 3) : 0.0;
+
+        if ($deductedQty > 0) {
+            $menu->decrement('stock', $deductedQty);
+            if ($om) {
+                $om->decrement('stock', $deductedQty);
+            }
+        }
+
+        if ($isDeficit && $pendingQty > 0) {
+            UrgentNote::create([
+                'business_id'    => $businessId,
+                'outlet_id'      => $outletId,
+                'transaction_id' => $trx->id,
+                'order_number'   => $orderNumber,
+                'menu_id'        => $menu->id,
+                'ingredient_id'  => null,
+                'item_type'      => 'DIRECT',
+                'item_name'      => "Produk {$menu->name} (x{$qty})",
+                'required_qty'   => $requiredQty,
+                'deducted_qty'   => $deductedQty,
+                'pending_qty'    => $pendingQty,
+                'unit'           => $menu->unit ?: 'pcs',
+                'status'         => 'PENDING',
+                'notes'          => "Stok produk hanya {$currentStock}, terpotong {$deductedQty}, kekurangan {$pendingQty} tergantung.",
+                'created_by'     => $userId,
+            ]);
+
+            $trx->is_urgent_note = true;
+            $trx->urgent_status = 'PENDING';
+            $trx->save();
+        }
+    }
+
     /**
      * Helper to resolve modifier options from item input.
      */
@@ -124,7 +268,7 @@ class TransactionController extends Controller
 
     public function index(Request $request)
     {
-        $query = Transaction::with(['menu', 'user', 'outlet', 'shift', 'creator', 'updater', 'modifiers.ingredient', 'discount'])
+        $query = Transaction::with(['menu', 'user', 'outlet', 'shift', 'creator', 'updater', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
@@ -152,9 +296,11 @@ class TransactionController extends Controller
                 'items.*.menu_id'              => 'required|exists:menus,id',
                 'items.*.qty'                  => 'required|integer|min:1',
                 'items.*.notes'                => 'nullable|string|max:255',
+                'items.*.is_urgent'            => 'nullable|boolean',
                 'items.*.modifier_option_ids'  => 'nullable|array',
                 'items.*.modifier_option_ids.*'=> 'exists:modifier_options,id',
                 'items.*.modifiers'            => 'nullable|array',
+                'is_urgent_note'               => 'nullable|boolean',
                 'status'                       => 'nullable|string|in:PAID,HOLD',
                 'date'                         => 'required|date',
                 'shift_id'                     => 'nullable|exists:shifts,id',
@@ -175,6 +321,7 @@ class TransactionController extends Controller
             ]);
 
             $orderStatus = $data['status'] ?? 'PAID';
+            $isUrgentOrder = !empty($data['is_urgent_note']);
 
             // Resolve Outlet ID & Business ID
             $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
@@ -227,6 +374,7 @@ class TransactionController extends Controller
                     'recipe'         => $recipe,
                     'qty'            => (int)$it['qty'],
                     'item_notes'     => $it['notes'] ?? null,
+                    'is_urgent'      => !empty($it['is_urgent']) || $isUrgentOrder,
                     'item_total'     => $itemTotal,
                     'options'        => $options,
                     'modifier_extra' => $modifierUnitPrice,
@@ -266,7 +414,7 @@ class TransactionController extends Controller
             unset($prep);
 
             $createdTransactions = DB::transaction(function () use (
-                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $outletId, $businessId, $request, $discInfo
+                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $outletId, $businessId, $request, $discInfo, $isUrgentOrder
             ) {
                 $results = [];
 
@@ -295,6 +443,8 @@ class TransactionController extends Controller
                         'order_type'      => $data['order_type'] ?? 'DINE_IN',
                         'table_number'    => $data['table_number'] ?? null,
                         'payment_method'  => $data['payment_method'] ?? 'CASH',
+                        'is_urgent_note'  => $isUrgentOrder || $prep['is_urgent'],
+                        'urgent_status'   => ($isUrgentOrder || $prep['is_urgent']) ? 'PENDING' : 'NONE',
                         'notes'           => $prep['item_notes'] ?: ($data['notes'] ?? null),
                         'user_id'         => $request->user()->id,
                         'created_by'      => $request->user()->id,
@@ -302,7 +452,7 @@ class TransactionController extends Controller
                         'outlet_id'       => $outletId,
                     ]);
 
-                    // Save selected modifiers snapshot
+                    // Save selected modifiers snapshot & deduct modifier ingredients
                     foreach ($prep['options'] as $opt) {
                         TransactionModifier::create([
                             'transaction_id'     => $trx->id,
@@ -316,113 +466,133 @@ class TransactionController extends Controller
                             'total_price'        => (float)($opt->price * $qty),
                         ]);
 
-                        // Stock deduction for modifier ingredient if NOT in shift and PAID
-                        if ($orderStatus === 'PAID' && !$shiftId && $opt->ingredient_id && $opt->qty > 0) {
-                            StockMovement::create([
-                                'date'           => $data['date'],
-                                'ingredient_id'  => $opt->ingredient_id,
-                                'type'           => 'SALE_USAGE',
-                                'qty'            => (float)($opt->qty * $qty),
-                                'note'           => "{$orderNumber} – Modifier {$opt->name} ({$menu->name} x{$qty})",
-                                'transaction_id' => $trx->id,
-                                'outlet_id'      => $outletId,
-                                'user_id'        => $request->user()->id,
-                                'created_by'     => $request->user()->id,
-                            ]);
+                        if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient) {
+                            $requiredModQty = (float)($opt->qty * $qty);
+                            $this->processIngredientStockDeduction(
+                                $businessId,
+                                $outletId,
+                                $trx,
+                                $orderNumber,
+                                $data['date'],
+                                $opt->ingredient,
+                                $requiredModQty,
+                                "Modifier {$opt->name} ({$menu->name} x{$qty})",
+                                'MODIFIER',
+                                $menu->id,
+                                !empty($shiftId),
+                                $orderStatus === 'PAID',
+                                $request->user()->id,
+                                $opt->unit
+                            );
                         }
                     }
 
                     // Deduct stock for DIRECT retail items
                     if ($orderStatus === 'PAID') {
-                        if ($menu->item_type === 'DIRECT' && $menu->track_stock) {
-                            $menu->decrement('stock', $qty);
-                            if ($outletId) {
-                                try {
-                                    $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                                    if ($om) {
-                                        $om->decrement('stock', $qty);
-                                    }
-                                } catch (\Throwable $e) {}
+                        $this->processDirectProductStockDeduction(
+                            $businessId,
+                            $outletId,
+                            $trx,
+                            $orderNumber,
+                            $menu,
+                            $qty,
+                            $request->user()->id
+                        );
+                    }
+
+                    // Deduct recipe ingredients with Urgent Note support
+                    if ($recipe) {
+                        foreach ($recipe->items as $item) {
+                            if ($item->ingredient) {
+                                $requiredIngQty = (float)($item->qty * $qty);
+                                $this->processIngredientStockDeduction(
+                                    $businessId,
+                                    $outletId,
+                                    $trx,
+                                    $orderNumber,
+                                    $data['date'],
+                                    $item->ingredient,
+                                    $requiredIngQty,
+                                    "{$menu->name} (x{$qty})",
+                                    'RECIPE',
+                                    $menu->id,
+                                    !empty($shiftId),
+                                    $orderStatus === 'PAID',
+                                    $request->user()->id,
+                                    $item->unit
+                                );
                             }
                         }
                     }
 
-                    // If NOT in a shift and PAID, deduct recipe ingredients immediately via StockMovement
-                    // (If in shift, ingredients are aggregated at shift closing; if HOLD, not deducted yet)
-                    if ($orderStatus === 'PAID' && !$shiftId && $recipe) {
-                        foreach ($recipe->items as $item) {
-                            StockMovement::create([
-                                'date'           => $data['date'],
-                                'ingredient_id'  => $item->ingredient_id,
-                                'type'           => 'SALE_USAGE',
-                                'qty'            => $item->qty * $qty,
-                                'note'           => "{$orderNumber} – {$menu->name} (x{$qty})",
-                                'transaction_id' => $trx->id,
-                                'outlet_id'      => $outletId,
-                                'user_id'        => $request->user()->id,
-                                'created_by'     => $request->user()->id,
-                            ]);
-                        }
-                    }
-
                     // Deduct stock for BUNDLE / Promo items (multi-component package / Buy 1 Get 1)
-                    if ($orderStatus === 'PAID' && ($menu->item_type === 'BUNDLE' || $menu->bundleItems->count() > 0)) {
+                    if ($menu->item_type === 'BUNDLE' || $menu->bundleItems->count() > 0) {
                         foreach ($menu->bundleItems as $bi) {
                             $bundledQty = (float)($bi->qty * $qty);
 
                             // 1. Bundled Menu (Recipe or Direct)
                             if ($bi->bundledMenu) {
                                 $bm = $bi->bundledMenu;
-                                if ($bm->item_type === 'DIRECT' && $bm->track_stock) {
-                                    $bm->decrement('stock', $bundledQty);
-                                    if ($outletId) {
-                                        try {
-                                            $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $bm->id)->first();
-                                            if ($om) {
-                                                $om->decrement('stock', $bundledQty);
-                                            }
-                                        } catch (\Throwable $e) {}
-                                    }
+                                if ($bm->item_type === 'DIRECT' && $orderStatus === 'PAID') {
+                                    $this->processDirectProductStockDeduction(
+                                        $businessId,
+                                        $outletId,
+                                        $trx,
+                                        $orderNumber,
+                                        $bm,
+                                        (int)ceil($bundledQty),
+                                        $request->user()->id
+                                    );
                                 }
 
-                                if (!$shiftId) {
-                                    $bmRecipe = $bm->activeRecipe($data['date']);
-                                    if ($bmRecipe) {
-                                        foreach ($bmRecipe->items as $item) {
-                                            StockMovement::create([
-                                                'date'           => $data['date'],
-                                                'ingredient_id'  => $item->ingredient_id,
-                                                'type'           => 'SALE_USAGE',
-                                                'qty'            => (float)($item->qty * $bundledQty),
-                                                'note'           => "{$orderNumber} – Bundling {$menu->name} (x{$qty}) → {$bm->name} (x{$bi->qty})",
-                                                'transaction_id' => $trx->id,
-                                                'outlet_id'      => $outletId,
-                                                'user_id'        => $request->user()->id,
-                                                'created_by'     => $request->user()->id,
-                                            ]);
+                                $bmRecipe = $bm->activeRecipe($data['date']);
+                                if ($bmRecipe) {
+                                    foreach ($bmRecipe->items as $item) {
+                                        if ($item->ingredient) {
+                                            $this->processIngredientStockDeduction(
+                                                $businessId,
+                                                $outletId,
+                                                $trx,
+                                                $orderNumber,
+                                                $data['date'],
+                                                $item->ingredient,
+                                                (float)($item->qty * $bundledQty),
+                                                "Bundling {$menu->name} (x{$qty}) → {$bm->name}",
+                                                'BUNDLE',
+                                                $bm->id,
+                                                !empty($shiftId),
+                                                $orderStatus === 'PAID',
+                                                $request->user()->id,
+                                                $item->unit
+                                            );
                                         }
                                     }
                                 }
                             }
 
                             // 2. Direct Ingredient in Bundle
-                            if ($bi->ingredient_id && !$shiftId) {
-                                StockMovement::create([
-                                    'date'           => $data['date'],
-                                    'ingredient_id'  => $bi->ingredient_id,
-                                    'type'           => 'SALE_USAGE',
-                                    'qty'            => (float)($bi->qty * $qty),
-                                    'note'           => "{$orderNumber} – Bundling {$menu->name} (x{$qty}) → Bahan #{$bi->ingredient_id}",
-                                    'transaction_id' => $trx->id,
-                                    'outlet_id'      => $outletId,
-                                    'user_id'        => $request->user()->id,
-                                    'created_by'     => $request->user()->id,
-                                ]);
+                            if ($bi->ingredient_id && $bi->ingredient) {
+                                $this->processIngredientStockDeduction(
+                                    $businessId,
+                                    $outletId,
+                                    $trx,
+                                    $orderNumber,
+                                    $data['date'],
+                                    $bi->ingredient,
+                                    (float)($bi->qty * $qty),
+                                    "Bundling {$menu->name} (x{$qty}) → {$bi->ingredient->name}",
+                                    'BUNDLE',
+                                    $menu->id,
+                                    !empty($shiftId),
+                                    $orderStatus === 'PAID',
+                                    $request->user()->id,
+                                    $bi->unit
+                                );
                             }
                         }
                     }
 
-                    $trx->load(['menu', 'modifiers.ingredient', 'discount']);
+                    $trx->load(['menu', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient']);
                     $results[] = $trx;
                 }
 
@@ -456,6 +626,9 @@ class TransactionController extends Controller
                 'total_price'     => $orderNetTotal,
                 'amount_paid'     => (float)($data['amount_paid'] ?? ($orderStatus === 'HOLD' ? 0 : $orderNetTotal)),
                 'change_amount'   => (float)($data['change_amount'] ?? 0),
+                'is_urgent_note'  => (bool)($createdTransactions[0]?->is_urgent_note ?? false),
+                'urgent_status'   => $createdTransactions[0]?->urgent_status ?? 'NONE',
+                'urgent_notes'    => UrgentNote::where('order_number', $orderNumber)->get(),
                 'items_count'     => count($createdTransactions),
                 'items'           => array_map(fn($t) => [
                     'id'              => $t->id,
@@ -466,6 +639,7 @@ class TransactionController extends Controller
                     'subtotal'        => (float)($t->subtotal ?? $t->total_price),
                     'discount_amount' => (float)($t->discount_amount ?? 0),
                     'total_price'     => $t->total_price,
+                    'is_urgent_note'  => (bool)$t->is_urgent_note,
                     'notes'           => $t->notes,
                     'modifiers'       => $t->modifiers->map(fn($m) => [
                         'id'          => $m->id,
@@ -493,6 +667,7 @@ class TransactionController extends Controller
             'menu_id'                     => 'required|exists:menus,id',
             'qty'                         => 'required|integer|min:1',
             'status'                      => 'nullable|string|in:PAID,HOLD',
+            'is_urgent_note'              => 'nullable|boolean',
             'date'                        => 'required|date',
             'shift_id'                    => 'nullable|exists:shifts,id',
             'outlet_id'                   => 'nullable|exists:outlets,id',
@@ -509,6 +684,7 @@ class TransactionController extends Controller
         ]);
 
         $orderStatus = $data['status'] ?? 'PAID';
+        $isUrgentOrder = !empty($data['is_urgent_note']);
         $menu   = Menu::findOrFail($data['menu_id']);
         $recipe = $menu->activeRecipe($data['date']);
 
@@ -548,7 +724,7 @@ class TransactionController extends Controller
         $itemUnitPrice = (float)$menu->price + $modifierUnitPrice;
         $totalItemPrice = $itemUnitPrice * (int)$data['qty'];
 
-        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $outletId, $businessId, $orderNumber, $orderStatus) {
+        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $outletId, $businessId, $orderNumber, $orderStatus, $isUrgentOrder) {
             $qty = (int)$data['qty'];
             $trx = Transaction::create([
                 'order_number'   => $orderNumber,
@@ -564,6 +740,8 @@ class TransactionController extends Controller
                 'order_type'     => $data['order_type'] ?? 'DINE_IN',
                 'table_number'   => $data['table_number'] ?? null,
                 'payment_method' => $data['payment_method'] ?? 'CASH',
+                'is_urgent_note' => $isUrgentOrder,
+                'urgent_status'  => $isUrgentOrder ? 'PENDING' : 'NONE',
                 'notes'          => $data['notes'] ?? null,
                 'user_id'        => $request->user()->id,
                 'created_by'     => $request->user()->id,
@@ -571,7 +749,7 @@ class TransactionController extends Controller
                 'outlet_id'      => $outletId,
             ]);
 
-            // Save selected modifiers
+            // Save selected modifiers & deduct modifier stock
             foreach ($options as $opt) {
                 TransactionModifier::create([
                     'transaction_id'     => $trx->id,
@@ -585,51 +763,62 @@ class TransactionController extends Controller
                     'total_price'        => (float)($opt->price * $qty),
                 ]);
 
-                // Stock deduction for modifier ingredient if NOT in shift and PAID
-                if ($orderStatus === 'PAID' && !$shiftId && $opt->ingredient_id && $opt->qty > 0) {
-                    StockMovement::create([
-                        'date'           => $data['date'],
-                        'ingredient_id'  => $opt->ingredient_id,
-                        'type'           => 'SALE_USAGE',
-                        'qty'            => (float)($opt->qty * $qty),
-                        'note'           => "{$orderNumber} – Modifier {$opt->name} ({$menu->name} x{$qty})",
-                        'transaction_id' => $trx->id,
-                        'outlet_id'      => $outletId,
-                        'user_id'        => $request->user()->id,
-                        'created_by'     => $request->user()->id,
-                    ]);
+                if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient) {
+                    $requiredModQty = (float)($opt->qty * $qty);
+                    $this->processIngredientStockDeduction(
+                        $businessId,
+                        $outletId,
+                        $trx,
+                        $orderNumber,
+                        $data['date'],
+                        $opt->ingredient,
+                        $requiredModQty,
+                        "Modifier {$opt->name} ({$menu->name} x{$qty})",
+                        'MODIFIER',
+                        $menu->id,
+                        !empty($shiftId),
+                        $orderStatus === 'PAID',
+                        $request->user()->id,
+                        $opt->unit
+                    );
                 }
             }
 
             // Deduct stock for DIRECT retail items
             if ($orderStatus === 'PAID') {
-                if ($menu->item_type === 'DIRECT' && $menu->track_stock) {
-                    $menu->decrement('stock', $qty);
-                    if ($outletId) {
-                        try {
-                            $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                            if ($om) {
-                                $om->decrement('stock', $qty);
-                            }
-                        } catch (\Throwable $e) {}
-                    }
-                }
+                $this->processDirectProductStockDeduction(
+                    $businessId,
+                    $outletId,
+                    $trx,
+                    $orderNumber,
+                    $menu,
+                    $qty,
+                    $request->user()->id
+                );
             }
 
-            // Only create per-transaction stock movement if NOT in a shift and PAID
-            if ($orderStatus === 'PAID' && !$shiftId && $recipe) {
+            // Deduct recipe ingredients with Urgent Note support
+            if ($recipe) {
                 foreach ($recipe->items as $item) {
-                    StockMovement::create([
-                        'date'           => $data['date'],
-                        'ingredient_id'  => $item->ingredient_id,
-                        'type'           => 'SALE_USAGE',
-                        'qty'            => $item->qty * $qty,
-                        'note'           => "{$orderNumber} – {$menu->name} (x{$qty})",
-                        'transaction_id' => $trx->id,
-                        'outlet_id'      => $outletId,
-                        'user_id'        => $request->user()->id,
-                        'created_by'     => $request->user()->id,
-                    ]);
+                    if ($item->ingredient) {
+                        $requiredIngQty = (float)($item->qty * $qty);
+                        $this->processIngredientStockDeduction(
+                            $businessId,
+                            $outletId,
+                            $trx,
+                            $orderNumber,
+                            $data['date'],
+                            $item->ingredient,
+                            $requiredIngQty,
+                            "{$menu->name} (x{$qty})",
+                            'RECIPE',
+                            $menu->id,
+                            !empty($shiftId),
+                            $orderStatus === 'PAID',
+                            $request->user()->id,
+                            $item->unit
+                        );
+                    }
                 }
             }
 
@@ -641,7 +830,7 @@ class TransactionController extends Controller
             return $trx;
         });
 
-        $trx->load(['menu', 'modifiers.ingredient']);
+        $trx->load(['menu', 'modifiers.ingredient', 'urgentNotes.ingredient']);
         return response()->json($trx, 201);
     }
 
@@ -651,7 +840,7 @@ class TransactionController extends Controller
     public function openBills(Request $request)
     {
         $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
-        $query = Transaction::with(['menu', 'user', 'outlet', 'modifiers.ingredient'])
+        $query = Transaction::with(['menu', 'user', 'outlet', 'modifiers.ingredient', 'urgentNotes.ingredient'])
             ->where('status', 'HOLD')
             ->orderBy('created_at', 'asc');
 
@@ -703,6 +892,9 @@ class TransactionController extends Controller
             }
             $grouped[$ord]['total_price'] += (float)$t->total_price;
             $grouped[$ord]['total_items'] += (int)$t->qty;
+            if ($t->is_urgent_note) {
+                $grouped[$ord]['is_urgent_note'] = true;
+            }
             $grouped[$ord]['items'][] = [
                 'id'              => $t->id,
                 'menu_id'         => $t->menu_id,
@@ -712,6 +904,7 @@ class TransactionController extends Controller
                 'subtotal'        => $itemSubtotal,
                 'discount_amount' => $itemDiscount,
                 'total_price'     => (float)$t->total_price,
+                'is_urgent_note'  => (bool)$t->is_urgent_note,
                 'notes'           => $t->notes,
                 'created_at'      => $t->created_at?->toDateTimeString(),
                 'modifiers'       => $t->modifiers->map(fn($m) => [
@@ -723,6 +916,7 @@ class TransactionController extends Controller
                     'unit'        => $m->unit,
                     'total_price' => (float)$m->total_price,
                 ]),
+                'urgent_notes'    => $t->urgentNotes,
             ];
         }
 
@@ -767,7 +961,7 @@ class TransactionController extends Controller
             'discount_rate'   => 'nullable|numeric|min:0',
         ]);
 
-        $transactions = Transaction::with(['menu.recipes.items', 'modifiers.ingredient', 'outlet'])
+        $transactions = Transaction::with(['menu.recipes.items.ingredient', 'modifiers.ingredient', 'outlet', 'urgentNotes'])
             ->where('order_number', $orderNumber)
             ->where('status', 'HOLD')
             ->get();
@@ -792,21 +986,17 @@ class TransactionController extends Controller
             ], 402);
         }
 
-        $grossSubtotal = (float)$transactions->sum(fn($t) => $t->subtotal ?: $t->total_price);
-        $hasDiscountInput = !empty($data['discount_id']) || !empty($data['discount_code']) || (!empty($data['discount_amount']) && (float)$data['discount_amount'] > 0);
-
-        $discInfo = null;
-        if ($hasDiscountInput) {
-            $discInfo = $this->resolveDiscountDetails(
-                $data,
-                $grossSubtotal,
-                $first->outlet_id,
-                $first->date,
-                $businessId
-            );
+        $date = now()->toDateString();
+        $shiftId = $request->user()->outlet_id ? \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->value('id') : null;
+        if (!$shiftId) {
+            $shiftId = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->value('id');
         }
 
-        $totalOrder = $discInfo ? max(0, $grossSubtotal - $discInfo['discount_amount']) : (float)$transactions->sum('total_price');
+        $grossSubtotal = (float)$transactions->sum(fn($t) => (float)($t->subtotal ?: $t->total_price));
+        $discInfo = $this->resolveDiscountDetails($data, $grossSubtotal, $outletId, $date, $businessId);
+        $totalDiscount = $discInfo['discount_amount'];
+        $totalOrder = max(0, $grossSubtotal - $totalDiscount);
+
         $amountPaid = (float)$data['amount_paid'];
         if ($amountPaid < $totalOrder && $data['payment_method'] === 'CASH') {
             return response()->json([
@@ -816,18 +1006,7 @@ class TransactionController extends Controller
 
         $changeAmount = (float)($data['change_amount'] ?? max(0, $amountPaid - $totalOrder));
 
-        DB::transaction(function () use ($transactions, $data, $request, $amountPaid, $changeAmount, $orderNumber, $discInfo, $grossSubtotal, $businessId) {
-            $first = $transactions->first();
-            $outletId = $first->outlet_id;
-            $date = $first->date;
-
-            // Cari shift kasir yang sedang aktif saat pelunasan (bisa jadi shift baru hasil carry-over)
-            $activeShift = \App\Models\Shift::where('outlet_id', $outletId)
-                ->where('status', 'OPEN')
-                ->latest()
-                ->first();
-            $shiftId = $activeShift ? $activeShift->id : $first->shift_id;
-
+        DB::transaction(function () use ($transactions, $data, $shiftId, $discInfo, $grossSubtotal, $amountPaid, $changeAmount, $date, $outletId, $businessId, $orderNumber, $request) {
             $accumulatedDisc = 0;
             $itemsCount = $transactions->count();
 
@@ -863,53 +1042,64 @@ class TransactionController extends Controller
 
                 // Deduct stock for DIRECT retail items
                 $menu = $t->menu;
-                if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
-                    $menu->decrement('stock', $t->qty);
-                    if ($outletId) {
-                        try {
-                            $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                            if ($om) {
-                                $om->decrement('stock', $t->qty);
-                            }
-                        } catch (\Throwable $e) {}
+                if ($menu) {
+                    $this->processDirectProductStockDeduction(
+                        $businessId,
+                        $outletId,
+                        $t,
+                        $orderNumber,
+                        $menu,
+                        $t->qty,
+                        $request->user()->id
+                    );
+                }
+
+                // Deduct recipe ingredients with Urgent Note support
+                $recipe = $menu?->activeRecipe($date);
+                if ($recipe) {
+                    foreach ($recipe->items as $item) {
+                        if ($item->ingredient) {
+                            $requiredIngQty = (float)($item->qty * $t->qty);
+                            $this->processIngredientStockDeduction(
+                                $businessId,
+                                $outletId,
+                                $t,
+                                $orderNumber,
+                                $date,
+                                $item->ingredient,
+                                $requiredIngQty,
+                                "{$menu->name} (x{$t->qty}) [Pelunasan Open Bill]",
+                                'RECIPE',
+                                $menu->id,
+                                !empty($shiftId),
+                                true,
+                                $request->user()->id,
+                                $item->unit
+                            );
+                        }
                     }
                 }
 
-                // If not in shift, deduct ingredients immediately via StockMovement
-                if (!$shiftId) {
-                    $menu = $t->menu;
-                    $recipe = $menu?->activeRecipe($date);
-                    if ($recipe) {
-                        foreach ($recipe->items as $item) {
-                            StockMovement::create([
-                                'date'           => $date,
-                                'ingredient_id'  => $item->ingredient_id,
-                                'type'           => 'SALE_USAGE',
-                                'qty'            => $item->qty * $t->qty,
-                                'note'           => "{$orderNumber} (Pelunasan Open Bill) – {$menu->name} (x{$t->qty})",
-                                'transaction_id' => $t->id,
-                                'outlet_id'      => $outletId,
-                                'user_id'        => $request->user()->id,
-                                'created_by'     => $request->user()->id,
-                            ]);
-                        }
-                    }
-
-                    // Also deduct modifier ingredients
-                    foreach ($t->modifiers as $mod) {
-                        if ($mod->ingredient_id && $mod->qty > 0) {
-                            StockMovement::create([
-                                'date'           => $date,
-                                'ingredient_id'  => $mod->ingredient_id,
-                                'type'           => 'SALE_USAGE',
-                                'qty'            => (float)($mod->qty * $t->qty),
-                                'note'           => "{$orderNumber} (Pelunasan Open Bill) – Modifier {$mod->name} ({$t->menu?->name} x{$t->qty})",
-                                'transaction_id' => $t->id,
-                                'outlet_id'      => $outletId,
-                                'user_id'        => $request->user()->id,
-                                'created_by'     => $request->user()->id,
-                            ]);
-                        }
+                // Deduct modifier ingredients
+                foreach ($t->modifiers as $mod) {
+                    if ($mod->ingredient_id && $mod->qty > 0 && $mod->ingredient) {
+                        $requiredModQty = (float)($mod->qty * $t->qty);
+                        $this->processIngredientStockDeduction(
+                            $businessId,
+                            $outletId,
+                            $t,
+                            $orderNumber,
+                            $date,
+                            $mod->ingredient,
+                            $requiredModQty,
+                            "Modifier {$mod->name} ({$menu->name} x{$t->qty}) [Pelunasan Open Bill]",
+                            'MODIFIER',
+                            $menu->id,
+                            !empty($shiftId),
+                            true,
+                            $request->user()->id,
+                            $mod->unit
+                        );
                     }
                 }
             }

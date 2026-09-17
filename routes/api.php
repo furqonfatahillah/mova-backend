@@ -21,6 +21,7 @@ use App\Http\Controllers\ExpenseController;
 use App\Http\Controllers\CashFlowController;
 use App\Http\Controllers\ShiftScheduleController;
 use App\Http\Controllers\CoinPlatformController;
+use App\Http\Controllers\UrgentNoteController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -111,6 +112,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/transactions',                                          [TransactionController::class, 'index']);
     Route::post('/transactions',                                         [TransactionController::class, 'store']);
     Route::delete('/transactions/{transaction}',                    [TransactionController::class, 'destroy']);
+
+    // Nota Urgent & Bahan Tergantung (Pending Stock Shortfall Management)
+    Route::get('/urgent-notes/summary',                 [UrgentNoteController::class, 'summary']);
+    Route::get('/urgent-notes',                         [UrgentNoteController::class, 'index']);
+    Route::post('/urgent-notes/{urgentNote}/resolve',   [UrgentNoteController::class, 'resolve']);
+    Route::post('/urgent-notes/{urgentNote}/cancel',    [UrgentNoteController::class, 'cancel']);
+    Route::post('/urgent-notes/batch-resolve',          [UrgentNoteController::class, 'batchResolve']);
 
     // Stock & Kartu Stok
     Route::get('/movements',          [MovementController::class, 'index']);

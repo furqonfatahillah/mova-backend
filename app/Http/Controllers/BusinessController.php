@@ -202,18 +202,18 @@ class BusinessController extends Controller
         $businessId = $user->business_id;
 
         if ($user->isPlatformAdmin()) {
-            $explicitBusinessId = $request->header('X-Business-Id') ?? $request->business_id ?? $user->business_id;
+            $explicitBusinessId = $request->header('X-Business-Id') ?? $request->business_id;
             if ($explicitBusinessId && is_numeric($explicitBusinessId)) {
                 $businessId = (int)$explicitBusinessId;
             } else {
-                // Platform admin without active tenant selected
+                // Platform admin without active tenant selected (SaaS Platform Owner has no personal coin balance)
                 return response()->json([
                     'is_platform_admin'      => true,
                     'business_id'            => null,
                     'business_name'          => 'Platform Provider (MOVA)',
                     'coin_balance'           => null,
-                    'coins_per_transaction'  => 1,
-                    'remaining_transactions' => 999999,
+                    'coins_per_transaction'  => null,
+                    'remaining_transactions' => null,
                     'low_coin_threshold'     => 0,
                     'is_coin_low'            => false,
                     'is_coin_out'            => false,

@@ -132,6 +132,22 @@ class User extends Authenticatable
         return $this->relationLoaded('outlet') ? $this->outlet?->name : null;
     }
 
+    public function getBusinessIdAttribute($value)
+    {
+        if ($this->isPlatformAdmin()) {
+            return null;
+        }
+        return $value;
+    }
+
+    public function getOutletIdAttribute($value)
+    {
+        if ($this->isPlatformAdmin()) {
+            return null;
+        }
+        return $value;
+    }
+
     public function getBusinessNameAttribute()
     {
         if ($this->isPlatformAdmin()) {

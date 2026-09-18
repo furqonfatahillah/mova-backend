@@ -14,14 +14,13 @@ class ExpenseController extends Controller
     public function index(Request $request)
     {
         $user = $request->user();
-        $isOwnerWebsite = $user->role === 'superadmin' || $user->role === 'superadmin_platform' || $user->role === 'owner_website' || $user->is_superadmin_platform || $user->is_owner_website;
-        $isOwnerBisnis  = $isOwnerWebsite || $user->role === 'owner_bisnis' || $user->role === 'owner' || $user->role === 'admin' || $user->is_owner_bisnis;
+        $canViewAllOutlets = $user->isPlatformAdmin() || $user->isOwnerBisnis();
 
         $query = OperatingExpense::with(['outlet', 'user'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
-        if (!$isOwnerBisnis && $user->outlet_id) {
+        if (!$canViewAllOutlets && $user->outlet_id) {
             $query->where(function ($q) use ($user) {
                 $q->where('outlet_id', $user->outlet_id)->orWhereNull('outlet_id');
             });
@@ -64,12 +63,11 @@ class ExpenseController extends Controller
     public function summary(Request $request)
     {
         $user = $request->user();
-        $isOwnerWebsite = $user->role === 'superadmin' || $user->role === 'superadmin_platform' || $user->role === 'owner_website' || $user->is_superadmin_platform || $user->is_owner_website;
-        $isOwnerBisnis  = $isOwnerWebsite || $user->role === 'owner_bisnis' || $user->role === 'owner' || $user->role === 'admin' || $user->is_owner_bisnis;
+        $canViewAllOutlets = $user->isPlatformAdmin() || $user->isOwnerBisnis();
 
         $query = OperatingExpense::query();
 
-        if (!$isOwnerBisnis && $user->outlet_id) {
+        if (!$canViewAllOutlets && $user->outlet_id) {
             $query->where(function ($q) use ($user) {
                 $q->where('outlet_id', $user->outlet_id)->orWhereNull('outlet_id');
             });

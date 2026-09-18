@@ -10,13 +10,13 @@ use Illuminate\Http\Request;
 class CoinPlatformController extends Controller
 {
     /**
-     * Check if authenticated user is the website owner / platform superadmin.
+     * Check if authenticated user is the platform superadmin / website owner.
      */
     protected function authorizeSuperadmin(Request $request): void
     {
         $user = $request->user();
-        if (!$user || !$user->isOwnerWebsite()) {
-            abort(403, 'Akses Ditolak: Hanya Pemilik Website yang memiliki izin untuk manajemen koin.');
+        if (!$user || !$user->isPlatformAdmin()) {
+            abort(403, 'Akses Ditolak: Hanya Pemilik Platform (Superadmin / Owner Website) yang memiliki izin untuk manajemen koin platform.');
         }
     }
 

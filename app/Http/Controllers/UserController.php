@@ -37,7 +37,7 @@ class UserController extends Controller
                 'rejected'  => (clone $baseCount)->where('status', 'rejected')->count(),
                 'suspended' => (clone $baseCount)->where('status', 'suspended')->count(),
             ];
-        } elseif ($currentUser->isOwnerBisnis() && !$currentUser->isOwnerWebsite() && !$currentUser->isSuperadminPlatform()) {
+        } elseif ($currentUser->isOwnerBisnis() && !$currentUser->isPlatformAdmin()) {
             // Owner Bisnis: can view branch owners and staff in their own business (excludes owner_bisnis, owner_website, superadmin_platform)
             $excludedRoles = ['owner_bisnis', 'owner_website', 'superadmin_platform', 'superadmin', 'owner', 'admin'];
             $query->where('business_id', $currentUser->business_id)
@@ -55,7 +55,7 @@ class UserController extends Controller
                 'suspended' => (clone $baseCount)->where('status', 'suspended')->count(),
             ];
         } else {
-            // Superadmin Platform / Owner Website: full visibility or filtered by business
+            // Platform Admin (Superadmin Platform / Owner Website): full visibility or filtered by business
             $bId = $request->header('X-Business-Id') ?? $request->business_id;
             if ($bId) {
                 $query->where('business_id', (int)$bId);
@@ -92,13 +92,15 @@ class UserController extends Controller
             'users'        => $users,
             'counts'       => $counts,
             'current_user' => [
-                'id'                   => $currentUser->id,
-                'role'                 => $currentUser->role,
-                'outlet_id'            => $currentUser->outlet_id,
+                'id'                     => $currentUser->id,
+                'role'                   => $currentUser->role,
+                'outlet_id'              => $currentUser->outlet_id,
                 'is_superadmin_platform' => $currentUser->isSuperadminPlatform(),
-                'is_owner_website'     => $currentUser->isOwnerWebsite(),
-                'is_owner_bisnis'      => $currentUser->isOwnerBisnis(),
-                'is_owner_outlet'      => $currentUser->isOwnerOutlet(),
+                'is_owner_website'       => $currentUser->isOwnerWebsite(),
+                'is_platform_admin'      => $currentUser->isPlatformAdmin(),
+                'is_owner_bisnis'        => $currentUser->isOwnerBisnis(),
+                'is_owner_outlet'        => $currentUser->isOwnerOutlet(),
+                'is_pegawai'             => $currentUser->isPegawai(),
             ],
         ]);
     }
@@ -111,8 +113,8 @@ class UserController extends Controller
             return response()->json(['message' => 'Anda tidak memiliki hak akses menambah pengguna.'], 403);
         }
 
-        $allowedRoles = ($currentUser->isSuperadminPlatform() || $currentUser->isOwnerWebsite())
-            ? 'in:owner_bisnis,owner_website,owner_outlet,pegawai,kasir,manager,admin,owner'
+        $allowedRoles = $currentUser->isPlatformAdmin()
+            ? 'in:owner_bisnis,owner_website,superadmin_platform,owner_outlet,pegawai,kasir,manager,admin,owner'
             : ($currentUser->isOwnerBisnis()
                 ? 'in:owner_outlet,pegawai,kasir,manager'
                 : 'in:pegawai,kasir,manager');
@@ -170,8 +172,8 @@ class UserController extends Controller
             return response()->json(['message' => 'Anda tidak memiliki wewenang mengedit data pengguna ini.'], 403);
         }
 
-        $allowedRoles = ($currentUser->isSuperadminPlatform() || $currentUser->isOwnerWebsite())
-            ? 'in:owner_bisnis,owner_website,owner_outlet,pegawai,kasir,manager,admin,owner'
+        $allowedRoles = $currentUser->isPlatformAdmin()
+            ? 'in:owner_bisnis,owner_website,superadmin_platform,owner_outlet,pegawai,kasir,manager,admin,owner'
             : ($currentUser->isOwnerBisnis()
                 ? 'in:owner_outlet,pegawai,kasir,manager'
                 : 'in:pegawai,kasir,manager');
@@ -212,8 +214,8 @@ class UserController extends Controller
             return response()->json(['message' => 'Anda tidak berwenang menyetujui akun ini.'], 403);
         }
 
-        $allowedRoles = ($currentUser->isSuperadminPlatform() || $currentUser->isOwnerWebsite())
-            ? 'in:owner_bisnis,owner_website,owner_outlet,pegawai,kasir,manager,admin,owner'
+        $allowedRoles = $currentUser->isPlatformAdmin()
+            ? 'in:owner_bisnis,owner_website,superadmin_platform,owner_outlet,pegawai,kasir,manager,admin,owner'
             : ($currentUser->isOwnerBisnis()
                 ? 'in:owner_outlet,pegawai,kasir,manager'
                 : 'in:pegawai,kasir,manager');

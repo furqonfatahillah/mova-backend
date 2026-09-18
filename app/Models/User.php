@@ -37,8 +37,9 @@ class User extends Authenticatable
         'outlet_name',
         'business_name',
         'is_superadmin_platform',
-        'is_owner_bisnis',
         'is_owner_website',
+        'is_platform_admin',
+        'is_owner_bisnis',
         'is_owner_outlet',
         'is_pegawai',
     ];
@@ -141,14 +142,19 @@ class User extends Authenticatable
         return $this->isSuperadminPlatform();
     }
 
-    public function getIsOwnerBisnisAttribute(): bool
-    {
-        return $this->isOwnerBisnis();
-    }
-
     public function getIsOwnerWebsiteAttribute(): bool
     {
         return $this->isOwnerWebsite();
+    }
+
+    public function getIsPlatformAdminAttribute(): bool
+    {
+        return $this->isPlatformAdmin();
+    }
+
+    public function getIsOwnerBisnisAttribute(): bool
+    {
+        return $this->isOwnerBisnis();
     }
 
     public function getIsOwnerOutletAttribute(): bool
@@ -178,12 +184,17 @@ class User extends Authenticatable
 
     public function isOwnerWebsite(): bool
     {
-        return $this->role === 'owner_website' || $this->isSuperadminPlatform();
+        return in_array($this->role, ['owner_website', 'superadmin_platform', 'superadmin']);
+    }
+
+    public function isPlatformAdmin(): bool
+    {
+        return $this->isOwnerWebsite();
     }
 
     public function isOwnerBisnis(): bool
     {
-        return in_array($this->role, ['owner_bisnis', 'owner', 'admin']) || $this->isOwnerWebsite();
+        return in_array($this->role, ['owner_bisnis', 'owner', 'admin']);
     }
 
     public function isOwnerOutlet(): bool
@@ -198,23 +209,19 @@ class User extends Authenticatable
 
     public function canManage(User $target): bool
     {
-        if ($this->isSuperadminPlatform()) return true;
+        if ($this->isPlatformAdmin()) {
+            return true;
+        }
 
         // User dari tenant lain tidak bisa dikelola
         if ((int)$this->business_id !== (int)$target->business_id) {
             return false;
         }
 
-        // Owner Website bisa mengelola seluruh user di bisnisnya (kecuali Superadmin Platform)
-        if ($this->isOwnerWebsite()) {
-            return !$target->isSuperadminPlatform();
-        }
-
         // Owner Bisnis HANYA bisa mengelola owner outlet dan pegawai di bisnisnya.
-        // TIDAK BISA mengelola superadmin_platform, owner_website, atau owner_bisnis.
+        // TIDAK BISA mengelola akun platform admin atau sesama owner_bisnis.
         if ($this->isOwnerBisnis()) {
-            return !$target->isSuperadminPlatform()
-                && !$target->isOwnerWebsite()
+            return !$target->isPlatformAdmin()
                 && !in_array($target->role, ['owner_bisnis', 'owner', 'admin']);
         }
 

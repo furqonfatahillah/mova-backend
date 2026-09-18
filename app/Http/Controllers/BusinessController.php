@@ -29,8 +29,8 @@ class BusinessController extends Controller
     public function index(Request $request)
     {
         $user = $request->user();
-        if (!$user->isSuperadminPlatform()) {
-            return response()->json(['message' => 'Unauthorized. Hanya Superadmin Platform yang dapat mengakses seluruh penyewa.'], 403);
+        if (!$user->isPlatformAdmin()) {
+            return response()->json(['message' => 'Unauthorized. Hanya Pemilik Platform yang dapat mengakses seluruh penyewa.'], 403);
         }
 
         $query = Business::query()
@@ -74,7 +74,7 @@ class BusinessController extends Controller
     public function store(Request $request)
     {
         $user = $request->user();
-        if (!$user->isSuperadminPlatform()) {
+        if (!$user->isPlatformAdmin()) {
             return response()->json(['message' => 'Unauthorized.'], 403);
         }
 
@@ -111,7 +111,7 @@ class BusinessController extends Controller
     public function show(Request $request, Business $business)
     {
         $user = $request->user();
-        if (!$user->isSuperadminPlatform() && (int)$user->business_id !== (int)$business->id) {
+        if (!$user->isPlatformAdmin() && (int)$user->business_id !== (int)$business->id) {
             return response()->json(['message' => 'Unauthorized.'], 403);
         }
 
@@ -129,7 +129,7 @@ class BusinessController extends Controller
     public function update(Request $request, Business $business)
     {
         $user = $request->user();
-        if (!$user->isSuperadminPlatform()) {
+        if (!$user->isPlatformAdmin()) {
             return response()->json(['message' => 'Unauthorized.'], 403);
         }
 
@@ -201,12 +201,29 @@ class BusinessController extends Controller
         $user = $request->user();
         $businessId = $user->business_id;
 
-        if ($user->isSuperadminPlatform()) {
-            $businessId = (int) ($request->header('X-Business-Id') ?? $request->business_id ?? $user->business_id ?? 1);
+        if ($user->isPlatformAdmin()) {
+            $explicitBusinessId = $request->header('X-Business-Id') ?? $request->business_id ?? $user->business_id;
+            if ($explicitBusinessId && is_numeric($explicitBusinessId)) {
+                $businessId = (int)$explicitBusinessId;
+            } else {
+                // Platform admin without active tenant selected
+                return response()->json([
+                    'is_platform_admin'      => true,
+                    'business_id'            => null,
+                    'business_name'          => 'Platform Provider (MOVA)',
+                    'coin_balance'           => null,
+                    'coins_per_transaction'  => 1,
+                    'remaining_transactions' => 999999,
+                    'low_coin_threshold'     => 0,
+                    'is_coin_low'            => false,
+                    'is_coin_out'            => false,
+                    'recent_mutations'       => [],
+                ]);
+            }
         }
 
         if (!$businessId) {
-            return response()->json(['message' => 'User tidak terikat dengan bisnis.'], 404);
+            return response()->json(['message' => 'User tidak terikat dengan bisnis tertentu.'], 404);
         }
 
         $business = Business::findOrFail($businessId);
@@ -223,6 +240,7 @@ class BusinessController extends Controller
             : [];
 
         return response()->json([
+            'is_platform_admin'      => false,
             'business_id'            => $business->id,
             'business_name'          => $business->name,
             'coin_balance'           => $hasCoinCol ? $business->coin_balance : 0,

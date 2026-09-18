@@ -17,7 +17,7 @@ class MenuController extends Controller
             'creator',
             'updater',
             'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
-            'bundleItems.bundledMenu',
+            'bundleItems.bundledMenu' => fn($q) => $q->with(['recipes' => fn($rq) => $rq->with('items.ingredient')->orderByDesc('version')]),
             'bundleItems.ingredient',
             'modifierGroups.options.ingredient',
             'outletMenus',
@@ -82,7 +82,13 @@ class MenuController extends Controller
             );
         }
 
-        $storeRelations = ['creator', 'updater', 'bundleItems.bundledMenu', 'bundleItems.ingredient', 'modifierGroups.options.ingredient'];
+        $storeRelations = [
+            'creator',
+            'updater',
+            'bundleItems.bundledMenu' => fn($q) => $q->with(['recipes' => fn($rq) => $rq->with('items.ingredient')->orderByDesc('version')]),
+            'bundleItems.ingredient',
+            'modifierGroups.options.ingredient'
+        ];
         if (Schema::hasTable('outlet_menus')) {
             $storeRelations[] = 'outletMenus';
         }
@@ -96,7 +102,7 @@ class MenuController extends Controller
             'creator',
             'updater',
             'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
-            'bundleItems.bundledMenu',
+            'bundleItems.bundledMenu' => fn($q) => $q->with(['recipes' => fn($rq) => $rq->with('items.ingredient')->orderByDesc('version')]),
             'bundleItems.ingredient',
             'modifierGroups.options.ingredient',
         ];
@@ -151,7 +157,13 @@ class MenuController extends Controller
             );
         }
 
-        $updateRelations = ['creator', 'updater', 'bundleItems.bundledMenu', 'bundleItems.ingredient', 'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version')];
+        $updateRelations = [
+            'creator',
+            'updater',
+            'bundleItems.bundledMenu' => fn($q) => $q->with(['recipes' => fn($rq) => $rq->with('items.ingredient')->orderByDesc('version')]),
+            'bundleItems.ingredient',
+            'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version')
+        ];
         if (Schema::hasTable('outlet_menus')) {
             $updateRelations[] = 'outletMenus';
         }

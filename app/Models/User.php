@@ -134,6 +134,9 @@ class User extends Authenticatable
 
     public function getBusinessNameAttribute()
     {
+        if ($this->isPlatformAdmin()) {
+            return 'Platform Provider MOVA';
+        }
         return $this->relationLoaded('business') ? $this->business?->name : null;
     }
 

@@ -44,8 +44,8 @@ class TransactionController extends Controller
         $deductedQty = $isDeficit ? max(0.0, min($currentStock, $requiredQty)) : $requiredQty;
         $pendingQty = $isDeficit ? round($requiredQty - $deductedQty, 3) : 0.0;
 
-        // 1. If not in shift and PAID, post stock movement for the physically available deducted_qty
-        if ($isPaid && !$isShiftActive && $deductedQty > 0) {
+        // 1. If PAID and available portion > 0, immediately deduct physical stock via StockMovement
+        if ($isPaid && $deductedQty > 0) {
             $noteText = $isDeficit
                 ? "{$orderNumber} – {$itemName} [Nota Urgent: Terpotong {$deductedQty} {$unit}, Tergantung {$pendingQty} {$unit}]"
                 : "{$orderNumber} – {$itemName}";
@@ -59,12 +59,13 @@ class TransactionController extends Controller
                 'qty'            => $deductedQty,
                 'note'           => $noteText,
                 'transaction_id' => $trx->id,
+                'shift_id'       => $trx->shift_id,
                 'user_id'        => $userId,
                 'created_by'     => $userId,
             ]);
         }
 
-        // 2. If deficit, create UrgentNote record
+        // 2. If deficit, create UrgentNote record (Bahan Tergantung)
         if ($isDeficit && $pendingQty > 0) {
             UrgentNote::create([
                 'business_id'    => $businessId,
@@ -1300,60 +1301,73 @@ class TransactionController extends Controller
     }
 
     /**
-     * Deduct stock for transaction items when outside of regular shift reconciliation.
+     * Deduct stock for transaction items when settling split bills or individual orders.
      */
     private function deductStockForTransaction(Transaction $t, string $orderRef, int $userId)
     {
         $menu = $t->menu;
-        $outletId = $t->outlet_id;
+        $outletId = $t->outlet_id ?: 1;
+        $businessId = $t->business_id ?: 1;
+        $date = $t->date ?: now()->toDateString();
+        $isPaid = true;
 
         // Deduct direct stock for DIRECT retail items
-        if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
-            $menu->decrement('stock', $t->qty);
-            if ($outletId) {
-                try {
-                    $om = \App\Models\OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-                    if ($om) {
-                        $om->decrement('stock', $t->qty);
-                    }
-                } catch (\Throwable $e) {}
-            }
+        if ($menu) {
+            $this->processDirectProductStockDeduction(
+                $businessId,
+                $outletId,
+                $t,
+                $orderRef,
+                $menu,
+                $t->qty,
+                $userId
+            );
         }
 
-        if ($t->shift_id) return;
-
-        $date = $t->date;
         $recipe = $menu?->activeRecipe($date);
-
         if ($recipe) {
             foreach ($recipe->items as $item) {
-                StockMovement::create([
-                    'date'           => $date,
-                    'ingredient_id'  => $item->ingredient_id,
-                    'type'           => 'SALE_USAGE',
-                    'qty'            => $item->qty * $t->qty,
-                    'note'           => "{$orderRef} (Split Bill) – {$menu->name} (x{$t->qty})",
-                    'transaction_id' => $t->id,
-                    'outlet_id'      => $outletId,
-                    'user_id'        => $userId,
-                    'created_by'     => $userId,
-                ]);
+                if ($item->ingredient) {
+                    $requiredIngQty = (float)($item->qty * $t->qty);
+                    $this->processIngredientStockDeduction(
+                        $businessId,
+                        $outletId,
+                        $t,
+                        $orderRef,
+                        $date,
+                        $item->ingredient,
+                        $requiredIngQty,
+                        "{$menu->name} (x{$t->qty}) [Split Bill]",
+                        'RECIPE',
+                        $menu->id,
+                        !empty($t->shift_id),
+                        $isPaid,
+                        $userId,
+                        $item->unit
+                    );
+                }
             }
         }
 
         foreach ($t->modifiers as $mod) {
-            if ($mod->ingredient_id && $mod->qty > 0) {
-                StockMovement::create([
-                    'date'           => $date,
-                    'ingredient_id'  => $mod->ingredient_id,
-                    'type'           => 'SALE_USAGE',
-                    'qty'            => (float)($mod->qty * $t->qty),
-                    'note'           => "{$orderRef} (Split Bill) – Modifier {$mod->name} ({$t->menu?->name} x{$t->qty})",
-                    'transaction_id' => $t->id,
-                    'outlet_id'      => $outletId,
-                    'user_id'        => $userId,
-                    'created_by'     => $userId,
-                ]);
+            if ($mod->ingredient_id && $mod->qty > 0 && $mod->ingredient) {
+                $requiredModQty = (float)($mod->qty * $t->qty);
+                $this->processIngredientStockDeduction(
+                    $businessId,
+                    $outletId,
+                    $t,
+                    $orderRef,
+                    $date,
+                    $mod->ingredient,
+                    $requiredModQty,
+                    "Modifier {$mod->name} ({$menu?->name} x{$t->qty}) [Split Bill]",
+                    'MODIFIER',
+                    $menu?->id,
+                    !empty($t->shift_id),
+                    $isPaid,
+                    $userId,
+                    $mod->unit
+                );
             }
         }
     }

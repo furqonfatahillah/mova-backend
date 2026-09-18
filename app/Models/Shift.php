@@ -96,6 +96,7 @@ class Shift extends Model
                         });
                 })->orWhere('status', 'SPLIT_CLOSED');
             })
+            ->whereDoesntHave('stockMovements')
             ->with([
                 'menu.recipes.items.ingredient',
                 'menu.bundleItems.bundledMenu.recipes.items.ingredient',

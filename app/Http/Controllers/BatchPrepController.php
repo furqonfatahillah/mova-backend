@@ -49,14 +49,18 @@ class BatchPrepController extends Controller
 
     /**
      * Create or update sub-recipe for a semi-finished ingredient
+     * If ingredient_id is omitted, automatically creates a new SEMI_FINISHED ingredient in Master Bahan!
      */
     public function storeRecipe(Request $request)
     {
         $data = $request->validate([
-            'ingredient_id' => 'required|exists:ingredients,id',
+            'ingredient_id' => 'nullable|exists:ingredients,id',
+            'code'          => 'nullable|string|max:20',
             'name'          => 'required|string|max:255',
+            'category'      => 'nullable|string|max:100',
             'output_qty'    => 'required|numeric|min:0.001',
             'output_unit'   => 'required|string|max:20',
+            'stok_min'      => 'nullable|numeric|min:0',
             'notes'         => 'nullable|string',
             'items'         => 'required|array|min:1',
             'items.*.ingredient_id' => 'required|exists:ingredients,id',
@@ -66,13 +70,46 @@ class BatchPrepController extends Controller
         ]);
 
         return DB::transaction(function () use ($data, $request) {
-            $ingredient = Ingredient::findOrFail($data['ingredient_id']);
+            if (!empty($data['ingredient_id'])) {
+                $ingredient = Ingredient::findOrFail($data['ingredient_id']);
+                $ingredient->type = 'SEMI_FINISHED';
+                $ingredient->yield_qty = $data['output_qty'];
+                $ingredient->yield_unit = $data['output_unit'];
+                if (isset($data['name'])) $ingredient->name = $data['name'];
+                if (isset($data['category'])) $ingredient->category = $data['category'];
+                if (isset($data['stok_min'])) $ingredient->stok_min = $data['stok_min'];
+                $ingredient->save();
+            } else {
+                // Generate a unique code for the new Semi-Finished ingredient
+                $code = $data['code'] ?? null;
+                if (!$code) {
+                    $lastIng = Ingredient::orderBy('id', 'desc')->first();
+                    $nextNum = $lastIng ? ($lastIng->id + 1) : 1;
+                    $code = 'PRP-' . str_pad($nextNum, 3, '0', STR_PAD_LEFT);
+                    while (Ingredient::where('code', $code)->exists()) {
+                        $nextNum++;
+                        $code = 'PRP-' . str_pad($nextNum, 3, '0', STR_PAD_LEFT);
+                    }
+                }
 
-            // Ensure the ingredient is marked as SEMI_FINISHED and has yield info
-            $ingredient->type = 'SEMI_FINISHED';
-            $ingredient->yield_qty = $data['output_qty'];
-            $ingredient->yield_unit = $data['output_unit'];
-            $ingredient->save();
+                $ingredient = Ingredient::create([
+                    'code'        => $code,
+                    'name'        => $data['name'],
+                    'category'    => $data['category'] ?? 'Bahan Olahan',
+                    'type'        => 'SEMI_FINISHED',
+                    'unit_beli'   => $data['output_unit'],
+                    'unit_pakai'  => $data['output_unit'],
+                    'konversi'    => 1,
+                    'harga'       => 0,
+                    'stok_awal'   => 0,
+                    'stok_min'    => $data['stok_min'] ?? 0,
+                    'tolerance'   => 0,
+                    'yield_qty'   => $data['output_qty'],
+                    'yield_unit'  => $data['output_unit'],
+                    'active'      => true,
+                    'created_by'  => $request->user()?->id,
+                ]);
+            }
 
             // Find existing prep recipe or create new
             $prepRecipe = PrepRecipe::where('ingredient_id', $ingredient->id)->first();
@@ -92,6 +129,7 @@ class BatchPrepController extends Controller
             // Delete old items and insert fresh
             $prepRecipe->items()->delete();
 
+            $totalEstimatedCost = 0;
             foreach ($data['items'] as $it) {
                 PrepRecipeItem::create([
                     'prep_recipe_id' => $prepRecipe->id,
@@ -100,6 +138,24 @@ class BatchPrepController extends Controller
                     'unit'           => $it['unit'],
                     'waste_std'      => $it['waste_std'] ?? 0,
                 ]);
+
+                // Calculate estimated cost
+                $rawIng = Ingredient::find($it['ingredient_id']);
+                if ($rawIng) {
+                    $konv = max((float)$rawIng->konversi, 1);
+                    $costPerPakai = (float)$rawIng->harga / $konv;
+                    $isBeli = (strtolower($it['unit']) === strtolower($rawIng->unit_beli));
+                    $baseQty = (float)$it['qty'];
+                    $qtyPakai = $isBeli ? ($baseQty * $konv) : $baseQty;
+                    $wasteFactor = 1 + ((float)($it['waste_std'] ?? 0) / 100);
+                    $totalEstimatedCost += ($qtyPakai * $costPerPakai * $wasteFactor);
+                }
+            }
+
+            // Update initial unit cost on the semi-finished ingredient if harga is 0
+            if ((float)$ingredient->harga == 0 && (float)$data['output_qty'] > 0) {
+                $ingredient->harga = round($totalEstimatedCost / (float)$data['output_qty'], 2);
+                $ingredient->save();
             }
 
             $prepRecipe->load(['ingredient', 'items.ingredient', 'creator', 'updater']);

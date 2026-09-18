@@ -235,7 +235,7 @@ class BusinessController extends Controller
             ? \App\Models\CoinTransaction::where('business_id', $businessId)
                 ->with(['outlet:id,name', 'creator:id,name'])
                 ->orderByDesc('id')
-                ->limit(100)
+                ->limit(500)
                 ->get()
             : [];
 

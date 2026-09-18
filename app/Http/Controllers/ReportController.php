@@ -85,15 +85,14 @@ class ReportController extends Controller
 
     /**
      * Variance per menu (allocation by theoretical usage share).
+    /**
+     * Internal variance per menu calculation
      */
-    public function varianceMenus(Request $request)
+    private function calculateVarianceMenusData(string $from, string $to, ?int $outletId): array
     {
-        $p = $this->validatePeriod($request);
-        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
-
-        $varData = $this->buildVarianceArray($p['from'], $p['to'], $outletId);
-        $menus   = Menu::with('recipes.items')->get();
-        $trxQuery = Transaction::whereBetween('date', [$p['from'], $p['to']])->where('status', 'PAID');
+        $varData = $this->buildVarianceArray($from, $to, $outletId);
+        $menus   = Menu::with(['recipes.items', 'outletMenus'])->get();
+        $trxQuery = Transaction::whereBetween('date', [$from, $to])->where('status', 'PAID');
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);
         }
@@ -153,7 +152,7 @@ class ReportController extends Controller
             }
         }
 
-        $result = array_values(array_map(function ($row) {
+        return array_values(array_map(function ($row) {
             $row['variance_value'] = round($row['variance_value'], 0);
             $row['weighted_pct'] = $row['weighted_pct_den'] > 0
                 ? round($row['weighted_pct_num'] / $row['weighted_pct_den'], 2)
@@ -161,8 +160,17 @@ class ReportController extends Controller
             unset($row['weighted_pct_num'], $row['weighted_pct_den']);
             return $row;
         }, $perMenu));
+    }
 
-        return response()->json($result);
+    /**
+     * Variance per menu (allocation by theoretical usage share).
+     */
+    public function varianceMenus(Request $request)
+    {
+        $p = $this->validatePeriod($request);
+        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
+
+        return response()->json($this->calculateVarianceMenusData($p['from'], $p['to'], $outletId));
     }
 
     /** Menu profitability */
@@ -171,14 +179,14 @@ class ReportController extends Controller
         $p = $this->validatePeriod($request);
         $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
 
-        $menus        = Menu::with('recipes.items.ingredient')->get();
+        $menus        = Menu::with(['recipes.items.ingredient', 'outletMenus'])->get();
         $trxQuery     = Transaction::whereBetween('date', [$p['from'], $p['to']])->where('status', 'PAID');
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);
         }
         $transactions = $trxQuery->get();
 
-        $varMenuData  = json_decode($this->varianceMenus($request)->getContent(), true);
+        $varMenuData  = $this->calculateVarianceMenusData($p['from'], $p['to'], $outletId);
         $varByMenu    = [];
         foreach ($varMenuData as $row) {
             $varByMenu[$row['menu']['id']] = $row['variance_value'];
@@ -724,7 +732,8 @@ class ReportController extends Controller
     private function calculatePnlData(string $from, string $to, ?int $outletId = null): array
     {
         // 1. REVENUE (PENDAPATAN USAHA)
-        $trxQuery = Transaction::where('status', 'PAID')
+        $trxQuery = Transaction::with(['menu.recipes.items'])
+            ->where('status', 'PAID')
             ->whereBetween('date', [$from, $to]);
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);

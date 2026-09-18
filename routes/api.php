@@ -22,6 +22,10 @@ use App\Http\Controllers\CashFlowController;
 use App\Http\Controllers\ShiftScheduleController;
 use App\Http\Controllers\CoinPlatformController;
 use App\Http\Controllers\UrgentNoteController;
+use App\Http\Controllers\CategoryController;
+use App\Http\Controllers\UnitController;
+use App\Http\Controllers\ExpenseCategoryController;
+use App\Http\Controllers\PaymentMethodController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -39,6 +43,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/my-business',       [BusinessController::class, 'myBusiness']);
     Route::get('/my-business/coins', [BusinessController::class, 'myCoins']);
     Route::put('/my-business',       [BusinessController::class, 'updateMyBusiness']);
+
+    // Master Tables (ID-based Lookup)
+    Route::apiResource('categories', CategoryController::class);
+    Route::apiResource('units', UnitController::class);
+    Route::apiResource('expense-categories', ExpenseCategoryController::class);
+    Route::apiResource('payment-methods', PaymentMethodController::class);
 
     // SaaS Platform Coin Top-Up & Rate Management (Website Owner / Superadmin Platform)
     Route::get('/platform/coins/overview', [CoinPlatformController::class, 'overview']);

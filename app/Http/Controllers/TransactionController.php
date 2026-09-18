@@ -920,12 +920,18 @@ class TransactionController extends Controller
             ];
         }
 
-        // Enhance each open bill with equal split payment progress if any
-        foreach ($grouped as $ord => &$bill) {
-            $paidSplits = Transaction::where('parent_order_number', $ord)
+        // Enhance each open bill with equal split payment progress if any (Single batch query)
+        $orderNumbersList = array_keys($grouped);
+        $allPaidSplitsGrouped = !empty($orderNumbersList)
+            ? Transaction::whereIn('parent_order_number', $orderNumbersList)
                 ->where('split_type', 'EQUAL')
                 ->where('status', 'PAID')
-                ->get();
+                ->get()
+                ->groupBy('parent_order_number')
+            : collect();
+
+        foreach ($grouped as $ord => &$bill) {
+            $paidSplits = $allPaidSplitsGrouped->get($ord, collect());
 
             $paidSplitsTotal = (float)$paidSplits->sum('total_price');
             $paidSplitsCount = $paidSplits->count();

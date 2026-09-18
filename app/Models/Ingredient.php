@@ -12,7 +12,8 @@ class Ingredient extends Model
 
     protected $fillable = [
         'business_id',
-        'code', 'name', 'category', 'type', 'unit_beli', 'unit_pakai',
+        'code', 'name', 'category', 'category_id', 'type',
+        'unit_beli', 'unit_beli_id', 'unit_pakai', 'unit_pakai_id',
         'konversi', 'harga', 'last_purchase_price', 'stok_awal', 'stok_min', 'tolerance',
         'yield_qty', 'yield_unit', 'active',
         'created_by', 'updated_by',
@@ -39,6 +40,21 @@ class Ingredient extends Model
         'active'              => 'boolean',
     ];
 
+    public function categoryModel()
+    {
+        return $this->belongsTo(Category::class, 'category_id');
+    }
+
+    public function unitBeliModel()
+    {
+        return $this->belongsTo(Unit::class, 'unit_beli_id');
+    }
+
+    public function unitPakaiModel()
+    {
+        return $this->belongsTo(Unit::class, 'unit_pakai_id');
+    }
+
     public function outletIngredients()
     {
         return $this->hasMany(OutletIngredient::class);
@@ -64,23 +80,52 @@ class Ingredient extends Model
         return $this->hasMany(BatchPrep::class);
     }
 
+    private static ?\Illuminate\Database\Eloquent\Collection $memoizedOutlets = null;
+
+    protected static function getCachedOutlets(): \Illuminate\Database\Eloquent\Collection
+    {
+        if (static::$memoizedOutlets === null) {
+            static::$memoizedOutlets = Outlet::orderBy('id')->get();
+        }
+        return static::$memoizedOutlets;
+    }
+
     public function stockForOutlet(int $outletId): float
     {
-        $outletRow = $this->outletIngredients()->where('outlet_id', $outletId)->first();
+        $outletRow = $this->relationLoaded('outletIngredients')
+            ? $this->outletIngredients->firstWhere('outlet_id', $outletId)
+            : $this->outletIngredients()->where('outlet_id', $outletId)->first();
+
         $stokAwal = $outletRow ? (float) $outletRow->stok_awal : ($outletId === 1 ? (float) $this->stok_awal : 0.0);
 
-        $movSum = (float) $this->movements()
-            ->where('outlet_id', $outletId)
-            ->get()
-            ->sum(fn($m) => $m->signedQty());
+        if ($this->relationLoaded('movements')) {
+            $movSum = (float) $this->movements
+                ->where('outlet_id', $outletId)
+                ->sum(fn($m) => $m->signedQty());
+        } else {
+            $movSum = (float) $this->movements()
+                ->where('outlet_id', $outletId)
+                ->selectRaw("SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->value('net_qty') ?? 0.0;
+        }
 
         return round($stokAwal + $movSum, 3);
     }
 
     public function consolidatedStock(): float
     {
-        $movSum = (float) $this->movements()->get()->sum(fn($m) => $m->signedQty());
-        $initialSum = (float) $this->outletIngredients()->sum('stok_awal');
+        if ($this->relationLoaded('movements')) {
+            $movSum = (float) $this->movements->sum(fn($m) => $m->signedQty());
+        } else {
+            $movSum = (float) $this->movements()
+                ->selectRaw("SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->value('net_qty') ?? 0.0;
+        }
+
+        $initialSum = $this->relationLoaded('outletIngredients')
+            ? (float) $this->outletIngredients->sum('stok_awal')
+            : (float) $this->outletIngredients()->sum('stok_awal');
+
         if ($initialSum <= 0) {
             $initialSum = (float) $this->stok_awal;
         }
@@ -90,7 +135,7 @@ class Ingredient extends Model
     public function getCurrentStockAttribute(): float
     {
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()->outlet_id) {
+        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
             $outletId = auth()->user()->outlet_id;
         }
 
@@ -105,12 +150,15 @@ class Ingredient extends Model
     public function getCurrentStokMinAttribute(): float
     {
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()->outlet_id) {
+        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
             $outletId = auth()->user()->outlet_id;
         }
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
-            $outletRow = $this->outletIngredients()->where('outlet_id', $outletId)->first();
+            $outletRow = $this->relationLoaded('outletIngredients')
+                ? $this->outletIngredients->firstWhere('outlet_id', $outletId)
+                : $this->outletIngredients()->where('outlet_id', $outletId)->first();
+
             if ($outletRow && $outletRow->stok_min !== null) {
                 return (float) $outletRow->stok_min;
             }
@@ -121,7 +169,7 @@ class Ingredient extends Model
 
     public function getOutletStocksAttribute(): array
     {
-        $outlets = Outlet::orderBy('id')->get();
+        $outlets = static::getCachedOutlets();
         $movementsGrouped = $this->movements()
             ->selectRaw("outlet_id, SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
             ->groupBy('outlet_id')
@@ -129,7 +177,9 @@ class Ingredient extends Model
             ->all();
 
         $rows = [];
-        $outletIngs = $this->outletIngredients()->get()->keyBy('outlet_id');
+        $outletIngs = $this->relationLoaded('outletIngredients')
+            ? $this->outletIngredients->keyBy('outlet_id')
+            : $this->outletIngredients()->get()->keyBy('outlet_id');
 
         foreach ($outlets as $outlet) {
             $initial = isset($outletIngs[$outlet->id])

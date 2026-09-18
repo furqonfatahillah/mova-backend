@@ -35,6 +35,7 @@ class Transaction extends Model
         'order_type',
         'table_number',
         'payment_method',
+        'payment_method_id',
         'is_urgent_note',
         'urgent_status',
         'notes',
@@ -114,6 +115,11 @@ class Transaction extends Model
     public function discount()
     {
         return $this->belongsTo(Discount::class);
+    }
+
+    public function paymentMethodModel()
+    {
+        return $this->belongsTo(PaymentMethod::class, 'payment_method_id');
     }
 
     public function urgentNotes()

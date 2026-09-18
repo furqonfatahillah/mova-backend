@@ -20,11 +20,8 @@ class MenuController extends Controller
             'bundleItems.bundledMenu',
             'bundleItems.ingredient',
             'modifierGroups.options.ingredient',
+            'outletMenus',
         ];
-
-        if (Schema::hasTable('outlet_menus')) {
-            $relations[] = 'outletMenus';
-        }
 
         $query = Menu::with($relations)->orderBy('code');
 

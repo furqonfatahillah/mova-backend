@@ -16,9 +16,11 @@ class OperatingExpense extends Model
         'expense_no',
         'date',
         'category',
+        'expense_category_id',
         'name',
         'amount',
         'payment_method',
+        'payment_method_id',
         'notes',
         'receipt_img',
         'user_id',
@@ -83,6 +85,16 @@ class OperatingExpense extends Model
         }
 
         return $prefix . str_pad($nextSeq, 4, '0', STR_PAD_LEFT);
+    }
+
+    public function expenseCategory()
+    {
+        return $this->belongsTo(ExpenseCategory::class, 'expense_category_id');
+    }
+
+    public function paymentMethodModel()
+    {
+        return $this->belongsTo(PaymentMethod::class, 'payment_method_id');
     }
 
     public function outlet()

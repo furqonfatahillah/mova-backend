@@ -17,6 +17,7 @@ class Menu extends Model
         'name',
         'description',
         'category',
+        'category_id',
         'item_type',    // RECIPE, DIRECT, SERVICE
         'track_stock',
         'stock',
@@ -24,6 +25,7 @@ class Menu extends Model
         'price',
         'cost_price',
         'unit',
+        'unit_id',
         'active',
         'created_by',
         'updated_by',
@@ -50,6 +52,16 @@ class Menu extends Model
         'track_stock' => 'boolean',
         'active'      => 'boolean',
     ];
+
+    public function categoryModel()
+    {
+        return $this->belongsTo(Category::class, 'category_id');
+    }
+
+    public function unitModel()
+    {
+        return $this->belongsTo(Unit::class, 'unit_id');
+    }
 
     public function recipes()
     {
@@ -82,6 +94,13 @@ class Menu extends Model
     /** Active recipe at or before a given date */
     public function activeRecipe(?string $atDate = null): ?Recipe
     {
+        if ($this->relationLoaded('recipes')) {
+            return $this->recipes
+                ->when($atDate, fn($c) => $c->where('date', '<=', $atDate))
+                ->sortByDesc('version')
+                ->first();
+        }
+
         return $this->recipes()
             ->when($atDate, fn($q) => $q->where('date', '<=', $atDate))
             ->orderByDesc('version')
@@ -96,7 +115,10 @@ class Menu extends Model
         }
 
         try {
-            $outletRow = $this->outletMenus()->where('outlet_id', $outletId)->first();
+            $outletRow = $this->relationLoaded('outletMenus')
+                ? $this->outletMenus->firstWhere('outlet_id', $outletId)
+                : $this->outletMenus()->where('outlet_id', $outletId)->first();
+
             if ($outletRow) {
                 return (float)$outletRow->stock;
             }
@@ -115,7 +137,10 @@ class Menu extends Model
         }
 
         try {
-            $outletRow = $this->outletMenus()->where('outlet_id', $outletId)->first();
+            $outletRow = $this->relationLoaded('outletMenus')
+                ? $this->outletMenus->firstWhere('outlet_id', $outletId)
+                : $this->outletMenus()->where('outlet_id', $outletId)->first();
+
             if ($outletRow && $outletRow->min_stock !== null) {
                 return (float)$outletRow->min_stock;
             }
@@ -139,7 +164,10 @@ class Menu extends Model
 
         try {
             // Konsolidasi seluruh outlet atau stok master
-            $outletSum = (float)$this->outletMenus()->sum('stock');
+            $outletSum = $this->relationLoaded('outletMenus')
+                ? (float)$this->outletMenus->sum('stock')
+                : (float)$this->outletMenus()->sum('stock');
+
             if ($outletSum > 0) {
                 return $outletSum;
             }

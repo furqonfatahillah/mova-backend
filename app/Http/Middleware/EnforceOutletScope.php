@@ -16,6 +16,25 @@ class EnforceOutletScope
     {
         $user = $request->user();
 
+        // 1. Enforce Real-time SaaS Subscription Status
+        if ($user && $user->business && !$user->isSuperadminPlatform()) {
+            $path = $request->path();
+            $isExempt = str_contains($path, 'logout') || str_contains($path, 'me') || str_contains($path, 'my-business');
+
+            if (!$isExempt) {
+                if ($user->business->status === 'suspended') {
+                    return response()->json([
+                        'message' => 'Akses bisnis Anda telah dinonaktifkan sementara oleh pengelola platform. Silakan hubungi admin pengelola.'
+                    ], 403);
+                }
+                if ($user->business->status === 'expired' || ($user->business->expires_at && $user->business->expires_at->isPast())) {
+                    return response()->json([
+                        'message' => 'Masa aktif langganan bisnis Anda telah berakhir. Silakan hubungi pengelola platform untuk perpanjangan sewa.'
+                    ], 403);
+                }
+            }
+        }
+
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $userOutletId = (int) $user->outlet_id;
 

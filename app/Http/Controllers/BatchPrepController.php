@@ -23,8 +23,10 @@ class BatchPrepController extends Controller
     public function indexRecipes(Request $request)
     {
         $query = PrepRecipe::with([
-            'ingredient',
-            'items.ingredient',
+            'ingredient.outletIngredients',
+            'ingredient.movements',
+            'items.ingredient.outletIngredients',
+            'items.ingredient.movements',
             'creator',
             'updater',
         ])->orderBy('name');
@@ -44,7 +46,15 @@ class BatchPrepController extends Controller
             });
         }
 
-        return response()->json($query->get());
+        $recipes = $query->get();
+        $recipes->each(function ($r) {
+            $r->ingredient?->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+            $r->items?->each(function ($it) {
+                $it->ingredient?->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+            });
+        });
+
+        return response()->json($recipes);
     }
 
     /**

@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Outlet;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 
 class OutletController extends Controller
 {
@@ -41,8 +42,18 @@ class OutletController extends Controller
             ], 422);
         }
 
+        $businessId = $user?->business_id;
+        if ($user?->isSuperadminPlatform()) {
+            $businessId = $request->header('X-Business-Id') ?? $request->query('business_id') ?? $request->input('business_id');
+        }
+
         $data = $request->validate([
-            'code'     => 'required|string|max:30',
+            'code' => [
+                'required', 'string', 'max:30',
+                Rule::unique('outlets', 'code')->where(function ($query) use ($businessId) {
+                    return $businessId ? $query->where('business_id', $businessId) : $query;
+                }),
+            ],
             'name'     => 'required|string|max:255',
             'address'  => 'nullable|string|max:500',
             'phone'    => 'nullable|string|max:50',
@@ -70,8 +81,15 @@ class OutletController extends Controller
 
     public function update(Request $request, Outlet $outlet)
     {
+        $businessId = $outlet->business_id ?? $request->user()?->business_id;
+
         $data = $request->validate([
-            'code'     => 'sometimes|string|max:30|unique:outlets,code,' . $outlet->id,
+            'code' => [
+                'sometimes', 'string', 'max:30',
+                Rule::unique('outlets', 'code')->where(function ($query) use ($businessId) {
+                    return $businessId ? $query->where('business_id', $businessId) : $query;
+                })->ignore($outlet->id),
+            ],
             'name'     => 'sometimes|string|max:255',
             'address'  => 'nullable|string|max:500',
             'phone'    => 'nullable|string|max:50',

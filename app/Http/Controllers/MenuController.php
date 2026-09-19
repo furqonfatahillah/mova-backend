@@ -8,6 +8,7 @@ use App\Models\RecipeItem;
 use App\Models\OutletMenu;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Validation\Rule;
 
 class MenuController extends Controller
 {
@@ -34,8 +35,19 @@ class MenuController extends Controller
 
     public function store(Request $request)
     {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+        if ($user?->isSuperadminPlatform()) {
+            $businessId = $request->header('X-Business-Id') ?? $request->query('business_id') ?? $request->input('business_id');
+        }
+
         $data = $request->validate([
-            'code'        => 'required|string|max:20|unique:menus',
+            'code' => [
+                'required', 'string', 'max:20',
+                Rule::unique('menus', 'code')->where(function ($query) use ($businessId) {
+                    return $businessId ? $query->where('business_id', $businessId) : $query;
+                }),
+            ],
             'barcode'     => 'nullable|string|max:50',
             'name'        => 'required|string|max:255',
             'description' => 'nullable|string',
@@ -115,8 +127,15 @@ class MenuController extends Controller
 
     public function update(Request $request, Menu $menu)
     {
+        $businessId = $menu->business_id ?? $request->user()?->business_id;
+
         $data = $request->validate([
-            'code'        => 'sometimes|string|max:20|unique:menus,code,' . $menu->id,
+            'code' => [
+                'sometimes', 'string', 'max:20',
+                Rule::unique('menus', 'code')->where(function ($query) use ($businessId) {
+                    return $businessId ? $query->where('business_id', $businessId) : $query;
+                })->ignore($menu->id),
+            ],
             'barcode'     => 'nullable|string|max:50',
             'name'        => 'sometimes|string|max:255',
             'description' => 'nullable|string',

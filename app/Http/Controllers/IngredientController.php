@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Ingredient;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 
 class IngredientController extends Controller
 {
@@ -21,8 +22,19 @@ class IngredientController extends Controller
 
     public function store(Request $request)
     {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+        if ($user?->isSuperadminPlatform()) {
+            $businessId = $request->header('X-Business-Id') ?? $request->query('business_id') ?? $request->input('business_id');
+        }
+
         $data = $request->validate([
-            'code'       => 'required|string|max:20|unique:ingredients',
+            'code' => [
+                'required', 'string', 'max:20',
+                Rule::unique('ingredients', 'code')->where(function ($query) use ($businessId) {
+                    return $businessId ? $query->where('business_id', $businessId) : $query;
+                }),
+            ],
             'name'       => 'required|string|max:255',
             'category'   => 'required|string|max:100',
             'type'       => 'nullable|string|in:RAW,SEMI_FINISHED',
@@ -54,8 +66,15 @@ class IngredientController extends Controller
 
     public function update(Request $request, Ingredient $ingredient)
     {
+        $businessId = $ingredient->business_id ?? $request->user()?->business_id;
+
         $data = $request->validate([
-            'code'       => 'sometimes|string|max:20|unique:ingredients,code,' . $ingredient->id,
+            'code' => [
+                'sometimes', 'string', 'max:20',
+                Rule::unique('ingredients', 'code')->where(function ($query) use ($businessId) {
+                    return $businessId ? $query->where('business_id', $businessId) : $query;
+                })->ignore($ingredient->id),
+            ],
             'name'       => 'sometimes|string|max:255',
             'category'   => 'sometimes|string|max:100',
             'type'       => 'nullable|string|in:RAW,SEMI_FINISHED',

@@ -26,6 +26,7 @@ use App\Http\Controllers\CategoryController;
 use App\Http\Controllers\UnitController;
 use App\Http\Controllers\ExpenseCategoryController;
 use App\Http\Controllers\PaymentMethodController;
+use App\Http\Controllers\ReceivableController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -159,6 +160,11 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     // Beban Operasional (OPEX / Operating Expenses)
     Route::get('/expenses/summary',             [ExpenseController::class, 'summary']);
     Route::apiResource('expenses', ExpenseController::class);
+
+    // Buku Piutang (Accounts Receivable & Pembayaran Angsuran)
+    Route::post('/receivables/{receivable}/payments',                   [ReceivableController::class, 'addPayment']);
+    Route::delete('/receivables/{receivable}/payments/{payment}',       [ReceivableController::class, 'deletePayment']);
+    Route::apiResource('receivables', ReceivableController::class);
 
     // Arus Kas Nyata (Cash Flow Statement & Mutasi Kas CapEx/Financing)
     Route::get('/cash-flow/statement',          [CashFlowController::class, 'statement']);

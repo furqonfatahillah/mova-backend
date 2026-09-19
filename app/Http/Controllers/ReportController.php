@@ -14,6 +14,8 @@ use Illuminate\Http\Request;
 
 class ReportController extends Controller
 {
+    protected ?\Illuminate\Database\Eloquent\Collection $cachedActiveIngredients = null;
+
     private function validatePeriod(Request $request): array
     {
         return $request->validate([
@@ -22,47 +24,59 @@ class ReportController extends Controller
         ]);
     }
 
-    /** Signed qty for a movement (IN = +, OUT = -) */
-    private function signedQty(StockMovement $m): float
+    /** Signed qty for a movement type (IN = +, OUT = -) */
+    private function signedQtyByType(string $type, float $qty): float
     {
-        $out = ['SALE_USAGE', 'WASTE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT'];
-        return in_array($m->type, $out) ? -$m->qty : $m->qty;
+        static $outTypes = ['SALE_USAGE' => 1, 'WASTE' => 1, 'ADJUSTMENT_OUT' => 1, 'TRANSFER_OUT' => 1, 'PREP_USAGE' => 1];
+        return isset($outTypes[$type]) ? -$qty : $qty;
     }
 
-    /** Balance of all movements for an ingredient BEFORE a given date */
-    private function movementsBalanceBefore(array $movements, int $ingId, string $beforeDate): float
+    /**
+     * Pre-compute movement aggregates for a single ingredient's movements.
+     * Returns all needed sums in a SINGLE pass — no repeated loops.
+     */
+    private function aggregateIngredientMovements(array $ingMovements, string $from, string $to): array
     {
-        $sum = 0;
-        foreach ($movements as $m) {
-            if ($m->ingredient_id === $ingId && $m->date < $beforeDate) {
-                $sum += $this->signedQty($m);
-            }
-        }
-        return $sum;
-    }
+        $balanceBefore = 0.0;
+        $purchase = 0.0;
+        $saleUsage = 0.0;
+        $waste = 0.0;
+        $transferIn = 0.0;
+        $transferOut = 0.0;
+        $adjustment = 0.0;
+        $wasteRecords = [];
 
-    private function sumMovementsInPeriod(array $movements, int $ingId, string $type, string $from, string $to): float
-    {
-        $sum = 0;
-        foreach ($movements as $m) {
-            if ($m->ingredient_id === $ingId && $m->type === $type && $m->date >= $from && $m->date <= $to) {
-                $sum += $m->qty;
-            }
-        }
-        return $sum;
-    }
+        foreach ($ingMovements as $m) {
+            $date = $m->date;
+            $type = $m->type;
+            $qty  = (float) $m->qty;
 
-    private function sumAdjustmentInPeriod(array $movements, int $ingId, string $from, string $to): float
-    {
-        $sum = 0;
-        foreach ($movements as $m) {
-            if ($m->ingredient_id !== $ingId) continue;
-            if ($m->date < $from || $m->date > $to) continue;
-            if (str_starts_with($m->type, 'ADJUSTMENT')) {
-                $sum += ($m->type === 'ADJUSTMENT_IN') ? $m->qty : -$m->qty;
+            if ($date < $from) {
+                // Pre-period: accumulate opening balance
+                $balanceBefore += $this->signedQtyByType($type, $qty);
+            } elseif ($date <= $to) {
+                // In-period: aggregate by type
+                switch ($type) {
+                    case 'PURCHASE':       $purchase += $qty; break;
+                    case 'SALE_USAGE':     $saleUsage += $qty; break;
+                    case 'WASTE':
+                        $waste += $qty;
+                        $wasteRecords[] = $m;
+                        break;
+                    case 'TRANSFER_IN':    $transferIn += $qty; break;
+                    case 'TRANSFER_OUT':   $transferOut += $qty; break;
+                    case 'ADJUSTMENT_IN':  case 'ADJUSTMENT_PLUS':
+                        $adjustment += $qty; break;
+                    case 'ADJUSTMENT_OUT':
+                        $adjustment -= $qty; break;
+                    default:
+                        // Other types in-period contribute to opening balance logic if needed
+                        break;
+                }
             }
         }
-        return $sum;
+
+        return compact('balanceBefore', 'purchase', 'saleUsage', 'waste', 'transferIn', 'transferOut', 'adjustment', 'wasteRecords');
     }
 
     private function statusOf(float $absPct, float $tol): string
@@ -1044,12 +1058,16 @@ class ReportController extends Controller
         ];
     }
 
-    /** Internal helper - reuse variance computation */
+    /** Internal helper - reuse variance computation (OPTIMIZED: pre-indexed by ingredient) */
     public function buildVarianceArray(string $from, string $to, ?int $outletId = null): array
     {
-        $ingredients  = Ingredient::with(['outletIngredients'])->where('active', true)->get();
-        
-        $movQuery = StockMovement::with(['creator', 'user'])->where(function ($q) use ($from, $to) {
+        if ($this->cachedActiveIngredients === null) {
+            $this->cachedActiveIngredients = Ingredient::with(['outletIngredients'])->where('active', true)->get();
+        }
+        $ingredients = $this->cachedActiveIngredients;
+
+        // Fetch movements WITHOUT heavy eager-loads (creator/user only needed for waste display)
+        $movQuery = StockMovement::where(function ($q) use ($from, $to) {
             $q->where('date', '<', $from)->orWhereBetween('date', [$from, $to]);
         });
         if ($outletId) {
@@ -1057,7 +1075,25 @@ class ReportController extends Controller
         }
         $allMovements = $movQuery->get();
 
-        $opnQuery = Opname::with(['user', 'creator', 'updater'])->where('period_from', $from)->where('period_to', $to);
+        // ⚡ KEY OPTIMIZATION: Pre-index movements by ingredient_id — O(m) once
+        $movementsByIngredient = [];
+        foreach ($allMovements as $m) {
+            $movementsByIngredient[$m->ingredient_id][] = $m;
+        }
+
+        // Batch-load waste record creator names (only for WASTE type movements in period)
+        $wasteCreatorIds = [];
+        foreach ($allMovements as $m) {
+            if ($m->type === 'WASTE' && $m->date >= $from && $m->date <= $to) {
+                if ($m->created_by) $wasteCreatorIds[$m->created_by] = true;
+                if ($m->user_id) $wasteCreatorIds[$m->user_id] = true;
+            }
+        }
+        $userNames = !empty($wasteCreatorIds)
+            ? \App\Models\User::whereIn('id', array_keys($wasteCreatorIds))->pluck('name', 'id')->all()
+            : [];
+
+        $opnQuery = Opname::where('period_from', $from)->where('period_to', $to);
         if ($outletId) {
             $opnQuery->where('outlet_id', $outletId);
         }
@@ -1065,7 +1101,9 @@ class ReportController extends Controller
 
         $result = [];
         foreach ($ingredients as $ing) {
-            $mvArr = $allMovements->all();
+            // ⚡ Only process THIS ingredient's movements — O(k) per ingredient
+            $ingMovements = $movementsByIngredient[$ing->id] ?? [];
+            $agg = $this->aggregateIngredientMovements($ingMovements, $from, $to);
 
             // Opening stock calculation
             if ($outletId) {
@@ -1076,15 +1114,15 @@ class ReportController extends Controller
                 $stokAwalMaster = $sumInit > 0 ? $sumInit : (float) $ing->stok_awal;
             }
 
-            $stokAwalPeriode = $stokAwalMaster + $this->movementsBalanceBefore($mvArr, $ing->id, $from);
-            $pembelian       = $this->sumMovementsInPeriod($mvArr, $ing->id, 'PURCHASE', $from, $to);
-            $pemakaianTeo    = $this->sumMovementsInPeriod($mvArr, $ing->id, 'SALE_USAGE', $from, $to);
-            $wasteQty        = $this->sumMovementsInPeriod($mvArr, $ing->id, 'WASTE', $from, $to);
-            $transferIn      = $this->sumMovementsInPeriod($mvArr, $ing->id, 'TRANSFER_IN', $from, $to);
-            $transferOut     = $this->sumMovementsInPeriod($mvArr, $ing->id, 'TRANSFER_OUT', $from, $to);
-            $adjustment      = $this->sumAdjustmentInPeriod($mvArr, $ing->id, $from, $to);
+            $stokAwalPeriode = $stokAwalMaster + $agg['balanceBefore'];
+            $pembelian       = $agg['purchase'];
+            $pemakaianTeo    = $agg['saleUsage'];
+            $wasteQty        = $agg['waste'];
+            $transferIn      = $agg['transferIn'];
+            $transferOut     = $agg['transferOut'];
+            $adjustment      = $agg['adjustment'];
 
-            $stokAkhirTeo    = $stokAwalPeriode + $pembelian + $transferIn - $pemakaianTeo - $wasteQty - $transferOut + $adjustment;
+            $stokAkhirTeo = $stokAwalPeriode + $pembelian + $transferIn - $pemakaianTeo - $wasteQty - $transferOut + $adjustment;
 
             $opname    = $opnames->get($ing->id);
             $actualQty = $opname?->actual_qty;
@@ -1105,19 +1143,18 @@ class ReportController extends Controller
             $variancePct         = ($hasActual && $pemakaianTeo > 0) ? ($unaccountedQty / $pemakaianTeo) * 100 : null;
             $status              = $hasActual ? $this->statusOf(abs($variancePct ?? 0), $ing->tolerance) : null;
 
-            $wasteRecords = [];
-            foreach ($allMovements as $m) {
-                if ($m->ingredient_id === $ing->id && $m->type === 'WASTE' && $m->date >= $from && $m->date <= $to) {
-                    $wasteRecords[] = [
-                        'id'              => $m->id,
-                        'date'            => $m->date,
-                        'qty'             => (float) $m->qty,
-                        'waste_reason'    => $m->waste_reason ?: 'SPOILED',
-                        'note'            => $m->note,
-                        'value'           => round($m->qty * $hargaPerPakai, 0),
-                        'created_by_name' => $m->creator?->name ?? ($m->user?->name ?? 'Staff'),
-                    ];
-                }
+            // Waste records already collected during aggregation — no extra loop needed
+            $wasteRecordsFmt = [];
+            foreach ($agg['wasteRecords'] as $m) {
+                $wasteRecordsFmt[] = [
+                    'id'              => $m->id,
+                    'date'            => $m->date,
+                    'qty'             => (float) $m->qty,
+                    'waste_reason'    => $m->waste_reason ?: 'SPOILED',
+                    'note'            => $m->note,
+                    'value'           => round($m->qty * $hargaPerPakai, 0),
+                    'created_by_name' => $userNames[$m->created_by] ?? ($userNames[$m->user_id] ?? 'Staff'),
+                ];
             }
 
             $result[] = [
@@ -1129,7 +1166,7 @@ class ReportController extends Controller
                 'waste'                => round($wasteQty, 3),
                 'waste_qty'            => round($wasteQty, 3),
                 'waste_value'          => $wasteValue,
-                'waste_records'        => $wasteRecords,
+                'waste_records'        => $wasteRecordsFmt,
                 'transfer_in'          => round($transferIn, 3),
                 'transfer_out'         => round($transferOut, 3),
                 'adjustment'           => round($adjustment, 3),
@@ -1150,3 +1187,4 @@ class ReportController extends Controller
         return $result;
     }
 }
+

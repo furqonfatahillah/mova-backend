@@ -45,16 +45,30 @@ trait Auditable
         return $this->belongsTo(User::class, 'updated_by');
     }
 
+    protected static array $userNameCache = [];
+
     /**
      * Display name of creator.
      */
     public function getCreatedByNameAttribute(): ?string
     {
-        if ($this->creator) {
+        if ($this->relationLoaded('creator') && $this->creator) {
             return $this->creator->name;
         }
         if ($this->relationLoaded('user') && $this->user) {
             return $this->user->name;
+        }
+        if (!empty($this->created_by)) {
+            if (!array_key_exists($this->created_by, static::$userNameCache)) {
+                static::$userNameCache[$this->created_by] = User::find($this->created_by)?->name;
+            }
+            return static::$userNameCache[$this->created_by];
+        }
+        if (!empty($this->user_id)) {
+            if (!array_key_exists($this->user_id, static::$userNameCache)) {
+                static::$userNameCache[$this->user_id] = User::find($this->user_id)?->name;
+            }
+            return static::$userNameCache[$this->user_id];
         }
         return null;
     }
@@ -64,11 +78,17 @@ trait Auditable
      */
     public function getUpdatedByNameAttribute(): ?string
     {
-        if ($this->updater) {
+        if ($this->relationLoaded('updater') && $this->updater) {
             return $this->updater->name;
         }
         if ($this->relationLoaded('closedByUser') && $this->closedByUser) {
             return $this->closedByUser->name;
+        }
+        if (!empty($this->updated_by)) {
+            if (!array_key_exists($this->updated_by, static::$userNameCache)) {
+                static::$userNameCache[$this->updated_by] = User::find($this->updated_by)?->name;
+            }
+            return static::$userNameCache[$this->updated_by];
         }
         return null;
     }

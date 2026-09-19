@@ -10,14 +10,19 @@ class IngredientController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Ingredient::with(['creator', 'updater', 'prepRecipe.items.ingredient'])
+        $query = Ingredient::with(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements'])
             ->orderBy('code');
 
         if ($request->filled('type') && in_array($request->type, ['RAW', 'SEMI_FINISHED'])) {
             $query->where('type', $request->type);
         }
 
-        return response()->json($query->get());
+        $ingredients = $query->get();
+
+        // ⚡ Explicitly append stock attributes (removed from default $appends for performance)
+        $ingredients->each->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+
+        return response()->json($ingredients);
     }
 
     public function store(Request $request)
@@ -54,13 +59,15 @@ class IngredientController extends Controller
         $data['created_by'] = $request->user()?->id;
 
         $ingredient = Ingredient::create($data);
-        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient']);
+        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
+        $ingredient->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
         return response()->json($ingredient, 201);
     }
 
     public function show(Ingredient $ingredient)
     {
-        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient']);
+        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
+        $ingredient->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
         return response()->json($ingredient);
     }
 
@@ -93,7 +100,8 @@ class IngredientController extends Controller
         $data['updated_by'] = $request->user()?->id;
 
         $ingredient->update($data);
-        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient']);
+        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
+        $ingredient->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
         return response()->json($ingredient);
     }
 

@@ -24,9 +24,8 @@ class Ingredient extends Model
         'updated_by_name',
         'changed_at',
         'changed_by_name',
-        'current_stock',
-        'current_stok_min',
-        'outlet_stocks',
+        // ⚡ PERF: current_stock, current_stok_min, outlet_stocks REMOVED from default appends.
+        // These trigger expensive DB queries per ingredient. Append explicitly in controllers that need them.
     ];
 
     protected $casts = [
@@ -187,11 +186,19 @@ class Ingredient extends Model
     public function getOutletStocksAttribute(): array
     {
         $outlets = static::getCachedOutlets();
-        $movementsGrouped = $this->movements()
-            ->selectRaw("outlet_id, SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
-            ->groupBy('outlet_id')
-            ->pluck('net_qty', 'outlet_id')
-            ->all();
+        if ($this->relationLoaded('movements')) {
+            $movementsGrouped = [];
+            foreach ($this->movements as $m) {
+                $oid = $m->outlet_id;
+                $movementsGrouped[$oid] = ($movementsGrouped[$oid] ?? 0.0) + $m->signedQty();
+            }
+        } else {
+            $movementsGrouped = $this->movements()
+                ->selectRaw("outlet_id, SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->groupBy('outlet_id')
+                ->pluck('net_qty', 'outlet_id')
+                ->all();
+        }
 
         $rows = [];
         $outletIngs = $this->relationLoaded('outletIngredients')

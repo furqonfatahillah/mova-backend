@@ -23,7 +23,8 @@ class StockMovement extends Model
         'updated_by_name',
         'changed_at',
         'changed_by_name',
-        'outlet_name',
+        // ⚡ PERF: outlet_name removed — triggers N+1 lazy-load on bulk queries.
+        // Controllers that render movements should eager-load 'outlet' and append explicitly.
     ];
 
     protected $casts = [

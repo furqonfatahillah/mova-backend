@@ -5,11 +5,6 @@ namespace Database\Seeders;
 use App\Models\Business;
 use App\Models\Outlet;
 use App\Models\User;
-use App\Models\Role;
-use App\Models\Category;
-use App\Models\Unit;
-use App\Models\ExpenseCategory;
-use App\Models\PaymentMethod;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\DB;
@@ -21,27 +16,12 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        // 1. Roles & Permissions Dasar
-        $roles = [
-            ['name' => 'Superadmin Platform', 'slug' => 'superadmin_platform', 'description' => 'Super Administrator MOVA Platform'],
-            ['name' => 'Owner Bisnis',        'slug' => 'owner_bisnis',        'description' => 'Owner / Pemilik Usaha Tenant'],
-            ['name' => 'Manager Outlet',      'slug' => 'manager_outlet',      'description' => 'Manager / Supervisor Outlet'],
-            ['name' => 'Kasir',               'slug' => 'pegawai',             'description' => 'Staff Kasir & Front Office'],
-            ['name' => 'Gudang / Kitchen',    'slug' => 'kitchen',             'description' => 'Staff Dapur & Logistik Gudang'],
-        ];
+        // 1. Ambil Role ID dari tabel roles (yang sudah di-generate oleh migration)
+        $superadminRoleId = DB::table('roles')->where('name', 'superadmin_platform')->value('id');
+        $ownerRoleId      = DB::table('roles')->where('name', 'owner_bisnis')->value('id');
 
-        foreach ($roles as $roleData) {
-            DB::table('roles')->updateOrInsert(
-                ['slug' => $roleData['slug']],
-                array_merge($roleData, ['created_at' => now(), 'updated_at' => now()])
-            );
-        }
-
-        $superadminRoleId = DB::table('roles')->where('slug', 'superadmin_platform')->value('id');
-        $ownerRoleId      = DB::table('roles')->where('slug', 'owner_bisnis')->value('id');
-
-        // 2. Akun Superadmin Platform
-        $superadmin = User::updateOrCreate(
+        // 2. Setup Akun Superadmin Platform (Penyedia Software MOVA)
+        User::updateOrCreate(
             ['email' => 'superadmin@mova.id'],
             [
                 'name'        => 'Superadmin Platform MOVA',
@@ -55,7 +35,7 @@ class DatabaseSeeder extends Seeder
             ]
         );
 
-        // 3. Setup Default Tenant (Maroa F&B Group)
+        // 3. Setup Default Tenant Usaha (Maroa F&B Group)
         $business = Business::firstOrCreate(
             ['slug' => 'maroa-fb-group'],
             [
@@ -71,7 +51,7 @@ class DatabaseSeeder extends Seeder
             ]
         );
 
-        // 4. Setup Default Outlet (Pusat)
+        // 4. Setup Default Outlet Cabang Utama
         $outlet = Outlet::withoutGlobalScopes()->firstOrCreate(
             ['business_id' => $business->id, 'code' => 'OUT-001'],
             [
@@ -84,7 +64,7 @@ class DatabaseSeeder extends Seeder
             ]
         );
 
-        // 5. Akun Owner Bisnis & Admin POS
+        // 5. Setup Akun Owner Bisnis & Admin POS
         User::updateOrCreate(
             ['email' => 'owner@mova.id'],
             [
@@ -112,62 +92,5 @@ class DatabaseSeeder extends Seeder
                 'approved_at' => now(),
             ]
         );
-
-        // 6. Master Satuan Standar (Units)
-        $units = ['Kg', 'gram', 'Liter', 'ml', 'Pcs', 'Dus', 'Pack', 'Botol', 'Porsi', 'Butir', 'Lembar'];
-        foreach ($units as $u) {
-            DB::table('units')->updateOrInsert(
-                ['name' => $u],
-                ['business_id' => $business->id, 'symbol' => $u, 'created_at' => now(), 'updated_at' => now()]
-            );
-        }
-
-        // 7. Master Kategori Standar
-        $categories = [
-            ['name' => 'Makanan Utama', 'type' => 'menu'],
-            ['name' => 'Minuman',       'type' => 'menu'],
-            ['name' => 'Snack / Cemilan','type' => 'menu'],
-            ['name' => 'Bahan Baku',    'type' => 'ingredient'],
-            ['name' => 'Bumbu Dapur',   'type' => 'ingredient'],
-            ['name' => 'Packaging',     'type' => 'ingredient'],
-        ];
-        foreach ($categories as $cat) {
-            DB::table('categories')->updateOrInsert(
-                ['business_id' => $business->id, 'name' => $cat['name']],
-                ['type' => $cat['type'], 'created_at' => now(), 'updated_at' => now()]
-            );
-        }
-
-        // 8. Master Kategori Biaya (Expense Categories)
-        $expenseCats = [
-            ['name' => 'Listrik, Air & Gas', 'description' => 'Tagihan utilitas outlet'],
-            ['name' => 'Gaji & Upah Karyawan', 'description' => 'Payroll bulanan & harian'],
-            ['name' => 'Sewa Tempat & Bangunan', 'description' => 'Biaya sewa outlet'],
-            ['name' => 'Maintenance & Perbaikan', 'description' => 'Perawatan alat & fasilitas'],
-            ['name' => 'Pemasaran & Promosi', 'description' => 'Iklan, banner & promo'],
-            ['name' => 'Lain-lain / Operasional', 'description' => 'Biaya operasional lainnya'],
-        ];
-        foreach ($expenseCats as $ec) {
-            DB::table('expense_categories')->updateOrInsert(
-                ['business_id' => $business->id, 'name' => $ec['name']],
-                ['description' => $ec['description'], 'created_at' => now(), 'updated_at' => now()]
-            );
-        }
-
-        // 9. Master Metode Pembayaran (Payment Methods)
-        $paymentMethods = [
-            ['name' => 'Cash / Tunai',        'type' => 'cash'],
-            ['name' => 'QRIS (Semua E-Wallet)', 'type' => 'qris'],
-            ['name' => 'Transfer Bank BCA',   'type' => 'transfer'],
-            ['name' => 'Transfer Bank Mandiri','type' => 'transfer'],
-            ['name' => 'Kartu Debit / EDC',   'type' => 'edc'],
-            ['name' => 'Piutang Usaha / Kasbon','type' => 'receivable'],
-        ];
-        foreach ($paymentMethods as $pm) {
-            DB::table('payment_methods')->updateOrInsert(
-                ['business_id' => $business->id, 'name' => $pm['name']],
-                ['type' => $pm['type'], 'is_active' => true, 'created_at' => now(), 'updated_at' => now()]
-            );
-        }
     }
 }

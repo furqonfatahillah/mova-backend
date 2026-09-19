@@ -40,6 +40,8 @@ class ReportController extends Controller
         $balanceBefore = 0.0;
         $purchase = 0.0;
         $saleUsage = 0.0;
+        $prepUsage = 0.0;
+        $prepOutput = 0.0;
         $waste = 0.0;
         $transferIn = 0.0;
         $transferOut = 0.0;
@@ -59,6 +61,8 @@ class ReportController extends Controller
                 switch ($type) {
                     case 'PURCHASE':       $purchase += $qty; break;
                     case 'SALE_USAGE':     $saleUsage += $qty; break;
+                    case 'PREP_USAGE':     $prepUsage += $qty; break;
+                    case 'PREP_OUTPUT':    $prepOutput += $qty; break;
                     case 'WASTE':
                         $waste += $qty;
                         $wasteRecords[] = $m;
@@ -76,7 +80,7 @@ class ReportController extends Controller
             }
         }
 
-        return compact('balanceBefore', 'purchase', 'saleUsage', 'waste', 'transferIn', 'transferOut', 'adjustment', 'wasteRecords');
+        return compact('balanceBefore', 'purchase', 'saleUsage', 'prepUsage', 'prepOutput', 'waste', 'transferIn', 'transferOut', 'adjustment', 'wasteRecords');
     }
 
     private function statusOf(float $absPct, float $tol): string
@@ -1117,12 +1121,14 @@ class ReportController extends Controller
             $stokAwalPeriode = $stokAwalMaster + $agg['balanceBefore'];
             $pembelian       = $agg['purchase'];
             $pemakaianTeo    = $agg['saleUsage'];
+            $prepUsage       = $agg['prepUsage'] ?? 0.0;
+            $prepOutput      = $agg['prepOutput'] ?? 0.0;
             $wasteQty        = $agg['waste'];
             $transferIn      = $agg['transferIn'];
             $transferOut     = $agg['transferOut'];
             $adjustment      = $agg['adjustment'];
 
-            $stokAkhirTeo = $stokAwalPeriode + $pembelian + $transferIn - $pemakaianTeo - $wasteQty - $transferOut + $adjustment;
+            $stokAkhirTeo = $stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $pemakaianTeo - $prepUsage - $wasteQty - $transferOut + $adjustment;
 
             $opname    = $opnames->get($ing->id);
             $actualQty = $opname?->actual_qty;
@@ -1131,16 +1137,17 @@ class ReportController extends Controller
             $hargaPerPakai       = $ing->harga / max($ing->konversi, 1);
             $wasteValue          = round($wasteQty * $hargaPerPakai, 0);
 
-            // Pemakaian fisik lapangan (memperhitungkan transfer)
-            $pemakaianAktual     = $hasActual ? ($stokAwalPeriode + $pembelian + $transferIn - $transferOut - $actualQty) : null;
-            // Variance kotor
-            $varianceGrossQty    = $hasActual ? ($pemakaianAktual - $pemakaianTeo) : null;
+            // Pemakaian fisik lapangan (memperhitungkan transfer & batch prep)
+            $pemakaianAktual     = $hasActual ? ($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty) : null;
+            // Variance kotor terhadap total pemakaian resep (POS + Batch Prep)
+            $totalTeoritisPakai  = $pemakaianTeo + $prepUsage;
+            $varianceGrossQty    = $hasActual ? ($pemakaianAktual - $totalTeoritisPakai) : null;
             $varianceGrossValue  = $hasActual ? round($varianceGrossQty * $hargaPerPakai, 0) : null;
             // Unaccounted variance (setelah dikurangi waste tercatat)
             $unaccountedQty      = $hasActual ? ($varianceGrossQty - $wasteQty) : null;
             $unaccountedValue    = $hasActual ? round($unaccountedQty * $hargaPerPakai, 0) : null;
 
-            $variancePct         = ($hasActual && $pemakaianTeo > 0) ? ($unaccountedQty / $pemakaianTeo) * 100 : null;
+            $variancePct         = ($hasActual && $totalTeoritisPakai > 0) ? ($unaccountedQty / $totalTeoritisPakai) * 100 : null;
             $status              = $hasActual ? $this->statusOf(abs($variancePct ?? 0), $ing->tolerance) : null;
 
             // Waste records already collected during aggregation — no extra loop needed
@@ -1163,6 +1170,8 @@ class ReportController extends Controller
                 'stok_awal_periode'    => round($stokAwalPeriode, 3),
                 'pembelian'            => round($pembelian, 3),
                 'pemakaian_teoritis'   => round($pemakaianTeo, 3),
+                'prep_usage'           => round($prepUsage, 3),
+                'prep_output'          => round($prepOutput, 3),
                 'waste'                => round($wasteQty, 3),
                 'waste_qty'            => round($wasteQty, 3),
                 'waste_value'          => $wasteValue,

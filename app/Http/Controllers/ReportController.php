@@ -833,27 +833,50 @@ class ReportController extends Controller
                 $cogsVariance += (float)$row['unaccounted_value'];
             }
 
-            if ($rowRecipeCost > 0) {
+            if ($rowRecipeCost > 0 || (float)$row['pemakaian_teoritis'] > 0) {
                 $topIngredientsUsage[] = [
                     'ingredient_id'   => $ing->id,
+                    'name'            => $ing->name,
                     'ingredient_name' => $ing->name,
-                    'unit'            => $ing->unit_pakai,
+                    'unit'            => $ing->unit_pakai ?: 'Pcs',
                     'qty'             => (float)$row['pemakaian_teoritis'],
                     'cost'            => round($rowRecipeCost, 0),
+                    'total_hpp'       => round($rowRecipeCost, 0),
                 ];
             }
         }
-        usort($topIngredientsUsage, fn($a, $b) => $b['cost'] <=> $a['cost']);
-        $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 8);
 
         // Tambahkan HPP barang direct retail (non-resep)
         $cogsDirectItems = 0.0;
+        $directItemsMap = [];
         foreach ($transactions as $t) {
             $m = $t->menu;
             if ($m && ($m->item_type === 'DIRECT' || (!$m->activeRecipe($t->date) && $m->cost_price > 0))) {
-                $cogsDirectItems += (float)($m->cost_price * $t->qty);
+                $itemCost = (float)($m->cost_price * $t->qty);
+                $cogsDirectItems += $itemCost;
+
+                if (!isset($directItemsMap[$m->id])) {
+                    $directItemsMap[$m->id] = [
+                        'ingredient_id'   => 'menu_' . $m->id,
+                        'name'            => $m->name . ' (Direct Retail)',
+                        'ingredient_name' => $m->name . ' (Direct Retail)',
+                        'unit'            => 'Pcs',
+                        'qty'             => 0,
+                        'cost'            => 0,
+                        'total_hpp'       => 0,
+                    ];
+                }
+                $directItemsMap[$m->id]['qty'] += (float)$t->qty;
+                $directItemsMap[$m->id]['cost'] += round($itemCost, 0);
+                $directItemsMap[$m->id]['total_hpp'] += round($itemCost, 0);
             }
         }
+        foreach ($directItemsMap as $dim) {
+            $topIngredientsUsage[] = $dim;
+        }
+
+        usort($topIngredientsUsage, fn($a, $b) => ($b['total_hpp'] ?? $b['cost'] ?? 0) <=> ($a['total_hpp'] ?? $a['cost'] ?? 0));
+        $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 15);
 
         $totalCogs = round($cogsRecipes + $cogsVariance + $cogsDirectItems, 2);
         $cogsRatioPct = $netSales > 0 ? round(($totalCogs / $netSales) * 100, 1) : 0;

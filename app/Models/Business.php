@@ -133,6 +133,6 @@ class Business extends Model
 
     public function canAddOutlet(): bool
     {
-        return $this->outlets()->count() < $this->max_outlets;
+        return true; // Bebas tanpa batasan kuota cabang (Unlimited Outlets)
     }
 }

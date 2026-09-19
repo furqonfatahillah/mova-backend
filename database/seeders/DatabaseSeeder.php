@@ -2,146 +2,172 @@
 
 namespace Database\Seeders;
 
-use App\Models\Ingredient;
-use App\Models\Menu;
-use App\Models\Recipe;
-use App\Models\RecipeItem;
-use App\Models\StockMovement;
+use App\Models\Business;
+use App\Models\Outlet;
 use App\Models\User;
+use App\Models\Role;
+use App\Models\Category;
+use App\Models\Unit;
+use App\Models\ExpenseCategory;
+use App\Models\PaymentMethod;
 use Illuminate\Database\Seeder;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\DB;
 
 class DatabaseSeeder extends Seeder
 {
+    /**
+     * Seed the application's database.
+     */
     public function run(): void
     {
-        // Admin user
-        User::create([
-            'name'     => 'Admin POS',
-            'email'    => 'admin@posmaroa.id',
-            'password' => Hash::make('password'),
-            'role'     => 'admin',
-        ]);
-
-        // Ingredients
-        $ings = [
-            ['code'=>'BB-001','name'=>'Ayam',    'category'=>'Protein','unit_beli'=>'Kg','unit_pakai'=>'gram','konversi'=>1000,'harga'=>35000,'stok_awal'=>20000,'stok_min'=>3000,'tolerance'=>5],
-            ['code'=>'BB-002','name'=>'Tepung',  'category'=>'Kering', 'unit_beli'=>'Kg','unit_pakai'=>'gram','konversi'=>1000,'harga'=>12000,'stok_awal'=>15000,'stok_min'=>2000,'tolerance'=>5],
-            ['code'=>'BB-003','name'=>'Minyak',  'category'=>'Cair',   'unit_beli'=>'Liter','unit_pakai'=>'ml','konversi'=>1000,'harga'=>18000,'stok_awal'=>12000,'stok_min'=>2000,'tolerance'=>5],
-            ['code'=>'BB-004','name'=>'Sambal',  'category'=>'Bumbu',  'unit_beli'=>'Kg','unit_pakai'=>'gram','konversi'=>1000,'harga'=>20000,'stok_awal'=>8000,'stok_min'=>1000,'tolerance'=>5],
-            ['code'=>'BB-005','name'=>'Beras',   'category'=>'Kering', 'unit_beli'=>'Kg','unit_pakai'=>'gram','konversi'=>1000,'harga'=>13000,'stok_awal'=>30000,'stok_min'=>5000,'tolerance'=>5],
-            ['code'=>'BB-006','name'=>'Lalapan', 'category'=>'Sayur',  'unit_beli'=>'Kg','unit_pakai'=>'gram','konversi'=>1000,'harga'=>15000,'stok_awal'=>5000,'stok_min'=>1000,'tolerance'=>8],
-        ];
-        foreach ($ings as $d) { Ingredient::create(array_merge($d, ['active'=>true])); }
-
-        // Menus
-        $menus = [
-            ['code'=>'MN-001','name'=>'Ayam Geprek', 'category'=>'Main','price'=>22000],
-            ['code'=>'MN-002','name'=>'Nasi Ayam',   'category'=>'Main','price'=>25000],
-            ['code'=>'MN-003','name'=>'Mie Ayam',    'category'=>'Main','price'=>18000],
-        ];
-        foreach ($menus as $d) { Menu::create(array_merge($d, ['active'=>true])); }
-
-        $geprek = Menu::where('code','MN-001')->first();
-        $nasiAyam = Menu::where('code','MN-002')->first();
-        $mieAyam = Menu::where('code','MN-003')->first();
-
-        $ayam = Ingredient::where('code','BB-001')->first();
-        $tepung = Ingredient::where('code','BB-002')->first();
-        $minyak = Ingredient::where('code','BB-003')->first();
-        $sambal = Ingredient::where('code','BB-004')->first();
-        $beras = Ingredient::where('code','BB-005')->first();
-        $lalapan = Ingredient::where('code','BB-006')->first();
-
-        // Recipes
-        $rcpGeprek = Recipe::create(['menu_id'=>$geprek->id,'version'=>1,'date'=>'2026-07-01']);
-        RecipeItem::insert([
-            ['recipe_id'=>$rcpGeprek->id,'ingredient_id'=>$ayam->id,  'qty'=>100,'unit'=>'gram','waste_std'=>2,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpGeprek->id,'ingredient_id'=>$tepung->id,'qty'=>30, 'unit'=>'gram','waste_std'=>1,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpGeprek->id,'ingredient_id'=>$minyak->id,'qty'=>15, 'unit'=>'ml',  'waste_std'=>1,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpGeprek->id,'ingredient_id'=>$sambal->id,'qty'=>30, 'unit'=>'gram','waste_std'=>0,'created_at'=>now(),'updated_at'=>now()],
-        ]);
-
-        $rcpNasi = Recipe::create(['menu_id'=>$nasiAyam->id,'version'=>1,'date'=>'2026-07-01']);
-        RecipeItem::insert([
-            ['recipe_id'=>$rcpNasi->id,'ingredient_id'=>$beras->id,  'qty'=>150,'unit'=>'gram','waste_std'=>2,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpNasi->id,'ingredient_id'=>$ayam->id,   'qty'=>100,'unit'=>'gram','waste_std'=>2,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpNasi->id,'ingredient_id'=>$minyak->id, 'qty'=>10, 'unit'=>'ml',  'waste_std'=>1,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpNasi->id,'ingredient_id'=>$sambal->id, 'qty'=>30, 'unit'=>'gram','waste_std'=>0,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpNasi->id,'ingredient_id'=>$lalapan->id,'qty'=>20, 'unit'=>'gram','waste_std'=>1,'created_at'=>now(),'updated_at'=>now()],
-        ]);
-
-        $rcpMie = Recipe::create(['menu_id'=>$mieAyam->id,'version'=>1,'date'=>'2026-07-01']);
-        RecipeItem::insert([
-            ['recipe_id'=>$rcpMie->id,'ingredient_id'=>$ayam->id,  'qty'=>60,'unit'=>'gram','waste_std'=>2,'created_at'=>now(),'updated_at'=>now()],
-            ['recipe_id'=>$rcpMie->id,'ingredient_id'=>$minyak->id,'qty'=>8, 'unit'=>'ml',  'waste_std'=>1,'created_at'=>now(),'updated_at'=>now()],
-        ]);
-
-        // Stock purchases Aug 2026
-        $purchases = [
-            ['date'=>'2026-08-05','ingredient_id'=>$ayam->id,  'qty'=>15000,'note'=>'PO-0801'],
-            ['date'=>'2026-08-15','ingredient_id'=>$ayam->id,  'qty'=>15000,'note'=>'PO-0812'],
-            ['date'=>'2026-08-05','ingredient_id'=>$tepung->id,'qty'=>8000, 'note'=>'PO-0801'],
-            ['date'=>'2026-08-05','ingredient_id'=>$minyak->id,'qty'=>10000,'note'=>'PO-0801'],
-            ['date'=>'2026-08-15','ingredient_id'=>$minyak->id,'qty'=>6000, 'note'=>'PO-0812'],
-            ['date'=>'2026-08-05','ingredient_id'=>$sambal->id,'qty'=>10000,'note'=>'PO-0801'],
-            ['date'=>'2026-08-05','ingredient_id'=>$beras->id, 'qty'=>20000,'note'=>'PO-0801'],
-            ['date'=>'2026-08-05','ingredient_id'=>$lalapan->id,'qty'=>6000,'note'=>'PO-0801'],
-        ];
-        foreach ($purchases as $p) {
-            StockMovement::create(array_merge($p, ['type'=>'PURCHASE']));
-        }
-        StockMovement::create(['date'=>'2026-08-01','ingredient_id'=>$ayam->id,'type'=>'WASTE','qty'=>300,'note'=>'Ayam basi (buang)']);
-
-        // Seed transactions Aug 2026 (simulate POS activity)
-        $menuDefs = [
-            $geprek->id   => ['rcp'=>$rcpGeprek, 'base'=>9],
-            $nasiAyam->id => ['rcp'=>$rcpNasi,   'base'=>6],
-            $mieAyam->id  => ['rcp'=>$rcpMie,    'base'=>5],
+        // 1. Roles & Permissions Dasar
+        $roles = [
+            ['name' => 'Superadmin Platform', 'slug' => 'superadmin_platform', 'description' => 'Super Administrator MOVA Platform'],
+            ['name' => 'Owner Bisnis',        'slug' => 'owner_bisnis',        'description' => 'Owner / Pemilik Usaha Tenant'],
+            ['name' => 'Manager Outlet',      'slug' => 'manager_outlet',      'description' => 'Manager / Supervisor Outlet'],
+            ['name' => 'Kasir',               'slug' => 'pegawai',             'description' => 'Staff Kasir & Front Office'],
+            ['name' => 'Gudang / Kitchen',    'slug' => 'kitchen',             'description' => 'Staff Dapur & Logistik Gudang'],
         ];
 
-        $trxId = 1;
-        for ($d = 1; $d <= 31; $d++) {
-            $date = '2026-08-' . str_pad($d, 2, '0', STR_PAD_LEFT);
-            foreach ($menuDefs as $menuId => $def) {
-                $jitter = round((sin($d * (strlen((string)$menuId) + 1)) + 1) * 2);
-                $qty = max(1, $def['base'] + $jitter - 2);
-                $menu = Menu::find($menuId);
-                $trx = \App\Models\Transaction::create([
-                    'date'           => $date,
-                    'menu_id'        => $menuId,
-                    'qty'            => $qty,
-                    'recipe_version' => 1,
-                    'total_price'    => $menu->price * $qty,
-                ]);
-                foreach ($def['rcp']->items as $item) {
-                    StockMovement::create([
-                        'date'           => $date,
-                        'ingredient_id'  => $item->ingredient_id,
-                        'type'           => 'SALE_USAGE',
-                        'qty'            => $item->qty * $qty,
-                        'note'           => "TRX #{$trx->id} - {$menu->name}",
-                        'transaction_id' => $trx->id,
-                    ]);
-                }
-            }
+        foreach ($roles as $roleData) {
+            DB::table('roles')->updateOrInsert(
+                ['slug' => $roleData['slug']],
+                array_merge($roleData, ['created_at' => now(), 'updated_at' => now()])
+            );
         }
 
-        // Seed Opname August 2026
-        $opnames = [
-            ['ingredient_id' => $ayam->id,    'actual_qty' => 5100, 'reason' => 'Over portion', 'approver' => 'Chef Budi', 'notes' => 'Potongan ayam sedikit lebih besar pada shift malam'],
-            ['ingredient_id' => $tepung->id,  'actual_qty' => 4200, 'reason' => 'Waste', 'approver' => 'Manager Siti', 'notes' => 'Sisa tepung gorengan terbuang'],
-            ['ingredient_id' => $minyak->id,  'actual_qty' => 4100, 'reason' => 'Gramasi tidak sesuai', 'approver' => 'Chef Budi', 'notes' => 'Penggantian minyak lebih cepat dari jadwal'],
-            ['ingredient_id' => $sambal->id,  'actual_qty' => 3900, 'reason' => 'Complimentary', 'approver' => 'Kasir Maya', 'notes' => 'Ekstra sambal untuk komplain tamu'],
-            ['ingredient_id' => $beras->id,   'actual_qty' => 8200, 'reason' => 'Staff meal', 'approver' => 'Manager Siti', 'notes' => 'Makan siang karyawan'],
-            ['ingredient_id' => $lalapan->id, 'actual_qty' => 2600, 'reason' => 'Produk rusak', 'approver' => 'Chef Budi', 'notes' => 'Lalapan layu di kulkas'],
+        $superadminRoleId = DB::table('roles')->where('slug', 'superadmin_platform')->value('id');
+        $ownerRoleId      = DB::table('roles')->where('slug', 'owner_bisnis')->value('id');
+
+        // 2. Akun Superadmin Platform
+        $superadmin = User::updateOrCreate(
+            ['email' => 'superadmin@mova.id'],
+            [
+                'name'        => 'Superadmin Platform MOVA',
+                'password'    => Hash::make('password'),
+                'role'        => 'superadmin_platform',
+                'role_id'     => $superadminRoleId,
+                'status'      => 'active',
+                'business_id' => null,
+                'outlet_id'   => null,
+                'approved_at' => now(),
+            ]
+        );
+
+        // 3. Setup Default Tenant (Maroa F&B Group)
+        $business = Business::firstOrCreate(
+            ['slug' => 'maroa-fb-group'],
+            [
+                'name'         => 'Maroa F&B Group',
+                'owner_name'   => 'Owner Maroa',
+                'email'        => 'owner@mova.id',
+                'phone'        => '0812-3456-7890',
+                'address'      => 'Makassar, Sulawesi Selatan',
+                'package_type' => 'enterprise',
+                'max_outlets'  => 10,
+                'status'       => 'active',
+                'expires_at'   => now()->addYears(5),
+            ]
+        );
+
+        // 4. Setup Default Outlet (Pusat)
+        $outlet = Outlet::withoutGlobalScopes()->firstOrCreate(
+            ['business_id' => $business->id, 'code' => 'OUT-001'],
+            [
+                'name'       => 'Maroa - Cabang Utama (Pusat)',
+                'address'    => 'Makassar',
+                'phone'      => '0812-3456-7890',
+                'pic_name'   => 'Owner Maroa',
+                'is_main'    => true,
+                'active'     => true,
+            ]
+        );
+
+        // 5. Akun Owner Bisnis & Admin POS
+        User::updateOrCreate(
+            ['email' => 'owner@mova.id'],
+            [
+                'name'        => 'Owner Maroa F&B',
+                'password'    => Hash::make('password'),
+                'role'        => 'owner_bisnis',
+                'role_id'     => $ownerRoleId,
+                'status'      => 'active',
+                'business_id' => $business->id,
+                'outlet_id'   => $outlet->id,
+                'approved_at' => now(),
+            ]
+        );
+
+        User::updateOrCreate(
+            ['email' => 'admin@posmaroa.id'],
+            [
+                'name'        => 'Admin POS Maroa',
+                'password'    => Hash::make('password'),
+                'role'        => 'owner_bisnis',
+                'role_id'     => $ownerRoleId,
+                'status'      => 'active',
+                'business_id' => $business->id,
+                'outlet_id'   => $outlet->id,
+                'approved_at' => now(),
+            ]
+        );
+
+        // 6. Master Satuan Standar (Units)
+        $units = ['Kg', 'gram', 'Liter', 'ml', 'Pcs', 'Dus', 'Pack', 'Botol', 'Porsi', 'Butir', 'Lembar'];
+        foreach ($units as $u) {
+            DB::table('units')->updateOrInsert(
+                ['name' => $u],
+                ['business_id' => $business->id, 'symbol' => $u, 'created_at' => now(), 'updated_at' => now()]
+            );
+        }
+
+        // 7. Master Kategori Standar
+        $categories = [
+            ['name' => 'Makanan Utama', 'type' => 'menu'],
+            ['name' => 'Minuman',       'type' => 'menu'],
+            ['name' => 'Snack / Cemilan','type' => 'menu'],
+            ['name' => 'Bahan Baku',    'type' => 'ingredient'],
+            ['name' => 'Bumbu Dapur',   'type' => 'ingredient'],
+            ['name' => 'Packaging',     'type' => 'ingredient'],
         ];
-        foreach ($opnames as $op) {
-            \App\Models\Opname::create(array_merge($op, [
-                'period_from' => '2026-08-01',
-                'period_to'   => '2026-08-31',
-                'is_closed'   => false,
-            ]));
+        foreach ($categories as $cat) {
+            DB::table('categories')->updateOrInsert(
+                ['business_id' => $business->id, 'name' => $cat['name']],
+                ['type' => $cat['type'], 'created_at' => now(), 'updated_at' => now()]
+            );
+        }
+
+        // 8. Master Kategori Biaya (Expense Categories)
+        $expenseCats = [
+            ['name' => 'Listrik, Air & Gas', 'description' => 'Tagihan utilitas outlet'],
+            ['name' => 'Gaji & Upah Karyawan', 'description' => 'Payroll bulanan & harian'],
+            ['name' => 'Sewa Tempat & Bangunan', 'description' => 'Biaya sewa outlet'],
+            ['name' => 'Maintenance & Perbaikan', 'description' => 'Perawatan alat & fasilitas'],
+            ['name' => 'Pemasaran & Promosi', 'description' => 'Iklan, banner & promo'],
+            ['name' => 'Lain-lain / Operasional', 'description' => 'Biaya operasional lainnya'],
+        ];
+        foreach ($expenseCats as $ec) {
+            DB::table('expense_categories')->updateOrInsert(
+                ['business_id' => $business->id, 'name' => $ec['name']],
+                ['description' => $ec['description'], 'created_at' => now(), 'updated_at' => now()]
+            );
+        }
+
+        // 9. Master Metode Pembayaran (Payment Methods)
+        $paymentMethods = [
+            ['name' => 'Cash / Tunai',        'type' => 'cash'],
+            ['name' => 'QRIS (Semua E-Wallet)', 'type' => 'qris'],
+            ['name' => 'Transfer Bank BCA',   'type' => 'transfer'],
+            ['name' => 'Transfer Bank Mandiri','type' => 'transfer'],
+            ['name' => 'Kartu Debit / EDC',   'type' => 'edc'],
+            ['name' => 'Piutang Usaha / Kasbon','type' => 'receivable'],
+        ];
+        foreach ($paymentMethods as $pm) {
+            DB::table('payment_methods')->updateOrInsert(
+                ['business_id' => $business->id, 'name' => $pm['name']],
+                ['type' => $pm['type'], 'is_active' => true, 'created_at' => now(), 'updated_at' => now()]
+            );
         }
     }
 }

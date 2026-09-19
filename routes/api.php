@@ -98,6 +98,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/batch-preps',                  [BatchPrepController::class, 'indexBatches']);
     Route::post('/batch-preps',                 [BatchPrepController::class, 'storeBatch']);
     Route::get('/batch-preps/{batchPrep}',      [BatchPrepController::class, 'showBatch']);
+    Route::delete('/batch-preps/{batchPrep}',   [BatchPrepController::class, 'destroyBatch']);
 
     // Transfer Bahan Baku antar Cabang
     Route::get('/transfers',                     [TransferController::class, 'index']);

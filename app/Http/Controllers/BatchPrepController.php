@@ -565,4 +565,18 @@ class BatchPrepController extends Controller
 
         return response()->json($batchPrep);
     }
+
+    public function destroyBatch(BatchPrep $batchPrep)
+    {
+        return DB::transaction(function () use ($batchPrep) {
+            $batchNo = $batchPrep->batch_no;
+            // Delete all stock movements associated with this batch
+            StockMovement::where('batch_prep_id', $batchPrep->id)->delete();
+            $batchPrep->delete();
+
+            return response()->json([
+                'message' => "Produksi {$batchNo} berhasil dibatalkan dan mutasi stok telah dikembalikan normal.",
+            ]);
+        });
+    }
 }

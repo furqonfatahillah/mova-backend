@@ -173,6 +173,8 @@ class MovementController extends Controller
                 'unit_pakai'      => $ing->unit_pakai,
                 'unit_beli'       => $ing->unit_beli,
                 'konversi'        => $ing->konversi,
+                'harga_beli'      => (float)$ing->harga,
+                'harga_satuan'    => round($hargaPerPakai, 2),
                 'stok_min'        => $stokMinOutlet,
                 'stok_awal'       => $stokAwalPeriod,
                 'total_masuk'     => $totalMasuk,

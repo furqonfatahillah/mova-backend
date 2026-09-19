@@ -108,6 +108,17 @@ class OpnameController extends Controller
             $updateData
         );
 
+        if ($isClosed) {
+            $this->syncOpnameStockMovements(
+                $opnameNo,
+                $data['period_from'],
+                $data['period_to'],
+                (int)$outletId,
+                $user,
+                $opnameDate
+            );
+        }
+
         $opname->load(['ingredient', 'user', 'creator', 'updater', 'outlet']);
         return response()->json($opname);
     }
@@ -209,8 +220,19 @@ class OpnameController extends Controller
             $results[] = $opname;
         }
 
+        if ($isClosed) {
+            $this->syncOpnameStockMovements(
+                $opnameNo,
+                $request->period_from,
+                $request->period_to,
+                (int)$outletId,
+                $user,
+                $opnameDate
+            );
+        }
+
         $statusMessage = $isClosed
-            ? "Data opname fisik ({$opnameNo}) berhasil di-release & disetujui!"
+            ? "Data opname fisik ({$opnameNo}) berhasil di-release & disetujui, dan mutasi penyesuaian telah dibukukan ke Kartu Stok!"
             : "Data opname fisik ({$opnameNo}) berhasil disimpan sebagai DRAFT (Menunggu Release Owner).";
 
         return response()->json([
@@ -260,12 +282,98 @@ class OpnameController extends Controller
             $opn->save();
         }
 
+        $firstOpn = $opnames->first();
+        if ($firstOpn) {
+            $this->syncOpnameStockMovements(
+                $opnameNo,
+                $firstOpn->period_from,
+                $firstOpn->period_to,
+                (int)$firstOpn->outlet_id,
+                $user,
+                $firstOpn->opname_date
+            );
+        }
+
         return response()->json([
-            'message'   => "Sesi Opname {$opnameNo} berhasil di-release dan disetujui oleh Owner ({$approverName})!",
+            'message'   => "Sesi Opname {$opnameNo} berhasil di-release dan disetujui oleh Owner ({$approverName}), dan mutasi penyesuaian telah dibukukan ke Kartu Stok!",
             'opname_no' => $opnameNo,
             'is_closed' => true,
             'status'    => 'RELEASED',
         ]);
+    }
+
+    /**
+     * Generate StockMovement adjustments for a released opname session.
+     * Reconciles difference between physical actual_qty and theoretical ending stock.
+     */
+    private function syncOpnameStockMovements(string $opnameNo, string $periodFrom, string $periodTo, int $outletId, $user, ?string $opnameDate = null): void
+    {
+        // 1. Remove previous adjustments generated for this opname session (idempotency)
+        \App\Models\StockMovement::where('outlet_id', $outletId)
+            ->where('note', 'like', "%{$opnameNo}%")
+            ->delete();
+
+        // 2. Compute theoretical variance up to the opname period
+        $reportCtrl = app(ReportController::class);
+        $varianceRows = $reportCtrl->buildVarianceArray($periodFrom, $periodTo, $outletId);
+        $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
+
+        $opnames = Opname::where('opname_no', $opnameNo)
+            ->where('outlet_id', $outletId)
+            ->get();
+
+        $adjDate = $opnameDate ?: ($opnames->first()?->opname_date ?: $periodTo);
+
+        foreach ($opnames as $opn) {
+            if ($opn->actual_qty === null) continue;
+
+            $var = $varByIng->get($opn->ingredient_id);
+            if (!$var) continue;
+
+            $ingredient = $var['ingredient'];
+            $stokTeoritis = (float)($var['stok_akhir_teoritis'] ?? 0);
+            $actualQty    = (float)$opn->actual_qty;
+            $diff         = round($actualQty - $stokTeoritis, 4);
+
+            if (abs($diff) < 0.0001) {
+                continue; // Exact match, no adjustment needed
+            }
+
+            $konversi = max((float)$ingredient->konversi, 1);
+            $hargaPerPakai = (float)$ingredient->harga / $konversi;
+
+            if ($diff > 0) {
+                // Surplus: ADJUSTMENT_IN (+)
+                \App\Models\StockMovement::create([
+                    'business_id'   => $user->business_id ?? $ingredient->business_id,
+                    'date'          => $adjDate,
+                    'ingredient_id' => $opn->ingredient_id,
+                    'outlet_id'     => $outletId,
+                    'type'          => 'ADJUSTMENT_IN',
+                    'qty'           => abs($diff),
+                    'unit_price'    => round($hargaPerPakai, 2),
+                    'total_price'   => round(abs($diff) * $hargaPerPakai, 2),
+                    'note'          => "Penyesuaian Opname Fisik {$opnameNo} (Surplus +)",
+                    'user_id'       => $user->id,
+                    'created_by'    => $user->id,
+                ]);
+            } else {
+                // Defisit: ADJUSTMENT_OUT (-)
+                \App\Models\StockMovement::create([
+                    'business_id'   => $user->business_id ?? $ingredient->business_id,
+                    'date'          => $adjDate,
+                    'ingredient_id' => $opn->ingredient_id,
+                    'outlet_id'     => $outletId,
+                    'type'          => 'ADJUSTMENT_OUT',
+                    'qty'           => abs($diff),
+                    'unit_price'    => round($hargaPerPakai, 2),
+                    'total_price'   => round(abs($diff) * $hargaPerPakai, 2),
+                    'note'          => "Penyesuaian Opname Fisik {$opnameNo} (Selisih Kurang -)",
+                    'user_id'       => $user->id,
+                    'created_by'    => $user->id,
+                ]);
+            }
+        }
     }
 
     /**

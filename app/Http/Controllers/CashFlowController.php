@@ -231,6 +231,9 @@ class CashFlowController extends Controller
             'to'        => $to,
             'outlet_id' => $outletId,
         ]);
+        if ($user) {
+            $plRequest->setUserResolver(fn() => $user);
+        }
         $plResponse = $reportCtrl->profitAndLoss($plRequest);
         $plData = json_decode($plResponse->getContent(), true);
 

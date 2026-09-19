@@ -198,10 +198,12 @@ class Ingredient extends Model
                 'outlet_code' => $outlet->code,
                 'outlet_name' => $outlet->name,
                 'is_main'     => (bool) $outlet->is_main,
-                'stok_awal'   => $initial,
-                'stok_min'    => $min,
-                'stock'       => $current,
-                'is_low'      => $current <= $min,
+                'stok_awal'     => $initial,
+                'stok_min'      => $min,
+                'stock'         => $current,
+                'current'       => $current,
+                'current_stock' => $current,
+                'is_low'        => $current <= $min,
             ];
         }
 

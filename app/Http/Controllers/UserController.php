@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\User;
+use App\Models\Role;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 
@@ -105,12 +106,50 @@ class UserController extends Controller
         ]);
     }
 
+    /**
+     * Get list of master roles eligible for the authenticated user to assign
+     */
+    public function roles(Request $request)
+    {
+        $currentUser = $request->user();
+        $query = Role::where('is_active', true)->orderByDesc('level');
+
+        if ($currentUser->isPlatformAdmin()) {
+            // Platform admin can assign any role
+        } elseif ($currentUser->isOwnerBisnis()) {
+            // Business Owner can assign branch owners, managers, staff, cashiers
+            $query->whereIn('name', [
+                Role::OWNER_OUTLET,
+                Role::MANAGER_OUTLET,
+                Role::PEGAWAI,
+                Role::KASIR,
+            ]);
+        } elseif ($currentUser->isOwnerOutlet()) {
+            // Outlet Owner can assign staff and cashiers in their branch
+            $query->whereIn('name', [
+                Role::PEGAWAI,
+                Role::KASIR,
+            ]);
+        } else {
+            $query->whereRaw('1 = 0');
+        }
+
+        return response()->json($query->get());
+    }
+
     public function store(Request $request)
     {
         $currentUser = $request->user();
 
         if ($currentUser->isPegawai()) {
             return response()->json(['message' => 'Anda tidak memiliki hak akses menambah pengguna.'], 403);
+        }
+
+        if ($request->filled('role_id')) {
+            $roleObj = Role::find($request->role_id);
+            if ($roleObj) {
+                $request->merge(['role' => $roleObj->name]);
+            }
         }
 
         $allowedRoles = $currentUser->isPlatformAdmin()
@@ -170,6 +209,13 @@ class UserController extends Controller
         $currentUser = $request->user();
         if (!$currentUser->canManage($user)) {
             return response()->json(['message' => 'Anda tidak memiliki wewenang mengedit data pengguna ini.'], 403);
+        }
+
+        if ($request->filled('role_id')) {
+            $roleObj = Role::find($request->role_id);
+            if ($roleObj) {
+                $request->merge(['role' => $roleObj->name]);
+            }
         }
 
         $allowedRoles = $currentUser->isPlatformAdmin()

@@ -23,6 +23,7 @@ class User extends Authenticatable
         'email',
         'password',
         'role',
+        'role_id',
         'status',
         'approved_by',
         'approved_at',
@@ -36,6 +37,7 @@ class User extends Authenticatable
         'approved_by_name',
         'outlet_name',
         'business_name',
+        'role_label',
         'is_superadmin_platform',
         'is_owner_website',
         'is_platform_admin',
@@ -65,6 +67,7 @@ class User extends Authenticatable
             'email_verified_at' => 'datetime',
             'approved_at'       => 'datetime',
             'password'          => 'hashed',
+            'role_id'           => 'integer',
         ];
     }
 
@@ -77,6 +80,25 @@ class User extends Authenticatable
                 }
             }
         });
+
+        static::saving(function (User $user) {
+            if ($user->role_id && (!$user->role || $user->isDirty('role_id'))) {
+                $r = Role::find($user->role_id);
+                if ($r) {
+                    $user->role = $r->name;
+                }
+            } elseif ($user->role && !$user->role_id) {
+                $rId = Role::where('name', strtolower(trim((string)$user->role)))->value('id');
+                if ($rId) {
+                    $user->role_id = $rId;
+                }
+            }
+        });
+    }
+
+    public function roleMaster(): \Illuminate\Database\Eloquent\Relations\BelongsTo
+    {
+        return $this->belongsTo(Role::class, 'role_id');
     }
 
     public static function generateUniqueReferralCode(): string
@@ -196,34 +218,50 @@ class User extends Authenticatable
         return $this->status === 'active';
     }
 
+    public function getRoleLabelAttribute(): string
+    {
+        if ($this->relationLoaded('roleMaster') && $this->roleMaster) {
+            return $this->roleMaster->label;
+        }
+        $r = Role::where('name', $this->role)->first();
+        return $r?->label ?? ucfirst(str_replace('_', ' ', $this->role ?? ''));
+    }
+
     public function isSuperadminPlatform(): bool
     {
-        return in_array($this->role, ['superadmin_platform', 'superadmin']);
+        return Role::isPlatformRole($this->role_id ?? $this->role);
     }
 
     public function isOwnerWebsite(): bool
     {
-        return in_array($this->role, ['owner_website', 'superadmin_platform', 'superadmin']);
+        return Role::isPlatformRole($this->role_id ?? $this->role);
     }
 
     public function isPlatformAdmin(): bool
     {
-        return $this->isOwnerWebsite();
+        return Role::isPlatformRole($this->role_id ?? $this->role);
     }
 
     public function isOwnerBisnis(): bool
     {
-        return in_array($this->role, ['owner_bisnis', 'owner', 'admin']);
+        return Role::isBusinessOwnerRole($this->role_id ?? $this->role);
     }
 
     public function isOwnerOutlet(): bool
     {
-        return in_array($this->role, ['owner_outlet', 'manager_outlet']);
+        $name = strtolower($this->role ?? '');
+        return in_array($name, [Role::OWNER_OUTLET, Role::MANAGER_OUTLET]);
     }
 
     public function isPegawai(): bool
     {
-        return in_array($this->role, ['pegawai', 'kasir', 'manager']);
+        $name = strtolower($this->role ?? '');
+        return in_array($name, [Role::PEGAWAI, Role::KASIR, Role::MANAGER]);
+    }
+
+    public function isOwnerOrManager(): bool
+    {
+        return Role::isOwnerOrManagerRole($this->role_id ?? $this->role);
     }
 
     public function canManage(User $target): bool

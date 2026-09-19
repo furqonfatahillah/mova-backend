@@ -57,6 +57,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/platform/coins/history',  [CoinPlatformController::class, 'history']);
 
     // User Management & Approval Workflow
+    Route::get('/roles',                   [UserController::class, 'roles']);
     Route::get('/users',                   [UserController::class, 'index']);
     Route::post('/users',                  [UserController::class, 'store']);
     Route::get('/users/{user}',            [UserController::class, 'show']);

@@ -57,7 +57,7 @@ class OpnameController extends Controller
         } else {
             $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
         }
-        $isOwnerOrManager = in_array(strtoupper($user?->role ?? ''), ['OWNER', 'SUPERADMIN', 'ADMIN', 'MANAGER']) || ($user?->is_owner ?? false) || ($user?->is_superadmin ?? false);
+        $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
         $existing = Opname::where('period_from', $data['period_from'])
             ->where('period_to', $data['period_to'])
@@ -136,7 +136,7 @@ class OpnameController extends Controller
 
         $outletId = $request->outlet_id ?? $request->user()->outlet_id ?? 1;
         $user = $request->user();
-        $isOwnerOrManager = in_array(strtoupper($user?->role ?? ''), ['OWNER', 'SUPERADMIN', 'ADMIN', 'MANAGER']) || ($user?->is_owner ?? false) || ($user?->is_superadmin ?? false);
+        $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
         // Determine if this opname session is RELEASED or DRAFT
         $isClosed = ($isOwnerOrManager && ($request->action === 'RELEASE' || $request->is_closed));
@@ -216,7 +216,7 @@ class OpnameController extends Controller
     public function releaseSession(Request $request, $opnameNo)
     {
         $user = $request->user();
-        $isOwnerOrManager = in_array(strtoupper($user?->role ?? ''), ['OWNER', 'SUPERADMIN', 'ADMIN', 'MANAGER']) || ($user?->is_owner ?? false) || ($user?->is_superadmin ?? false);
+        $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
         if (!$isOwnerOrManager) {
             return response()->json([
@@ -445,5 +445,17 @@ class OpnameController extends Controller
             ],
             'items' => $detailedItems,
         ]);
+    }
+
+    /**
+     * Check if user has Owner, Admin, or Store Manager privilege
+     */
+    protected function checkIsOwnerOrManager($user): bool
+    {
+        if (!$user) {
+            return false;
+        }
+
+        return \App\Models\Role::isOwnerOrManagerRole($user->role_id ?? $user->role);
     }
 }

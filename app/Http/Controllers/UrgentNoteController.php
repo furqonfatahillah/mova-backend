@@ -18,8 +18,10 @@ class UrgentNoteController extends Controller
      */
     public function index(Request $request)
     {
-        $businessId = $request->user()->business_id ?: 1;
-        $outletId = $request->query('outlet_id') ?? $request->header('X-Outlet-Id') ?? $request->user()->outlet_id;
+        $user = $request->user();
+        $businessId = $user->business_id ?: 1;
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->query('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
 
         $query = UrgentNote::with([
             'outlet',
@@ -70,8 +72,10 @@ class UrgentNoteController extends Controller
      */
     public function summary(Request $request)
     {
-        $businessId = $request->user()->business_id ?: 1;
-        $outletId = $request->query('outlet_id') ?? $request->header('X-Outlet-Id') ?? $request->user()->outlet_id;
+        $user = $request->user();
+        $businessId = $user->business_id ?: 1;
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->query('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
 
         $baseQuery = UrgentNote::where('business_id', $businessId);
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
@@ -128,6 +132,15 @@ class UrgentNoteController extends Controller
             return response()->json([
                 'message' => 'Nota urgent ini sudah diselesaikan atau dibatalkan sebelumnya.'
             ], 422);
+        }
+
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$urgentNote->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk menyelesaikan nota urgent di cabang outlet lain.'
+                ], 403);
+            }
         }
 
         $outletId = $urgentNote->outlet_id ?: 1;
@@ -218,6 +231,15 @@ class UrgentNoteController extends Controller
             ], 422);
         }
 
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$urgentNote->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk membatalkan nota urgent di cabang outlet lain.'
+                ], 403);
+            }
+        }
+
         $reason = $request->input('reason', 'Dibatalkan oleh kasir / penyesuaian manual');
 
         $urgentNote->update([
@@ -239,8 +261,10 @@ class UrgentNoteController extends Controller
      */
     public function batchResolve(Request $request)
     {
-        $businessId = $request->user()->business_id ?: 1;
-        $outletId = $request->input('outlet_id') ?? $request->header('X-Outlet-Id') ?? $request->user()->outlet_id;
+        $user = $request->user();
+        $businessId = $user->business_id ?: 1;
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->input('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
         $ingredientId = $request->input('ingredient_id');
         $noteIds = $request->input('note_ids');
 

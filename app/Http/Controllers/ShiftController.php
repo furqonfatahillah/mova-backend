@@ -17,6 +17,9 @@ class ShiftController extends Controller
      */
     public function index(Request $request)
     {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
         $query = Shift::with(['user', 'closedByUser', 'creator', 'updater', 'outlet', 'shiftSchedule'])
             ->withCount('transactions')
             ->orderByDesc('opened_at')
@@ -26,7 +29,9 @@ class ShiftController extends Controller
             $query->where('status', $request->status);
         }
 
-        if ($request->outlet_id) {
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int)$user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', $request->outlet_id);
         }
 
@@ -50,9 +55,12 @@ class ShiftController extends Controller
      */
     public function active(Request $request)
     {
-        $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
         $query = Shift::with(['user', 'outlet', 'shiftSchedule'])->where('status', 'OPEN');
-        if ($outletId) {
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
         }
         $shift = $query->orderByDesc('opened_at')->first();
@@ -90,8 +98,8 @@ class ShiftController extends Controller
 
         $outletId = !empty($data['outlet_id']) ? (int)$data['outlet_id'] : ($user->outlet_id ?? 1);
 
-        // If user is Owner Outlet or Pegawai with assigned outlet, lock to their outlet
-        if ($user->isOwnerOutlet() && $user->outlet_id) {
+        // If user is Owner Outlet or Pegawai with assigned outlet, lock strictly to their outlet
+        if (($user->isOwnerOutlet() || $user->isPegawai()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         }
 
@@ -192,6 +200,13 @@ class ShiftController extends Controller
      */
     public function summary(Shift $shift)
     {
+        $user = auth()->user() ?? request()->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$shift->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk mengelola shift di cabang outlet lain.'], 403);
+            }
+        }
+
         $shift->load(['user', 'closedByUser']);
 
         $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
@@ -264,6 +279,13 @@ class ShiftController extends Controller
      */
     public function close(Request $request, Shift $shift)
     {
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$shift->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk menutup shift di cabang outlet lain.'], 403);
+            }
+        }
+
         if ($shift->status !== 'OPEN') {
             return response()->json(['message' => 'Shift ini sudah ditutup sebelumnya.'], 422);
         }
@@ -370,6 +392,13 @@ class ShiftController extends Controller
      */
     public function transactions(Request $request, Shift $shift)
     {
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$shift->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk melihat transaksi shift di cabang outlet lain.'], 403);
+            }
+        }
+
         $ingId = $request->ingredient_id ? (int)$request->ingredient_id : null;
 
         $transactions = $shift->transactions()

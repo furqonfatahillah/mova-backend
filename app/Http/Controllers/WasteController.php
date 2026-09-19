@@ -22,7 +22,12 @@ class WasteController extends Controller
             ->orderByDesc('date')
             ->orderByDesc('id');
 
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int)$user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', $request->outlet_id);
         }
 
@@ -60,7 +65,12 @@ class WasteController extends Controller
     {
         $query = WasteLog::query();
 
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int)$user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', $request->outlet_id);
         }
 
@@ -155,7 +165,12 @@ class WasteController extends Controller
         ]);
 
         $itemType = $data['item_type'] ?? ($request->filled('menu_id') ? 'MENU' : 'INGREDIENT');
-        $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? 1;
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
+        }
 
         $datePrefix = date('Ymd', strtotime($data['date']));
         $latest = WasteLog::where('waste_no', 'like', "WST-{$datePrefix}-%")

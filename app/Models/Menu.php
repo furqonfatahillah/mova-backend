@@ -153,9 +153,14 @@ class Menu extends Model
 
     public function getCurrentStockAttribute(): float
     {
+        $user = auth()->user() ?? auth('sanctum')->user() ?? (app()->bound('request') ? request()->user() : null);
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            return $this->stockForOutlet((int)$user->outlet_id);
+        }
+
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
-            $outletId = auth()->user()->outlet_id;
+        if (!$outletId && $user?->outlet_id) {
+            $outletId = $user->outlet_id;
         }
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
@@ -180,9 +185,14 @@ class Menu extends Model
 
     public function getCurrentMinStockAttribute(): float
     {
+        $user = auth()->user() ?? auth('sanctum')->user() ?? (app()->bound('request') ? request()->user() : null);
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            return $this->minStockForOutlet((int)$user->outlet_id);
+        }
+
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
-            $outletId = auth()->user()->outlet_id;
+        if (!$outletId && $user?->outlet_id) {
+            $outletId = $user->outlet_id;
         }
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {

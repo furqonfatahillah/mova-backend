@@ -20,8 +20,12 @@ class CashFlowController extends Controller
     {
         $from = $request->input('from', date('Y-m-01'));
         $to   = $request->input('to', date('Y-m-d'));
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $outletId = null;
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $outletId = (int)$request->outlet_id;
         }
 
@@ -372,7 +376,12 @@ class CashFlowController extends Controller
             ->orderByDesc('date')
             ->orderByDesc('id');
 
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int)$user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', $request->outlet_id);
         }
 
@@ -428,12 +437,14 @@ class CashFlowController extends Controller
         ]);
 
         $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $businessId = $user->business_id ?? null;
         $transactionNo = CashTransaction::generateTransactionNo($businessId, $data['date']);
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($data['outlet_id'] ?? null);
 
         $trx = CashTransaction::create([
             'business_id'    => $businessId,
-            'outlet_id'      => $data['outlet_id'] ?? null,
+            'outlet_id'      => $outletId,
             'transaction_no' => $transactionNo,
             'date'           => $data['date'],
             'type'           => $data['type'],

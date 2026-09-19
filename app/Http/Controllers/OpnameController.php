@@ -11,7 +11,9 @@ class OpnameController extends Controller
 {
     public function index(Request $request)
     {
-        $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
 
         $query = Opname::with(['ingredient', 'user', 'creator', 'updater', 'outlet'])
             ->where('period_from', $request->from ?? now()->startOfMonth()->toDateString())
@@ -49,8 +51,12 @@ class OpnameController extends Controller
             ], 422);
         }
 
-        $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? 1;
         $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
+        }
         $isOwnerOrManager = in_array(strtoupper($user?->role ?? ''), ['OWNER', 'SUPERADMIN', 'ADMIN', 'MANAGER']) || ($user?->is_owner ?? false) || ($user?->is_superadmin ?? false);
 
         $existing = Opname::where('period_from', $data['period_from'])
@@ -223,6 +229,13 @@ class OpnameController extends Controller
             return response()->json(['message' => 'Dokumen sesi opname tidak ditemukan.'], 404);
         }
 
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $firstOpn = $opnames->first();
+            if ($firstOpn && (int)$firstOpn->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk merilis dokumen opname di cabang lain.'], 403);
+            }
+        }
+
         $approverName = $request->approver ?: ($user->name ?? 'Owner Bisnis');
 
         foreach ($opnames as $opn) {
@@ -248,7 +261,9 @@ class OpnameController extends Controller
      */
     public function history(Request $request)
     {
-        $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
 
         $query = Opname::with(['outlet', 'creator', 'user'])
             ->whereNotNull('opname_no')
@@ -331,6 +346,14 @@ class OpnameController extends Controller
 
         if ($opnames->isEmpty()) {
             return response()->json(['message' => 'Dokumen sesi opname tidak ditemukan.'], 404);
+        }
+
+        $user = auth()->user() ?? request()->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $firstOpn = $opnames->first();
+            if ($firstOpn && (int)$firstOpn->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk melihat sesi opname cabang lain.'], 403);
+            }
         }
 
         $first = $opnames->first();

@@ -159,7 +159,10 @@ class ExpenseController extends Controller
         $businessId = $user->business_id ?? null;
         $paymentMethod = $data['payment_method'] ?? 'CASH';
 
-        $outletId = !empty($data['outlet_id']) ? $data['outlet_id'] : ($user->outlet_id ?? null);
+        $canViewAllOutlets = $user->isPlatformAdmin() || $user->isOwnerBisnis();
+        $outletId = (!$canViewAllOutlets && $user->outlet_id)
+            ? (int)$user->outlet_id
+            : (!empty($data['outlet_id']) ? (int)$data['outlet_id'] : ($user->outlet_id ?? null));
 
         $expenseNo = OperatingExpense::generateExpenseNo($businessId, $data['date']);
 
@@ -214,6 +217,13 @@ class ExpenseController extends Controller
             'receipt_img'    => 'nullable|string|max:255',
         ]);
 
+        $canViewAllOutlets = $user->isPlatformAdmin() || $user->isOwnerBisnis();
+        if (!$canViewAllOutlets && $user->outlet_id) {
+            if ($expense->outlet_id && (int)$expense->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk mengubah beban operasional di cabang lain.'], 403);
+            }
+        }
+
         $expense->update([
             'date'           => $data['date'] ?? $expense->date,
             'category'       => $data['category'] ?? $expense->category,
@@ -235,9 +245,17 @@ class ExpenseController extends Controller
     /**
      * Delete an expense.
      */
-    public function destroy($id)
+    public function destroy(Request $request, $id)
     {
+        $user = $request->user();
         $expense = OperatingExpense::findOrFail($id);
+        $canViewAllOutlets = $user->isPlatformAdmin() || $user->isOwnerBisnis();
+        if (!$canViewAllOutlets && $user->outlet_id) {
+            if ($expense->outlet_id && (int)$expense->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk menghapus beban operasional di cabang lain.'], 403);
+            }
+        }
+
         $expense->delete();
 
         return response()->json([

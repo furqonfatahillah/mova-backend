@@ -10,13 +10,22 @@ class MovementController extends Controller
 {
     public function index(Request $request)
     {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
         $query = StockMovement::with(['ingredient', 'user', 'creator', 'updater', 'shift', 'outlet', 'transfer.destinationOutlet', 'transfer.sourceOutlet'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
         if ($request->ingredient_id) $query->where('ingredient_id', $request->ingredient_id);
         if ($request->type)          $query->where('type', $request->type);
-        if ($request->outlet_id)     $query->where('outlet_id', $request->outlet_id);
+        
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int)$user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $query->where('outlet_id', $request->outlet_id);
+        }
+
         if ($request->from)          $query->where('date', '>=', $request->from);
         if ($request->to)            $query->where('date', '<=', $request->to);
 
@@ -37,7 +46,12 @@ class MovementController extends Controller
             'outlet_id'     => 'nullable|exists:outlets,id',
         ]);
 
-        $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? 1;
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
+        }
         $ingredient = Ingredient::findOrFail($data['ingredient_id']);
         $konversi = max((float)$ingredient->konversi, 1);
 
@@ -102,7 +116,12 @@ class MovementController extends Controller
 
         $from     = $request->from;
         $to       = $request->to;
-        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id ?? 1);
+        $user     = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = $request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id ?? 1);
+        }
 
         $outlet = \App\Models\Outlet::findOrFail($outletId);
 
@@ -223,7 +242,12 @@ class MovementController extends Controller
         $ingId    = (int) $request->ingredient_id;
         $from     = $request->from;
         $to       = $request->to;
-        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
+        $user     = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = $request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id);
+        }
 
         $ingredient = Ingredient::with(['creator', 'updater', 'outletIngredients.outlet'])->findOrFail($ingId);
 

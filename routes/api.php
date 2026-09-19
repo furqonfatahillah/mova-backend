@@ -33,8 +33,8 @@ Route::post('/login',    [AuthController::class, 'login'])->name('login');
 Route::get('/public/businesses', [BusinessController::class, 'publicList']);
 Route::get('/public/outlets', [OutletController::class, 'publicList']);
 
-// Protected routes (require Sanctum token)
-Route::middleware('auth:sanctum')->group(function () {
+// Protected routes (require Sanctum token and enforce outlet scoping)
+Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::class])->group(function () {
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/me',      [AuthController::class, 'me']);
 

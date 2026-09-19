@@ -43,7 +43,12 @@ class ShiftScheduleController extends Controller
             ->orderBy('start_time')
             ->orderBy('id');
 
-        if ($request->filled('outlet_id')) {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int) $user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', (int) $request->outlet_id);
         }
 

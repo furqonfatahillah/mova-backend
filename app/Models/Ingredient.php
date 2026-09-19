@@ -134,9 +134,14 @@ class Ingredient extends Model
 
     public function getCurrentStockAttribute(): float
     {
+        $user = auth()->user() ?? auth('sanctum')->user() ?? (app()->bound('request') ? request()->user() : null);
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            return $this->stockForOutlet((int) $user->outlet_id);
+        }
+
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
-            $outletId = auth()->user()->outlet_id;
+        if (!$outletId && $user?->outlet_id) {
+            $outletId = $user->outlet_id;
         }
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
@@ -149,9 +154,21 @@ class Ingredient extends Model
 
     public function getCurrentStokMinAttribute(): float
     {
+        $user = auth()->user() ?? auth('sanctum')->user() ?? (app()->bound('request') ? request()->user() : null);
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletRow = $this->relationLoaded('outletIngredients')
+                ? $this->outletIngredients->firstWhere('outlet_id', (int)$user->outlet_id)
+                : $this->outletIngredients()->where('outlet_id', (int)$user->outlet_id)->first();
+
+            if ($outletRow && $outletRow->stok_min !== null) {
+                return (float) $outletRow->stok_min;
+            }
+            return (float) $this->stok_min;
+        }
+
         $outletId = request()->query('outlet_id') ?? request()->header('X-Outlet-Id');
-        if (!$outletId && auth()->check() && auth()->user()?->outlet_id) {
-            $outletId = auth()->user()->outlet_id;
+        if (!$outletId && $user?->outlet_id) {
+            $outletId = $user->outlet_id;
         }
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {

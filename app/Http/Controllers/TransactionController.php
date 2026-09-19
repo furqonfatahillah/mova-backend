@@ -269,6 +269,9 @@ class TransactionController extends Controller
 
     public function index(Request $request)
     {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
         $query = Transaction::with(['menu', 'user', 'outlet', 'shift', 'creator', 'updater', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient'])
             ->orderByDesc('date')
             ->orderByDesc('id');
@@ -278,7 +281,13 @@ class TransactionController extends Controller
         if ($request->menu_id)      $query->where('menu_id', $request->menu_id);
         if ($request->order_number) $query->where('order_number', $request->order_number);
         if ($request->shift_id)     $query->where('shift_id', $request->shift_id);
-        if ($request->outlet_id)    $query->where('outlet_id', $request->outlet_id);
+        
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int)$user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $query->where('outlet_id', $request->outlet_id);
+        }
+
         if ($request->status)       $query->where('status', $request->status);
 
         return response()->json($query->limit(200)->get());
@@ -325,8 +334,13 @@ class TransactionController extends Controller
             $isUrgentOrder = !empty($data['is_urgent_note']);
 
             // Resolve Outlet ID & Business ID
-            $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
-            $businessId = (int)($request->user()->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
+            $user = $request->user();
+            if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+                $outletId = (int)$user->outlet_id;
+            } else {
+                $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? null;
+            }
+            $businessId = (int)($user?->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
 
             if (!$outletId || $outletId === 'ALL' || $outletId === 'all') {
                 $outletId = \App\Models\Outlet::where('business_id', $businessId)->where('is_main', true)->value('id')
@@ -689,8 +703,13 @@ class TransactionController extends Controller
         $menu   = Menu::findOrFail($data['menu_id']);
         $recipe = $menu->activeRecipe($data['date']);
 
-        $outletId = $data['outlet_id'] ?? $request->user()->outlet_id ?? null;
-        $businessId = (int)($request->user()->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? null;
+        }
+        $businessId = (int)($user?->business_id ?: ($outletId ? \App\Models\Outlet::find($outletId)?->business_id : 1) ?: 1);
 
         if (!$outletId || $outletId === 'ALL' || $outletId === 'all') {
             $outletId = \App\Models\Outlet::where('business_id', $businessId)->where('is_main', true)->value('id')
@@ -713,7 +732,7 @@ class TransactionController extends Controller
         // Find active shift if not explicitly provided
         $shiftId = $data['shift_id'] ?? null;
         if (!$shiftId) {
-            $activeShift = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->first();
+            $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->first();
             $shiftId = $activeShift?->id;
         }
 
@@ -840,7 +859,10 @@ class TransactionController extends Controller
      */
     public function openBills(Request $request)
     {
-        $outletId = $request->outlet_id ?? $request->user()?->outlet_id;
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
         $query = Transaction::with(['menu', 'user', 'outlet', 'modifiers.ingredient', 'urgentNotes.ingredient'])
             ->where('status', 'HOLD')
             ->orderBy('created_at', 'asc');
@@ -977,6 +999,16 @@ class TransactionController extends Controller
             return response()->json([
                 'message' => "Tagihan terbuka dengan nomor '{$orderNumber}' tidak ditemukan atau sudah diselesaikan."
             ], 404);
+        }
+
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $firstTrx = $transactions->first();
+            if ($firstTrx && (int)$firstTrx->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk memproses tagihan di cabang outlet lain.'
+                ], 403);
+            }
         }
 
         $first = $transactions->first();
@@ -1180,6 +1212,15 @@ class TransactionController extends Controller
             ], 404);
         }
 
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$existing->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk mengubah tagihan di cabang outlet lain.'
+                ], 403);
+            }
+        }
+
         $date = $existing->date;
         $shiftId = $existing->shift_id;
         $outletId = $existing->outlet_id;
@@ -1282,6 +1323,16 @@ class TransactionController extends Controller
             return response()->json([
                 'message' => "Tagihan terbuka '{$orderNumber}' tidak ditemukan atau sudah diselesaikan."
             ], 404);
+        }
+
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $firstTrx = $transactions->first();
+            if ($firstTrx && (int)$firstTrx->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk membatalkan tagihan di cabang outlet lain.'
+                ], 403);
+            }
         }
 
         DB::transaction(function () use ($transactions, $data, $request) {
@@ -1397,6 +1448,16 @@ class TransactionController extends Controller
             return response()->json([
                 'message' => "Tagihan terbuka '{$orderNumber}' tidak ditemukan atau sudah diselesaikan."
             ], 404);
+        }
+
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $firstTrx = $transactions->first();
+            if ($firstTrx && (int)$firstTrx->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk memproses tagihan di cabang outlet lain.'
+                ], 403);
+            }
         }
 
         $trxMap = $transactions->keyBy('id');
@@ -1656,6 +1717,16 @@ class TransactionController extends Controller
             return response()->json([
                 'message' => "Tagihan terbuka '{$orderNumber}' tidak ditemukan atau sudah diselesaikan."
             ], 404);
+        }
+
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $firstTrx = $transactions->first();
+            if ($firstTrx && (int)$firstTrx->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk memproses tagihan di cabang outlet lain.'
+                ], 403);
+            }
         }
 
         $first = $transactions->first();

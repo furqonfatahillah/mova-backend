@@ -31,17 +31,27 @@ class TransferController extends Controller
         ->orderByDesc('date')
         ->orderByDesc('id');
 
+        $user = $request->user();
+        if ($user && !$user->isPlatformAdmin() && !$user->isOwnerBisnis() && $user->outlet_id) {
+            $userOutletId = (int)$user->outlet_id;
+            $query->where(function($q) use ($userOutletId) {
+                $q->where('source_outlet_id', $userOutletId)
+                  ->orWhere('destination_outlet_id', $userOutletId);
+            });
+        } else {
+            if ($request->source_outlet_id) {
+                $query->where('source_outlet_id', $request->source_outlet_id);
+            }
+            if ($request->destination_outlet_id) {
+                $query->where('destination_outlet_id', $request->destination_outlet_id);
+            }
+        }
+
         if ($request->from) {
             $query->where('date', '>=', $request->from);
         }
         if ($request->to) {
             $query->where('date', '<=', $request->to);
-        }
-        if ($request->source_outlet_id) {
-            $query->where('source_outlet_id', $request->source_outlet_id);
-        }
-        if ($request->destination_outlet_id) {
-            $query->where('destination_outlet_id', $request->destination_outlet_id);
         }
         if ($request->status) {
             $query->where('status', $request->status);
@@ -120,6 +130,16 @@ class TransferController extends Controller
             }
             if ($destOutlet && (int)$destOutlet->business_id !== (int)$userBusinessId) {
                 return response()->json(['message' => 'Cabang tujuan bukan milik perusahaan Anda.'], 403);
+            }
+        }
+
+        // Kunci penempatan pegawai/outlet: pegawai hanya berhak membuat transfer jika cabang penempatannya adalah asal atau tujuan
+        if ($user && !$user->isPlatformAdmin() && !$user->isOwnerBisnis() && $user->outlet_id) {
+            $myOutletId = (int)$user->outlet_id;
+            if ($sourceOutletId !== $myOutletId && $destOutletId !== $myOutletId) {
+                return response()->json([
+                    'message' => 'Anda hanya berhak membuat transfer yang melibatkan cabang penempatan Anda (' . ($user->outlet?->name ?? 'Outlet Anda') . ').'
+                ], 403);
             }
         }
 
@@ -356,8 +376,18 @@ class TransferController extends Controller
         $destOutlet  = $transfer->destinationOutlet;
         $sourceName  = $transfer->source_display_name;
         $destName    = $transfer->destination_display_name;
-        $userId      = $request->user()?->id;
-        $businessId  = $request->user()?->business_id ?? $transfer->business_id;
+        $user        = $request->user();
+        $userId      = $user?->id;
+        $businessId  = $user?->business_id ?? $transfer->business_id;
+
+        if ($user && !$user->isPlatformAdmin() && !$user->isOwnerBisnis() && $user->outlet_id) {
+            if ($transfer->destination_outlet_id && (int)$transfer->destination_outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda hanya berhak menerima transfer barang untuk cabang tujuan penempatan Anda.'
+                ], 403);
+            }
+        }
+
         $receiveDate = date('Y-m-d');
         $disposition = $validated['return_disposition'] ?? 'RECORD_AS_WASTE';
         $defaultReturnReason = $validated['return_reason'] ?? 'Barang rusak / kurang saat pengiriman';
@@ -566,6 +596,15 @@ class TransferController extends Controller
 
     public function cancel(Request $request, Transfer $transfer)
     {
+        $user = $request->user();
+        if ($user && !$user->isPlatformAdmin() && !$user->isOwnerBisnis() && $user->outlet_id) {
+            if ((int)$transfer->source_outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Hanya cabang pengirim atau pemilik bisnis yang dapat membatalkan transfer ini.'
+                ], 403);
+            }
+        }
+
         if ($transfer->status === 'CANCELLED') {
             return response()->json(['message' => 'Transfer ini sudah dibatalkan sebelumnya.'], 422);
         }
@@ -642,6 +681,9 @@ class TransferController extends Controller
      */
     public function returnTransfer(Request $request, Transfer $transfer)
     {
+        if ($transfer->status === 'COMPLETED' || $transfer->status === 'PARTIALLY_RETURNED' || $transfer->status === 'RETURNED') {
+            return response()->json(['message' => 'Transfer ini sudah diproses penerimaan/returnya.'], 422);
+        }
         if ($transfer->status === 'CANCELLED') {
             return response()->json(['message' => 'Transfer yang sudah dibatalkan tidak dapat diretur.'], 422);
         }
@@ -740,20 +782,9 @@ class TransferController extends Controller
                         ]);
                     }
 
-                    // Pencatatan StockMovement WASTE untuk outlet asal
-                    if ($item->item_type === 'INGREDIENT' && $ingredientId) {
-                        StockMovement::create([
-                            'date'          => $returnDate,
-                            'ingredient_id' => $ingredientId,
-                            'type'          => 'WASTE',
-                            'qty'           => -$returnedBaseQty,
-                            'note'          => "Kerugian retur rusak di jalan ({$transfer->transfer_no}): {$itemReason}",
-                            'transfer_id'   => $transfer->id,
-                            'outlet_id'     => $transfer->source_outlet_id,
-                            'user_id'       => $userId,
-                            'created_by'    => $userId,
-                        ]);
-                    }
+                    // Kerugian kerusakan saat pengiriman sudah dicatat di WasteLog di atas.
+                    // Stok cabang pengirim TIDAK perlu dipotong lagi karena saat dokumen transfer dibuat,
+                    // stok cabang pengirim sudah dipotong penuh (TRANSFER_OUT).
 
                 } elseif ($disposition === 'RETURN_TO_SOURCE') {
                     // DISPOSISI B: RETUR KE CABANG ASAL -> Pulihkan stok ke outlet asal

@@ -250,7 +250,12 @@ class BatchPrepController extends Controller
 
         $recipe = PrepRecipe::with(['ingredient', 'items.ingredient.outletIngredients'])->findOrFail($request->prep_recipe_id);
         $multiplier = (float)($request->batch_multiplier ?? 1.0);
-        $outletId = (int)($request->outlet_id ?? $request->user()?->outlet_id ?? 1);
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = (int)($request->outlet_id ?? $user?->outlet_id ?? 1);
+        }
 
         $itemsPreview = [];
         $totalEstimatedCost = 0.0;
@@ -341,7 +346,12 @@ class BatchPrepController extends Controller
             'movements.ingredient',
         ])->orderByDesc('date')->orderByDesc('id');
 
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+
+        if ($isOutletBounded) {
+            $query->where('outlet_id', (int)$user->outlet_id);
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where('outlet_id', $request->outlet_id);
         }
 
@@ -391,7 +401,12 @@ class BatchPrepController extends Controller
         ]);
 
         $recipe = PrepRecipe::with(['ingredient', 'items.ingredient'])->findOrFail($data['prep_recipe_id']);
-        $outletId = (int)$data['outlet_id'];
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = (int)$data['outlet_id'];
+        }
         $multiplier = (float)$data['batch_multiplier'];
         $actualOutputQty = (float)$data['actual_output_qty'];
         $date = $data['date'];

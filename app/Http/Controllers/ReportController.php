@@ -78,7 +78,9 @@ class ReportController extends Controller
     public function varianceIngredients(Request $request)
     {
         $p = $this->validatePeriod($request);
-        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
 
         return response()->json($this->buildVarianceArray($p['from'], $p['to'], $outletId));
     }
@@ -168,7 +170,9 @@ class ReportController extends Controller
     public function varianceMenus(Request $request)
     {
         $p = $this->validatePeriod($request);
-        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
 
         return response()->json($this->calculateVarianceMenusData($p['from'], $p['to'], $outletId));
     }
@@ -177,7 +181,9 @@ class ReportController extends Controller
     public function profitability(Request $request)
     {
         $p = $this->validatePeriod($request);
-        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
 
         $menus        = Menu::with(['recipes.items.ingredient', 'outletMenus'])->get();
         $trxQuery     = Transaction::whereBetween('date', [$p['from'], $p['to']])->where('status', 'PAID');
@@ -225,7 +231,9 @@ class ReportController extends Controller
     public function dashboard(Request $request)
     {
         $p = $this->validatePeriod($request);
-        $outletId = $request->outlet_id ? (int)$request->outlet_id : ($request->user()?->outlet_id);
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
         $varData = $this->buildVarianceArray($p['from'], $p['to'], $outletId);
 
         $statusCounts      = ['NORMAL' => 0, 'WASPADA' => 0, 'TIDAK WAJAR' => 0];
@@ -284,8 +292,12 @@ class ReportController extends Controller
     {
         $from = $request->input('from', date('Y-m-01'));
         $to   = $request->input('to', date('Y-m-d'));
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $outletId = null;
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $outletId = (int)$request->outlet_id;
         }
 

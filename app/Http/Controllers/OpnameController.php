@@ -43,14 +43,6 @@ class OpnameController extends Controller
             'action'        => 'nullable|string',
         ]);
 
-        $opnameDate = $data['opname_date'] ?? now()->toDateString();
-        $today = now()->toDateString();
-        if ($opnameDate < $today) {
-            return response()->json([
-                'message' => 'Tanggal pelaksanaan opname tidak boleh tanggal mundur (sebelum hari ini).'
-            ], 422);
-        }
-
         $user = $request->user();
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
@@ -65,10 +57,32 @@ class OpnameController extends Controller
             ->where('outlet_id', $outletId)
             ->first();
 
-        if ($existing && $existing->is_closed) {
+        $opnameDate = $data['opname_date'] ?? ($existing?->opname_date ? (is_string($existing->opname_date) ? $existing->opname_date : $existing->opname_date->toDateString()) : now()->toDateString());
+        $today = now()->toDateString();
+        if (!$existing && $opnameDate < $today) {
             return response()->json([
-                'message' => "Item opname ini sudah berstatus release (terkunci) dan tidak dapat diubah lagi."
+                'message' => 'Tanggal pelaksanaan opname tidak boleh tanggal mundur (sebelum hari ini).'
             ], 422);
+        }
+
+        if ($existing && $existing->is_closed) {
+            // If the item is already closed/released, keep actual_qty locked to protect physical stock movement integrity,
+            // but allow updating Root Cause analysis metadata (reason, approver, notes).
+            if (isset($data['actual_qty']) && $data['actual_qty'] !== null && (float)$data['actual_qty'] !== (float)$existing->actual_qty) {
+                return response()->json([
+                    'message' => "Item opname ini sudah berstatus release (terkunci). Kuantitas fisik (stok aktual) tidak dapat diubah lagi."
+                ], 422);
+            }
+
+            $existing->update([
+                'reason'     => $data['reason']   ?? $existing->reason,
+                'approver'   => $data['approver'] ?? $existing->approver,
+                'notes'      => $data['notes']    ?? $existing->notes,
+                'updated_by' => $user->id,
+            ]);
+
+            $existing->load(['ingredient', 'user', 'creator', 'updater', 'outlet']);
+            return response()->json($existing);
         }
 
         $opnameNo = $data['opname_no'] ?? ($existing?->opname_no);

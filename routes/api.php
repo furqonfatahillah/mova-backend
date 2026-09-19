@@ -31,6 +31,9 @@ use App\Http\Controllers\ReceivableController;
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
 Route::post('/login',    [AuthController::class, 'login'])->name('login');
+Route::post('/forgot-password',     [AuthController::class, 'forgotPassword']);
+Route::post('/verify-reset-code',   [AuthController::class, 'verifyResetCode']);
+Route::post('/reset-password',      [AuthController::class, 'resetPassword']);
 Route::get('/public/businesses', [BusinessController::class, 'publicList']);
 Route::get('/public/outlets', [OutletController::class, 'publicList']);
 
@@ -44,48 +47,6 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/my-business',       [BusinessController::class, 'myBusiness']);
     Route::get('/my-business/coins', [BusinessController::class, 'myCoins']);
     Route::put('/my-business',       [BusinessController::class, 'updateMyBusiness']);
-
-    // System Maintenance & Reset (Owner / Superadmin Only)
-    Route::post('/system/reset-transactions', function (\Illuminate\Http\Request $request) {
-        $user = $request->user();
-        if (!$user) {
-            return response()->json(['message' => 'Unauthorized'], 401);
-        }
-
-        $tablesToClear = [
-            'receivable_payments',
-            'receivables',
-            'cash_transactions',
-            'operating_expenses',
-            'urgent_notes',
-            'waste_logs',
-            'batch_preps',
-            'transfer_items',
-            'transfers',
-            'opnames',
-            'stock_movements',
-            'transactions',
-            'shifts',
-        ];
-
-        \Illuminate\Support\Facades\DB::statement('SET FOREIGN_KEY_CHECKS=0;');
-
-        $totalCleared = 0;
-        foreach ($tablesToClear as $table) {
-            if (\Illuminate\Support\Facades\Schema::hasTable($table)) {
-                $count = \Illuminate\Support\Facades\DB::table($table)->delete();
-                $totalCleared += $count;
-            }
-        }
-
-        \Illuminate\Support\Facades\DB::statement('SET FOREIGN_KEY_CHECKS=1;');
-
-        return response()->json([
-            'success' => true,
-            'message' => "Berhasil membersihkan {$totalCleared} data transaksi pada server.",
-            'total_cleared' => $totalCleared,
-        ]);
-    });
 
     // Master Tables (ID-based Lookup)
     Route::apiResource('categories', CategoryController::class);

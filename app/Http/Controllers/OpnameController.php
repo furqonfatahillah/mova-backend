@@ -65,6 +65,12 @@ class OpnameController extends Controller
             ->where('outlet_id', $outletId)
             ->first();
 
+        if ($existing && $existing->is_closed) {
+            return response()->json([
+                'message' => "Item opname ini sudah berstatus release (terkunci) dan tidak dapat diubah lagi."
+            ], 422);
+        }
+
         $opnameNo = $data['opname_no'] ?? ($existing?->opname_no);
         if (!$opnameNo) {
             $dateClean = str_replace('-', '', $opnameDate);
@@ -138,15 +144,21 @@ class OpnameController extends Controller
         $user = $request->user();
         $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
-        // Determine if this opname session is RELEASED or DRAFT
-        $isClosed = ($isOwnerOrManager && ($request->action === 'RELEASE' || $request->is_closed));
-
-        // Check if any item in this period & outlet already has an opname_no
+        // Check if any item in this period & outlet already has a released/closed session
         $existingSession = Opname::where('period_from', $request->period_from)
             ->where('period_to', $request->period_to)
             ->where('outlet_id', $outletId)
             ->whereNotNull('opname_no')
             ->first();
+
+        if ($existingSession && $existingSession->is_closed) {
+            return response()->json([
+                'message' => "Sesi Opname ({$existingSession->opname_no}) sudah di-release dan dikunci permanen. Dokumen tidak dapat diubah lagi."
+            ], 422);
+        }
+
+        // Determine if this opname session is RELEASED or DRAFT
+        $isClosed = ($isOwnerOrManager && ($request->action === 'RELEASE' || $request->is_closed));
 
         $opnameNo = $request->opname_no ?? ($existingSession?->opname_no);
         if (!$opnameNo) {

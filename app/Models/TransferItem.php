@@ -15,6 +15,8 @@ class TransferItem extends Model
         'unit',
         'input_qty',
         'input_unit',
+        'unit_price',
+        'total_price',
         'returned_qty',
         'received_qty',
         'return_reason',
@@ -24,6 +26,8 @@ class TransferItem extends Model
     protected $casts = [
         'qty'          => 'float',
         'input_qty'    => 'float',
+        'unit_price'   => 'float',
+        'total_price'  => 'float',
         'returned_qty' => 'float',
         'received_qty' => 'float',
     ];

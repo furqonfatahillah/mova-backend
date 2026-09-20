@@ -92,6 +92,8 @@ class TransferController extends Controller
             'items.*.unit'          => 'nullable|string|max:30',
             'items.*.input_qty'     => 'nullable|numeric|min:0.0001',
             'items.*.input_unit'    => 'nullable|string|max:30',
+            'items.*.unit_price'    => 'nullable|numeric|min:0',
+            'items.*.total_price'   => 'nullable|numeric|min:0',
             'items.*.notes'         => 'nullable|string|max:255',
         ], [
             'items.min' => 'Pilih minimal satu barang atau bahan untuk ditransfer.',
@@ -150,6 +152,107 @@ class TransferController extends Controller
 
         if ($sourceOutlet && $destOutlet && (int)$sourceOutlet->business_id !== (int)$destOutlet->business_id) {
             return response()->json(['message' => 'Transfer hanya dapat dilakukan antar cabang dalam satu perusahaan yang sama.'], 422);
+        }
+
+        // Validasi ketersediaan stok di cabang asal: Tidak boleh transfer jika stok bahan atau produk kurang
+        if ($sourceOutlet) {
+            $deficitErrors = [];
+            $neededIngredients = [];
+            $neededProducts = [];
+
+            foreach ($validated['items'] as $itemData) {
+                $itemType = strtoupper($itemData['item_type'] ?? 'INGREDIENT');
+
+                if ($itemType === 'PRODUCT' || (!empty($itemData['menu_id']) && empty($itemData['ingredient_id']))) {
+                    $menuId = (int)$itemData['menu_id'];
+                    $qty = isset($itemData['input_qty']) && $itemData['input_qty'] !== ''
+                        ? (float)$itemData['input_qty']
+                        : (float)($itemData['qty'] ?? 1);
+
+                    if (!isset($neededProducts[$menuId])) {
+                        $menu = Menu::find($menuId);
+                        $neededProducts[$menuId] = [
+                            'menu'      => $menu,
+                            'total_qty' => 0.0,
+                        ];
+                    }
+                    $neededProducts[$menuId]['total_qty'] += $qty;
+                } else {
+                    $ingredientId = (int)($itemData['ingredient_id'] ?? 0);
+                    if (!$ingredientId) {
+                        continue;
+                    }
+                    $ingredient = Ingredient::find($ingredientId);
+                    if (!$ingredient) {
+                        continue;
+                    }
+
+                    $inputQty = isset($itemData['input_qty']) && $itemData['input_qty'] !== ''
+                        ? (float)$itemData['input_qty']
+                        : (float)($itemData['qty'] ?? 0);
+
+                    $inputUnit = !empty($itemData['input_unit'])
+                        ? trim($itemData['input_unit'])
+                        : (!empty($itemData['unit']) ? trim($itemData['unit']) : (string)$ingredient->unit_pakai);
+
+                    $konversi = (float)($ingredient->konversi ?: 1);
+                    $isUnitBeli = strtolower($inputUnit) === strtolower((string)$ingredient->unit_beli);
+                    $canConvert = $isUnitBeli && strtolower((string)$ingredient->unit_beli) !== strtolower((string)$ingredient->unit_pakai) && $konversi > 1;
+
+                    $baseQty = $canConvert ? round($inputQty * $konversi, 4) : round($inputQty, 4);
+
+                    if (!isset($neededIngredients[$ingredientId])) {
+                        $neededIngredients[$ingredientId] = [
+                            'ingredient'     => $ingredient,
+                            'total_base_qty' => 0.0,
+                        ];
+                    }
+                    $neededIngredients[$ingredientId]['total_base_qty'] += $baseQty;
+                }
+            }
+
+            // Cek ketersediaan stok bahan baku di cabang asal
+            foreach ($neededIngredients as $ingId => $data) {
+                $ing = $data['ingredient'];
+                $neededBaseQty = $data['total_base_qty'];
+                $availableStock = (float)$ing->stockForOutlet($sourceOutlet->id);
+
+                if (round($neededBaseQty - $availableStock, 4) > 0.0001) {
+                    $shortfall = round($neededBaseQty - $availableStock, 4);
+                    $unitPakai = (string)($ing->unit_pakai ?: 'satuan');
+                    $availFmt = number_format($availableStock, 2, ',', '.');
+                    $neededFmt = number_format($neededBaseQty, 2, ',', '.');
+                    $shortfallFmt = number_format($shortfall, 2, ',', '.');
+
+                    $deficitErrors[] = "Stok bahan '{$ing->name}' di cabang asal ({$sourceOutlet->name}) tidak mencukupi. Tersedia: {$availFmt} {$unitPakai}, Dibutuhkan: {$neededFmt} {$unitPakai} (Kurang {$shortfallFmt} {$unitPakai}).";
+                }
+            }
+
+            // Cek ketersediaan stok produk retail di cabang asal
+            foreach ($neededProducts as $mId => $data) {
+                $menu = $data['menu'];
+                if ($menu && $menu->track_stock) {
+                    $neededQty = $data['total_qty'];
+                    $availableStock = (float)$menu->stockForOutlet($sourceOutlet->id);
+
+                    if (round($neededQty - $availableStock, 4) > 0.0001) {
+                        $shortfall = round($neededQty - $availableStock, 4);
+                        $unit = (string)($menu->unit ?: 'pcs');
+                        $availFmt = number_format($availableStock, 2, ',', '.');
+                        $neededFmt = number_format($neededQty, 2, ',', '.');
+                        $shortfallFmt = number_format($shortfall, 2, ',', '.');
+
+                        $deficitErrors[] = "Stok produk '{$menu->name}' di cabang asal ({$sourceOutlet->name}) tidak mencukupi. Tersedia: {$availFmt} {$unit}, Dibutuhkan: {$neededFmt} {$unit} (Kurang {$shortfallFmt} {$unit}).";
+                    }
+                }
+            }
+
+            if (!empty($deficitErrors)) {
+                return response()->json([
+                    'message' => 'Transfer ditolak: Stok bahan atau produk di cabang asal tidak mencukupi.',
+                    'errors'  => $deficitErrors,
+                ], 422);
+            }
         }
 
         $businessIdToAssign = $userBusinessId ?? $sourceOutlet?->business_id ?? $destOutlet?->business_id;
@@ -216,6 +319,9 @@ class TransferController extends Controller
                         : (float)($itemData['qty'] ?? 1);
                     $unit = !empty($itemData['input_unit']) ? trim($itemData['input_unit']) : ($menu->unit ?: 'pcs');
 
+                    $prodUnitPrice = isset($itemData['unit_price']) && $itemData['unit_price'] !== '' ? (float)$itemData['unit_price'] : null;
+                    $prodTotalPrice = isset($itemData['total_price']) && $itemData['total_price'] !== '' ? (float)$itemData['total_price'] : null;
+
                     TransferItem::create([
                         'transfer_id' => $transfer->id,
                         'item_type'   => 'PRODUCT',
@@ -224,6 +330,8 @@ class TransferController extends Controller
                         'unit'        => $unit,
                         'input_qty'   => $qty,
                         'input_unit'  => $unit,
+                        'unit_price'  => $prodUnitPrice,
+                        'total_price' => $prodTotalPrice,
                         'notes'       => $itemData['notes'] ?? null,
                     ]);
 
@@ -251,7 +359,10 @@ class TransferController extends Controller
                                 );
                                 $destOm->increment('stock', $qty);
 
-                                if ($sourceOutlet) {
+                                if ($prodUnitPrice !== null && (float)$prodUnitPrice > 0) {
+                                    $destOm->cost_price = (float)$prodUnitPrice;
+                                    $destOm->save();
+                                } elseif ($sourceOutlet) {
                                     $sourceOm = OutletMenu::where('outlet_id', $sourceOutlet->id)->where('menu_id', $menu->id)->first();
                                     $sourceCost = $sourceOm?->cost_price ?? $menu->cost_price;
                                     if ($sourceCost !== null && (float)$sourceCost > 0) {
@@ -288,6 +399,9 @@ class TransferController extends Controller
                         $baseUnit = (string) ($ingredient->unit_pakai ?: $inputUnit);
                     }
 
+                    $ingUnitPrice = isset($itemData['unit_price']) && $itemData['unit_price'] !== '' ? (float)$itemData['unit_price'] : null;
+                    $ingTotalPrice = isset($itemData['total_price']) && $itemData['total_price'] !== '' ? (float)$itemData['total_price'] : null;
+
                     TransferItem::create([
                         'transfer_id'   => $transfer->id,
                         'item_type'     => 'INGREDIENT',
@@ -296,6 +410,8 @@ class TransferController extends Controller
                         'unit'          => $baseUnit,
                         'input_qty'     => $inputQty,
                         'input_unit'    => $inputUnit,
+                        'unit_price'    => $ingUnitPrice,
+                        'total_price'   => $ingTotalPrice,
                         'notes'         => $itemData['notes'] ?? null,
                     ]);
 
@@ -478,7 +594,10 @@ class TransferController extends Controller
                                     );
                                     $destOm->increment('stock', $receivedInputQty);
 
-                                    if ($transfer->source_outlet_id) {
+                                    if ($item->unit_price !== null && (float)$item->unit_price > 0) {
+                                        $destOm->cost_price = (float)$item->unit_price;
+                                        $destOm->save();
+                                    } elseif ($transfer->source_outlet_id) {
                                         $sourceOm = OutletMenu::where('outlet_id', $transfer->source_outlet_id)->where('menu_id', $menu->id)->first();
                                         $sourceCost = $sourceOm?->cost_price ?? $menu->cost_price;
                                         if ($sourceCost !== null && (float)$sourceCost > 0) {
@@ -500,26 +619,39 @@ class TransferController extends Controller
                                 $noteSuffix .= " [Diterima: " . number_format($receivedInputQty, 0, ',', '.') . "/{$originalInputQty} {$inputUnit}]";
                             }
 
-                            // Ambil harga modal dari cabang asal saat transfer
-                            $sourcePricePerBeli = $transfer->source_outlet_id
-                                ? $ingredient->hargaForOutlet($transfer->source_outlet_id)
-                                : (float)$ingredient->harga;
+                            // Ambil harga modal dari item transfer (jika pembelian online / transfer ada harga khusus) atau dari cabang asal
+                            if ($item->unit_price !== null && (float)$item->unit_price > 0) {
+                                $sourcePricePerBeli = (float)$item->unit_price;
+                            } elseif ($item->total_price !== null && (float)$item->total_price > 0 && $originalInputQty > 0) {
+                                $sourcePricePerBeli = (float)$item->total_price / $originalInputQty;
+                            } elseif ($transfer->source_outlet_id) {
+                                $sourcePricePerBeli = $ingredient->hargaForOutlet($transfer->source_outlet_id);
+                            } else {
+                                $sourcePricePerBeli = (float)$ingredient->harga;
+                            }
+
                             $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
                             $itemTotalPrice = round(($receivedBaseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
 
                             // Cabang tujuan menyerap stok transfer ke moving average mandiri miliknya
                             $destAvg = $ingredient->recalculateMovingAverage($receivedBaseQty, $sourcePricePerPakai, $destOutlet->id);
 
+                            $isExternalPurchase = !$transfer->source_outlet_id || $transfer->source_type === 'EXTERNAL';
+                            $movementType = $isExternalPurchase ? 'PURCHASE' : 'TRANSFER_IN';
+                            $movementNote = $isExternalPurchase
+                                ? "Penerimaan belanja online dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})"
+                                : "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})";
+
                             StockMovement::create([
                                 'date'          => $receiveDate,
                                 'ingredient_id' => $ingredient->id,
-                                'type'          => 'TRANSFER_IN',
+                                'type'          => $movementType,
                                 'qty'           => $receivedBaseQty,
                                 'unit_price'    => $sourcePricePerBeli,
                                 'total_price'   => $itemTotalPrice,
                                 'cost_before'   => $destAvg['cost_before'],
                                 'cost_after'    => $destAvg['cost_after'],
-                                'note'          => "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})",
+                                'note'          => $movementNote,
                                 'transfer_id'   => $transfer->id,
                                 'outlet_id'     => $destOutlet->id,
                                 'user_id'       => $userId,

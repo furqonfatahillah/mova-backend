@@ -290,7 +290,20 @@ class TransactionController extends Controller
 
         if ($request->status)       $query->where('status', $request->status);
 
-        return response()->json($query->limit(200)->get());
+        if ($request->has('is_urgent_note')) {
+            $query->where('is_urgent_note', $request->boolean('is_urgent_note'));
+        }
+
+        if ($request->boolean('has_discount')) {
+            $query->where('discount_amount', '>', 0);
+        }
+
+        $limit = $request->integer('limit', 200);
+        if ($limit <= 0 || $limit > 1000) {
+            $limit = 200;
+        }
+
+        return response()->json($query->limit($limit)->get());
     }
 
     public function store(Request $request)

@@ -38,13 +38,13 @@ class TransferController extends Controller
                 $q->where('source_outlet_id', $userOutletId)
                   ->orWhere('destination_outlet_id', $userOutletId);
             });
-        } else {
-            if ($request->source_outlet_id) {
-                $query->where('source_outlet_id', $request->source_outlet_id);
-            }
-            if ($request->destination_outlet_id) {
-                $query->where('destination_outlet_id', $request->destination_outlet_id);
-            }
+        }
+
+        if ($request->source_outlet_id) {
+            $query->where('source_outlet_id', $request->source_outlet_id);
+        }
+        if ($request->destination_outlet_id) {
+            $query->where('destination_outlet_id', $request->destination_outlet_id);
         }
 
         if ($request->from) {
@@ -54,7 +54,12 @@ class TransferController extends Controller
             $query->where('date', '<=', $request->to);
         }
         if ($request->status) {
-            $query->where('status', $request->status);
+            if (str_contains($request->status, ',')) {
+                $statuses = array_filter(array_map('trim', explode(',', $request->status)));
+                $query->whereIn('status', $statuses);
+            } else {
+                $query->where('status', $request->status);
+            }
         }
 
         if ($request->user()?->business_id) {
@@ -245,6 +250,15 @@ class TransferController extends Controller
                                     ['stock' => 0, 'min_stock' => $menu->min_stock]
                                 );
                                 $destOm->increment('stock', $qty);
+
+                                if ($sourceOutlet) {
+                                    $sourceOm = OutletMenu::where('outlet_id', $sourceOutlet->id)->where('menu_id', $menu->id)->first();
+                                    $sourceCost = $sourceOm?->cost_price ?? $menu->cost_price;
+                                    if ($sourceCost !== null && (float)$sourceCost > 0) {
+                                        $destOm->cost_price = (float)$sourceCost;
+                                        $destOm->save();
+                                    }
+                                }
                             }
                         } catch (\Throwable $e) {}
                         $menu->increment('stock', $qty);
@@ -287,6 +301,11 @@ class TransferController extends Controller
 
                     $noteSuffix = $canConvert ? " ({$inputQty} {$inputUnit} ≈ " . number_format($baseQty, 0, ',', '.') . " {$baseUnit})" : "";
 
+                    // Hitung harga modal/transfer dari cabang asal
+                    $sourcePricePerBeli = $sourceOutlet ? $ingredient->hargaForOutlet($sourceOutlet->id) : (float)$ingredient->harga;
+                    $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
+                    $itemTotalPrice = round(($baseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
+
                     // 1. Mutasi TRANSFER_OUT dari outlet asal (langsung terpotong saat dikirim)
                     if ($sourceOutlet) {
                         StockMovement::create([
@@ -294,6 +313,10 @@ class TransferController extends Controller
                             'ingredient_id' => $ingredient->id,
                             'type'          => 'TRANSFER_OUT',
                             'qty'           => $baseQty,
+                            'unit_price'    => $sourcePricePerBeli,
+                            'total_price'   => $itemTotalPrice,
+                            'cost_before'   => $sourcePricePerPakai,
+                            'cost_after'    => $sourcePricePerPakai,
                             'note'          => "Transfer keluar ke {$destName}{$noteSuffix} ({$transferNo})",
                             'transfer_id'   => $transfer->id,
                             'outlet_id'     => $sourceOutlet->id,
@@ -304,11 +327,18 @@ class TransferController extends Controller
 
                     // 2. Mutasi TRANSFER_IN ke outlet tujuan (hanya jika langsung status COMPLETED)
                     if ($initialStatus === 'COMPLETED' && $destOutlet) {
+                        // Cabang penerima menyerap stok masuk dengan harga transfer dari cabang asal
+                        $destAvg = $ingredient->recalculateMovingAverage($baseQty, $sourcePricePerPakai, $destOutlet->id);
+
                         StockMovement::create([
                             'date'          => $date,
                             'ingredient_id' => $ingredient->id,
                             'type'          => 'TRANSFER_IN',
                             'qty'           => $baseQty,
+                            'unit_price'    => $sourcePricePerBeli,
+                            'total_price'   => $itemTotalPrice,
+                            'cost_before'   => $destAvg['cost_before'],
+                            'cost_after'    => $destAvg['cost_after'],
                             'note'          => "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transferNo})",
                             'transfer_id'   => $transfer->id,
                             'outlet_id'     => $destOutlet->id,
@@ -447,6 +477,15 @@ class TransferController extends Controller
                                         ['stock' => 0, 'min_stock' => $menu->min_stock]
                                     );
                                     $destOm->increment('stock', $receivedInputQty);
+
+                                    if ($transfer->source_outlet_id) {
+                                        $sourceOm = OutletMenu::where('outlet_id', $transfer->source_outlet_id)->where('menu_id', $menu->id)->first();
+                                        $sourceCost = $sourceOm?->cost_price ?? $menu->cost_price;
+                                        if ($sourceCost !== null && (float)$sourceCost > 0) {
+                                            $destOm->cost_price = (float)$sourceCost;
+                                            $destOm->save();
+                                        }
+                                    }
                                 }
                             } catch (\Throwable $e) {}
                             $menu->increment('stock', $receivedInputQty);
@@ -461,11 +500,25 @@ class TransferController extends Controller
                                 $noteSuffix .= " [Diterima: " . number_format($receivedInputQty, 0, ',', '.') . "/{$originalInputQty} {$inputUnit}]";
                             }
 
+                            // Ambil harga modal dari cabang asal saat transfer
+                            $sourcePricePerBeli = $transfer->source_outlet_id
+                                ? $ingredient->hargaForOutlet($transfer->source_outlet_id)
+                                : (float)$ingredient->harga;
+                            $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
+                            $itemTotalPrice = round(($receivedBaseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
+
+                            // Cabang tujuan menyerap stok transfer ke moving average mandiri miliknya
+                            $destAvg = $ingredient->recalculateMovingAverage($receivedBaseQty, $sourcePricePerPakai, $destOutlet->id);
+
                             StockMovement::create([
                                 'date'          => $receiveDate,
                                 'ingredient_id' => $ingredient->id,
                                 'type'          => 'TRANSFER_IN',
                                 'qty'           => $receivedBaseQty,
+                                'unit_price'    => $sourcePricePerBeli,
+                                'total_price'   => $itemTotalPrice,
+                                'cost_before'   => $destAvg['cost_before'],
+                                'cost_after'    => $destAvg['cost_after'],
                                 'note'          => "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})",
                                 'transfer_id'   => $transfer->id,
                                 'outlet_id'     => $destOutlet->id,

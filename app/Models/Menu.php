@@ -222,39 +222,53 @@ class Menu extends Model
         return $this->item_type === 'BUNDLE';
     }
 
+    public function costPriceForOutlet(?int $outletId = null): float
+    {
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $om = $this->relationLoaded('outletMenus')
+                ? $this->outletMenus->firstWhere('outlet_id', (int)$outletId)
+                : $this->outletMenus()->where('outlet_id', (int)$outletId)->first();
+
+            if ($om && $om->cost_price !== null && (float)$om->cost_price > 0) {
+                return (float)$om->cost_price;
+            }
+        }
+        return (float)($this->cost_price ?? 0);
+    }
+
     /**
-     * Hitung HPP / Cost of Goods Sold untuk produk ini
+     * Hitung HPP / Cost of Goods Sold untuk produk ini (mendukung isolasi HPP per cabang)
      */
-    public function calculateHpp(?string $date = null): float
+    public function calculateHpp(?string $date = null, ?int $outletId = null): float
     {
         // 1. Jika menu bertipe BUNDLE / Combo, hitung total HPP dari seluruh item di dalamnya
         if ($this->is_bundle) {
             $sum = 0.0;
             foreach ($this->bundleItems as $bi) {
                 if ($bi->bundledMenu) {
-                    $sum += $bi->bundledMenu->calculateHpp($date) * (float)$bi->qty;
+                    $sum += $bi->bundledMenu->calculateHpp($date, $outletId) * (float)$bi->qty;
                 } elseif ($bi->ingredient) {
                     $ing = $bi->ingredient;
-                    $hargaPakai = (float)$ing->harga / max((float)$ing->konversi, 1);
+                    $hargaPakai = $ing->costPerPakaiForOutlet($outletId);
                     $sum += (float)$bi->qty * $hargaPakai;
                 }
             }
             return round($sum, 2);
         }
 
-        // 2. Jika barang retail direct atau jasa, gunakan cost_price langsung
+        // 2. Jika barang retail direct atau jasa, gunakan cost_price cabang terkait
         if ($this->is_direct || $this->is_service) {
-            return (float)$this->cost_price;
+            return $this->costPriceForOutlet($outletId);
         }
 
-        // 3. Jika olahan resep (RECIPE), hitung total harga bahan baku
+        // 3. Jika olahan resep (RECIPE), hitung total harga bahan baku cabang terkait
         $recipe = $this->activeRecipe($date);
         if ($recipe) {
             $sum = 0.0;
             foreach ($recipe->items as $item) {
                 $ing = $item->ingredient;
                 if ($ing) {
-                    $hargaPakai = (float)$ing->harga / max((float)$ing->konversi, 1);
+                    $hargaPakai = $ing->costPerPakaiForOutlet($outletId);
                     $sum += (float)$item->qty * $hargaPakai;
                 }
             }
@@ -262,6 +276,6 @@ class Menu extends Model
         }
 
         // Fallback jika belum memiliki resep
-        return (float)($this->cost_price ?? 0);
+        return $this->costPriceForOutlet($outletId);
     }
 }

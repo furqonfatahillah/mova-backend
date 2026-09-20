@@ -19,8 +19,13 @@ class IngredientController extends Controller
 
         $ingredients = $query->get();
 
-        // ⚡ Explicitly append stock attributes (removed from default $appends for performance)
-        $ingredients->each->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+        // ⚡ Explicitly append stock and outlet-isolated pricing attributes
+        $ingredients->each(function ($ing) {
+            $ing->append(['current_stock', 'current_stok_min', 'current_harga', 'outlet_stocks']);
+            if ($ing->current_harga > 0) {
+                $ing->harga = $ing->current_harga;
+            }
+        });
 
         return response()->json($ingredients);
     }
@@ -60,14 +65,17 @@ class IngredientController extends Controller
 
         $ingredient = Ingredient::create($data);
         $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
-        $ingredient->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+        $ingredient->append(['current_stock', 'current_stok_min', 'current_harga', 'outlet_stocks']);
         return response()->json($ingredient, 201);
     }
 
     public function show(Ingredient $ingredient)
     {
         $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
-        $ingredient->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+        $ingredient->append(['current_stock', 'current_stok_min', 'current_harga', 'outlet_stocks']);
+        if ($ingredient->current_harga > 0) {
+            $ingredient->harga = $ingredient->current_harga;
+        }
         return response()->json($ingredient);
     }
 

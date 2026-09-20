@@ -139,7 +139,7 @@ class Shift extends Model
                                 'ingredient_name' => $ing->name,
                                 'unit'            => $item->unit ?: $ing->unit_pakai,
                                 'total_qty'       => 0.0,
-                                'harga_satuan'    => (float)$ing->harga / max((float)$ing->konversi, 1),
+                                'harga_satuan'    => $ing->costPerPakaiForOutlet($this->outlet_id),
                                 'total_cost'      => 0.0,
                             ];
                         }
@@ -172,7 +172,7 @@ class Shift extends Model
                                             'ingredient_name' => $ing->name,
                                             'unit'            => $item->unit ?: $ing->unit_pakai,
                                             'total_qty'       => 0.0,
-                                            'harga_satuan'    => (float)$ing->harga / max((float)$ing->konversi, 1),
+                                            'harga_satuan'    => $ing->costPerPakaiForOutlet($this->outlet_id),
                                             'total_cost'      => 0.0,
                                         ];
                                     }
@@ -196,7 +196,7 @@ class Shift extends Model
                                     'ingredient_name' => $ing->name,
                                     'unit'            => $bi->unit ?: $ing->unit_pakai,
                                     'total_qty'       => 0.0,
-                                    'harga_satuan'    => (float)$ing->harga / max((float)$ing->konversi, 1),
+                                    'harga_satuan'    => $ing->costPerPakaiForOutlet($this->outlet_id),
                                     'total_cost'      => 0.0,
                                 ];
                             }
@@ -225,7 +225,7 @@ class Shift extends Model
                             'ingredient_name' => $ing->name,
                             'unit'            => $mod->unit ?: $ing->unit_pakai,
                             'total_qty'       => 0.0,
-                            'harga_satuan'    => (float)$ing->harga / max((float)$ing->konversi, 1),
+                            'harga_satuan'    => $ing->costPerPakaiForOutlet($this->outlet_id),
                             'total_cost'      => 0.0,
                         ];
                     }

@@ -220,6 +220,7 @@ class MenuController extends Controller
         $data = $request->validate([
             'qty'        => 'required|numeric|min:0.01',
             'cost_price' => 'nullable|numeric|min:0',
+            'total_cost' => 'nullable|numeric|min:0',
             'outlet_id'  => 'nullable|integer',
             'notes'      => 'nullable|string|max:255',
         ]);
@@ -227,8 +228,10 @@ class MenuController extends Controller
         $outletId = $data['outlet_id'] ?? $request->user()?->outlet_id;
         $qty = (float)$data['qty'];
 
-        if ($data['cost_price'] !== null && $data['cost_price'] > 0) {
+        if ($data['cost_price'] !== null && (float)$data['cost_price'] > 0) {
             $menu->cost_price = (float)$data['cost_price'];
+        } elseif (!empty($data['total_cost']) && (float)$data['total_cost'] > 0 && $qty > 0) {
+            $menu->cost_price = round((float)$data['total_cost'] / $qty, 2);
         }
 
         // Tambah saldo master

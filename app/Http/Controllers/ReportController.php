@@ -415,6 +415,8 @@ class ReportController extends Controller
                 'total_discount'    => $this->calculateDelta($current['revenue']['total_discount'], $previous['revenue']['total_discount'], false),
                 'transaction_count' => $this->calculateDelta($current['revenue']['transaction_count'], $previous['revenue']['transaction_count'], true),
                 'avg_order_value'   => $this->calculateDelta($current['revenue']['avg_order_value'], $previous['revenue']['avg_order_value'], true),
+                'nota_generate_net' => $this->calculateDelta($current['revenue']['nota_generate']['net_sales'] ?? 0, $previous['revenue']['nota_generate']['net_sales'] ?? 0, true),
+                'nota_manual_net'   => $this->calculateDelta($current['revenue']['nota_manual']['net_sales'] ?? 0, $previous['revenue']['nota_manual']['net_sales'] ?? 0, true),
             ],
             'cogs' => [
                 'total_cogs'       => $this->calculateDelta($current['cogs']['total_cogs'], $previous['cogs']['total_cogs'], false),
@@ -530,6 +532,8 @@ class ReportController extends Controller
                     'net_sales'         => $netSales,
                     'transaction_count' => $txCount,
                     'avg_order_value'   => $aov,
+                    'nota_generate'     => $pnl['revenue']['nota_generate'] ?? null,
+                    'nota_manual'       => $pnl['revenue']['nota_manual'] ?? null,
                 ],
                 'cogs' => [
                     'total_cogs'       => $totalCogs,
@@ -777,6 +781,17 @@ class ReportController extends Controller
         $orderNumbers = [];
         $itemCount = 0;
 
+        $genGross = 0.0;
+        $genDiscount = 0.0;
+        $genNet = 0.0;
+
+        $manGross = 0.0;
+        $manDiscount = 0.0;
+        $manNet = 0.0;
+
+        $orderIsManual = [];
+        $orderHasDiscount = [];
+
         foreach ($transactions as $t) {
             $subtotal = (float)($t->subtotal > 0 ? $t->subtotal : ($t->total_price + ($t->discount_amount ?? 0)));
             $discount = (float)($t->discount_amount ?? 0);
@@ -787,8 +802,25 @@ class ReportController extends Controller
             $netSales += $net;
             $itemCount += (int)$t->qty;
 
-            if ($t->order_number) {
-                $orderNumbers[$t->order_number] = true;
+            $orderKey = $t->order_number ?: "TRX-{$t->id}";
+            $orderNumbers[$orderKey] = true;
+
+            if ($discount > 0) {
+                $orderHasDiscount[$orderKey] = true;
+            }
+
+            if ($t->is_urgent_note) {
+                $manGross += $subtotal;
+                $manDiscount += $discount;
+                $manNet += $net;
+                $orderIsManual[$orderKey] = true;
+            } else {
+                $genGross += $subtotal;
+                $genDiscount += $discount;
+                $genNet += $net;
+                if (!isset($orderIsManual[$orderKey])) {
+                    $orderIsManual[$orderKey] = false;
+                }
             }
 
             $method = $t->payment_method ?: 'CASH';
@@ -797,6 +829,17 @@ class ReportController extends Controller
 
         $transactionCount = count($orderNumbers);
         $avgOrderValue = $transactionCount > 0 ? round($netSales / $transactionCount, 0) : 0;
+
+        $genOrderCount = 0;
+        $manOrderCount = 0;
+        foreach ($orderIsManual as $k => $isMan) {
+            if ($isMan) {
+                $manOrderCount++;
+            } else {
+                $genOrderCount++;
+            }
+        }
+        $discOrderCount = count($orderHasDiscount);
 
         $methodLabels = [
             'CASH'       => 'Tunai (Cash)',
@@ -825,7 +868,8 @@ class ReportController extends Controller
 
         foreach ($varianceData as $row) {
             $ing = $row['ingredient'];
-            $hargaPerPakai = (float)$ing->harga / max((float)$ing->konversi, 1);
+            $targetOutletId = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
+            $hargaPerPakai = $ing->costPerPakaiForOutlet($targetOutletId);
             $rowRecipeCost = (float)$row['pemakaian_teoritis'] * $hargaPerPakai;
             $cogsRecipes += $rowRecipeCost;
 
@@ -1051,6 +1095,25 @@ class ReportController extends Controller
                 'item_sold_count'    => $itemCount,
                 'avg_order_value'    => $avgOrderValue,
                 'payment_breakdown'  => $paymentBreakdown,
+                'nota_generate'      => [
+                    'gross_sales'       => round($genGross, 2),
+                    'discount'          => round($genDiscount, 2),
+                    'net_sales'         => round($genNet, 2),
+                    'transaction_count' => $genOrderCount,
+                    'share_pct'         => $netSales > 0 ? round(($genNet / $netSales) * 100, 1) : 0,
+                ],
+                'nota_manual'        => [
+                    'gross_sales'       => round($manGross, 2),
+                    'discount'          => round($manDiscount, 2),
+                    'net_sales'         => round($manNet, 2),
+                    'transaction_count' => $manOrderCount,
+                    'share_pct'         => $netSales > 0 ? round(($manNet / $netSales) * 100, 1) : 0,
+                ],
+                'discount_summary'   => [
+                    'total_discount'    => round($totalDiscount, 2),
+                    'discounted_orders' => $discOrderCount,
+                    'avg_discount'      => $discOrderCount > 0 ? round($totalDiscount / $discOrderCount, 2) : 0,
+                ],
             ],
             'cogs' => [
                 'cogs_recipes'          => round($cogsRecipes, 2),
@@ -1157,7 +1220,8 @@ class ReportController extends Controller
             $actualQty = $opname?->actual_qty;
             $hasActual = $actualQty !== null;
 
-            $hargaPerPakai       = $ing->harga / max($ing->konversi, 1);
+            $targetOid = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
+            $hargaPerPakai       = $ing->costPerPakaiForOutlet($targetOid);
             $wasteValue          = round($wasteQty * $hargaPerPakai, 0);
 
             // Pemakaian fisik lapangan (memperhitungkan transfer & batch prep)

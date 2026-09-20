@@ -14,14 +14,16 @@ class OutletMenu extends Model
         'stock',
         'min_stock',
         'price',
+        'cost_price',
         'active',
     ];
 
     protected $casts = [
-        'stock'     => 'float',
-        'min_stock' => 'float',
-        'price'     => 'float',
-        'active'    => 'boolean',
+        'stock'      => 'float',
+        'min_stock'  => 'float',
+        'price'      => 'float',
+        'cost_price' => 'float',
+        'active'     => 'boolean',
     ];
 
     public function outlet()

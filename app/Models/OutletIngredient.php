@@ -11,11 +11,15 @@ class OutletIngredient extends Model
         'ingredient_id',
         'stok_awal',
         'stok_min',
+        'harga',
+        'last_purchase_price',
     ];
 
     protected $casts = [
-        'stok_awal' => 'float',
-        'stok_min'  => 'float',
+        'stok_awal'           => 'float',
+        'stok_min'            => 'float',
+        'harga'               => 'float',
+        'last_purchase_price' => 'float',
     ];
 
     public function outlet()

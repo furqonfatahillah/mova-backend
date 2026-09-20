@@ -41,6 +41,7 @@ class MovementController extends Controller
             'waste_reason'  => 'nullable|string|max:50',
             'qty'           => 'required|numeric|min:0.001',
             'unit_price'    => 'nullable|numeric|min:0',
+            'total_price'   => 'nullable|numeric|min:0',
             'unit_type'     => 'nullable|in:BELI,PAKAI',
             'note'          => 'nullable|string|max:255',
             'outlet_id'     => 'nullable|exists:outlets,id',
@@ -55,7 +56,7 @@ class MovementController extends Controller
         $ingredient = Ingredient::findOrFail($data['ingredient_id']);
         $konversi = max((float)$ingredient->konversi, 1);
 
-        $costBefore = (float)$ingredient->harga / $konversi;
+        $costBefore = $ingredient->costPerPakaiForOutlet($outletId);
         $costAfter  = $costBefore;
         $unitPrice  = null;
         $totalPrice = null;
@@ -69,13 +70,20 @@ class MovementController extends Controller
                 $inputPrice = (float)$request->unit_price;
                 $pricePerPakai = $isUnitBeli ? ($inputPrice / $konversi) : $inputPrice;
                 $pricePerBeli  = $isUnitBeli ? $inputPrice : ($inputPrice * $konversi);
+            } elseif ($request->filled('total_price') && (float)$request->total_price > 0 && (float)$data['qty'] > 0) {
+                $totalInput = (float)$request->total_price;
+                $inputQty = (float)$data['qty'];
+                $pricePerBeli = $isUnitBeli ? ($totalInput / $inputQty) : (($totalInput / $inputQty) * $konversi);
+                $pricePerPakai = $pricePerBeli / $konversi;
             } else {
-                $pricePerBeli  = (float)$ingredient->harga;
+                $pricePerBeli  = $ingredient->hargaForOutlet($outletId);
                 $pricePerPakai = $pricePerBeli / $konversi;
             }
 
             $unitPrice  = $pricePerBeli;
-            $totalPrice = round(($qtyPakai / $konversi) * $pricePerBeli, 2);
+            $totalPrice = $request->filled('total_price') && (float)$request->total_price > 0
+                ? (float)$request->total_price
+                : round(($qtyPakai / $konversi) * $pricePerBeli, 2);
 
             // Calculate Weighted Moving Average Cost
             $avgResult  = $ingredient->recalculateMovingAverage($qtyPakai, $pricePerPakai, $outletId);
@@ -177,7 +185,8 @@ class MovementController extends Controller
             $totalPembelian = $periodData ? (float)$periodData->total_pembelian : 0.0;
 
             $stokAkhir = round($stokAwalPeriod + $totalMasuk - $totalKeluar, 3);
-            $hargaPerPakai = $ing->harga / max($ing->konversi, 1);
+            $hargaBeliOutlet = $ing->hargaForOutlet($outletId);
+            $hargaPerPakai = $hargaBeliOutlet / max($ing->konversi, 1);
             $nilaiStok = round(max($stokAkhir, 0) * $hargaPerPakai, 0);
 
             $isLow = $stokAkhir <= $stokMinOutlet;
@@ -192,7 +201,7 @@ class MovementController extends Controller
                 'unit_pakai'      => $ing->unit_pakai,
                 'unit_beli'       => $ing->unit_beli,
                 'konversi'        => $ing->konversi,
-                'harga_beli'      => (float)$ing->harga,
+                'harga_beli'      => (float)$hargaBeliOutlet,
                 'harga_satuan'    => round($hargaPerPakai, 2),
                 'stok_min'        => $stokMinOutlet,
                 'stok_awal'       => $stokAwalPeriod,
@@ -364,7 +373,7 @@ class MovementController extends Controller
             ];
         }
 
-        $hargaPerPakai = $ingredient->harga / max($ingredient->konversi, 1);
+        $hargaPerPakai = $ingredient->costPerPakaiForOutlet($outletId);
         $stokAkhir = round($running, 3);
         $outletObj = $outletId ? \App\Models\Outlet::find($outletId) : null;
 

@@ -15,9 +15,12 @@ class OpnameController extends Controller
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
 
+        $from = $request->from ?? now()->toDateString();
+        $to   = $request->to   ?? now()->toDateString();
+
         $query = Opname::with(['ingredient', 'user', 'creator', 'updater', 'outlet'])
-            ->where('period_from', $request->from ?? now()->startOfMonth()->toDateString())
-            ->where('period_to',   $request->to   ?? now()->toDateString());
+            ->where('period_from', $from)
+            ->where('period_to',   $to);
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
@@ -59,10 +62,35 @@ class OpnameController extends Controller
 
         $opnameDate = $data['opname_date'] ?? ($existing?->opname_date ? (is_string($existing->opname_date) ? $existing->opname_date : $existing->opname_date->toDateString()) : now()->toDateString());
         $today = now()->toDateString();
-        if (!$existing && $opnameDate < $today) {
+
+        // 1. Tidak boleh tanggal mundur sebelum hari ini
+        if ($opnameDate < $today || $data['period_to'] < $today) {
             return response()->json([
                 'message' => 'Tanggal pelaksanaan opname tidak boleh tanggal mundur (sebelum hari ini).'
             ], 422);
+        }
+
+        // 2. Tidak boleh tanggal mundur dari sesi opname yang telah di-release sebelumnya di cabang ini
+        $latestReleased = Opname::where('outlet_id', $outletId)
+            ->where('is_closed', true)
+            ->where(function ($q) use ($data) {
+                if (!empty($data['opname_no'])) {
+                    $q->where('opname_no', '!=', $data['opname_no']);
+                }
+            })
+            ->orderByDesc('opname_date')
+            ->orderByDesc('period_to')
+            ->first();
+
+        if ($latestReleased) {
+            $latestDate = $latestReleased->opname_date
+                ? (is_string($latestReleased->opname_date) ? $latestReleased->opname_date : $latestReleased->opname_date->toDateString())
+                : $latestReleased->period_to;
+            if ($opnameDate < $latestDate || $data['period_to'] < $latestDate) {
+                return response()->json([
+                    'message' => "Tanggal pelaksanaan opname ({$opnameDate}) tidak boleh mundur dari sesi opname yang telah di-release sebelumnya ({$latestDate})."
+                ], 422);
+            }
         }
 
         if ($existing && $existing->is_closed) {
@@ -159,7 +187,9 @@ class OpnameController extends Controller
 
         $opnameDate = $request->opname_date ?? now()->toDateString();
         $today = now()->toDateString();
-        if ($opnameDate < $today) {
+
+        // 1. Tidak boleh tanggal mundur sebelum hari ini
+        if ($opnameDate < $today || $request->period_to < $today) {
             return response()->json([
                 'message' => 'Tanggal pelaksanaan opname tidak boleh di-inputkan tanggal mundur (sebelum hari ini).'
             ], 422);
@@ -168,6 +198,29 @@ class OpnameController extends Controller
         $outletId = $request->outlet_id ?? $request->user()->outlet_id ?? 1;
         $user = $request->user();
         $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
+
+        // 2. Tidak boleh tanggal mundur dari sesi opname yang telah di-release sebelumnya di cabang ini
+        $latestReleased = Opname::where('outlet_id', $outletId)
+            ->where('is_closed', true)
+            ->where(function ($q) use ($request) {
+                if ($request->filled('opname_no')) {
+                    $q->where('opname_no', '!=', $request->opname_no);
+                }
+            })
+            ->orderByDesc('opname_date')
+            ->orderByDesc('period_to')
+            ->first();
+
+        if ($latestReleased) {
+            $latestDate = $latestReleased->opname_date
+                ? (is_string($latestReleased->opname_date) ? $latestReleased->opname_date : $latestReleased->opname_date->toDateString())
+                : $latestReleased->period_to;
+            if ($opnameDate < $latestDate || $request->period_to < $latestDate) {
+                return response()->json([
+                    'message' => "Tanggal pelaksanaan opname ({$opnameDate}) tidak boleh mundur dari sesi opname yang telah di-release sebelumnya ({$latestDate})."
+                ], 422);
+            }
+        }
 
         // Check if any item in this period & outlet already has a released/closed session
         $existingSession = Opname::where('period_from', $request->period_from)

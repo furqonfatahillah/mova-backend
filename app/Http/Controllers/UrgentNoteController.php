@@ -266,6 +266,7 @@ class UrgentNoteController extends Controller
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->input('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
         $ingredientId = $request->input('ingredient_id');
+        $orderNumber = $request->input('order_number');
         $noteIds = $request->input('note_ids');
 
         $query = UrgentNote::where('business_id', $businessId)->where('status', 'PENDING');
@@ -274,6 +275,9 @@ class UrgentNoteController extends Controller
         }
         if ($ingredientId) {
             $query->where('ingredient_id', $ingredientId);
+        }
+        if ($orderNumber) {
+            $query->where('order_number', $orderNumber);
         }
         if (!empty($noteIds) && is_array($noteIds)) {
             $query->whereIn('id', $noteIds);

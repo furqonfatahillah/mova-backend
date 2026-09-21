@@ -934,14 +934,20 @@ class ReportController extends Controller
             }
         }
 
-        // Tambahkan HPP barang direct retail (non-resep) for target transactions
-        $cogsDirectItems = 0.0;
+        // Compute separate direct items cost for Generate vs Manual
+        $cogsDirectGen = 0.0;
+        $cogsDirectMan = 0.0;
         $directItemsMap = [];
-        foreach ($targetTransactions as $t) {
+
+        foreach ($transactions as $t) {
             $m = $t->menu;
             if ($m && ($m->item_type === 'DIRECT' || (!$m->activeRecipe($t->date) && $m->cost_price > 0))) {
                 $itemCost = (float)($m->cost_price * $t->qty);
-                $cogsDirectItems += $itemCost;
+                if ($t->is_urgent_note) {
+                    $cogsDirectMan += $itemCost;
+                } else {
+                    $cogsDirectGen += $itemCost;
+                }
 
                 if (!isset($directItemsMap[$m->id])) {
                     $directItemsMap[$m->id] = [
@@ -965,6 +971,8 @@ class ReportController extends Controller
 
         usort($topIngredientsUsage, fn($a, $b) => ($b['total_hpp'] ?? $b['cost'] ?? 0) <=> ($a['total_hpp'] ?? $a['cost'] ?? 0));
         $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 15);
+
+        $cogsDirectItems = ($notaType === 'GENERATE') ? $cogsDirectGen : (($notaType === 'MANUAL') ? $cogsDirectMan : ($cogsDirectGen + $cogsDirectMan));
 
         // Apportion recipes & variance when filtered
         $cogsRecipes = round($cogsRecipesBase * $notaRatio, 2);
@@ -1044,6 +1052,28 @@ class ReportController extends Controller
         // 5. LABA BERSIH USAHA (NET OPERATING PROFIT)
         $netProfit = round($operatingProfitAfterWaste - $totalOpex, 2);
         $netMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 1) : 0;
+
+        // Pre-compute Full Parallel Metrics for Generate vs Manual vs Combined
+        $genRatio = $allNet > 0 ? ($genNet / $allNet) : 0.0;
+        $manRatio = $allNet > 0 ? ($manNet / $allNet) : 0.0;
+
+        $cogsGen = ($cogsRecipesBase * $genRatio) + ($cogsVarianceBase * $genRatio) + $cogsDirectGen;
+        $cogsMan = ($cogsRecipesBase * $manRatio) + ($cogsVarianceBase * $manRatio) + $cogsDirectMan;
+        $cogsAll = $cogsRecipesBase + $cogsVarianceBase + ($cogsDirectGen + $cogsDirectMan);
+
+        $wasteGen = $totalWasteLossBase * $genRatio;
+        $wasteMan = $totalWasteLossBase * $manRatio;
+
+        $opexGen = $totalOpexBase * $genRatio;
+        $opexMan = $totalOpexBase * $manRatio;
+
+        $netProfitGen = ($genNet - $cogsGen) - $wasteGen - $opexGen;
+        $netProfitMan = ($manNet - $cogsMan) - $wasteMan - $opexMan;
+        $netProfitAll = ($allNet - $cogsAll) - $totalWasteLossBase - $totalOpexBase;
+
+        $netMarginGen = $genNet > 0 ? round(($netProfitGen / $genNet) * 100, 1) : 0.0;
+        $netMarginMan = $manNet > 0 ? round(($netProfitMan / $manNet) * 100, 1) : 0.0;
+        $netMarginAll = $allNet > 0 ? round(($netProfitAll / $allNet) * 100, 1) : 0.0;
 
         // Health Status Indicator
         $healthStatus = 'PRIME';
@@ -1209,6 +1239,65 @@ class ReportController extends Controller
                 'health_color'   => $healthColor,
             ],
             'waterfall' => $waterfall,
+            'nota_breakdown' => [
+                'generate' => [
+                    'gross_sales'       => round($genGross, 2),
+                    'discount'          => round($genDiscount, 2),
+                    'net_sales'         => round($genNet, 2),
+                    'transaction_count' => count($genOrderNumbers),
+                    'item_sold_count'   => $genItemCount,
+                    'avg_order_value'   => count($genOrderNumbers) > 0 ? round($genNet / count($genOrderNumbers), 0) : 0,
+                    'share_pct'         => $allNet > 0 ? round(($genNet / $allNet) * 100, 1) : 0,
+                    'cogs'              => round($cogsGen, 2),
+                    'cogs_ratio_pct'    => $genNet > 0 ? round(($cogsGen / $genNet) * 100, 1) : 0,
+                    'gross_profit'      => round($genNet - $cogsGen, 2),
+                    'gross_margin_pct'  => $genNet > 0 ? round((($genNet - $cogsGen) / $genNet) * 100, 1) : 0,
+                    'waste'             => round($wasteGen, 2),
+                    'waste_ratio_pct'   => $genNet > 0 ? round(($wasteGen / $genNet) * 100, 1) : 0,
+                    'opex'              => round($opexGen, 2),
+                    'opex_ratio_pct'    => $genNet > 0 ? round(($opexGen / $genNet) * 100, 1) : 0,
+                    'net_profit'        => round($netProfitGen, 2),
+                    'net_margin_pct'    => $netMarginGen,
+                ],
+                'manual' => [
+                    'gross_sales'       => round($manGross, 2),
+                    'discount'          => round($manDiscount, 2),
+                    'net_sales'         => round($manNet, 2),
+                    'transaction_count' => count($manOrderNumbers),
+                    'item_sold_count'   => $manItemCount,
+                    'avg_order_value'   => count($manOrderNumbers) > 0 ? round($manNet / count($manOrderNumbers), 0) : 0,
+                    'share_pct'         => $allNet > 0 ? round(($manNet / $allNet) * 100, 1) : 0,
+                    'cogs'              => round($cogsMan, 2),
+                    'cogs_ratio_pct'    => $manNet > 0 ? round(($cogsMan / $manNet) * 100, 1) : 0,
+                    'gross_profit'      => round($manNet - $cogsMan, 2),
+                    'gross_margin_pct'  => $manNet > 0 ? round((($manNet - $cogsMan) / $manNet) * 100, 1) : 0,
+                    'waste'             => round($wasteMan, 2),
+                    'waste_ratio_pct'   => $manNet > 0 ? round(($wasteMan / $manNet) * 100, 1) : 0,
+                    'opex'              => round($opexMan, 2),
+                    'opex_ratio_pct'    => $manNet > 0 ? round(($opexMan / $manNet) * 100, 1) : 0,
+                    'net_profit'        => round($netProfitMan, 2),
+                    'net_margin_pct'    => $netMarginMan,
+                ],
+                'combined' => [
+                    'gross_sales'       => round($allGross, 2),
+                    'discount'          => round($allDiscount, 2),
+                    'net_sales'         => round($allNet, 2),
+                    'transaction_count' => count($allOrderNumbers),
+                    'item_sold_count'   => $allItemCount,
+                    'avg_order_value'   => count($allOrderNumbers) > 0 ? round($allNet / count($allOrderNumbers), 0) : 0,
+                    'share_pct'         => 100.0,
+                    'cogs'              => round($cogsAll, 2),
+                    'cogs_ratio_pct'    => $allNet > 0 ? round(($cogsAll / $allNet) * 100, 1) : 0,
+                    'gross_profit'      => round($allNet - $cogsAll, 2),
+                    'gross_margin_pct'  => $allNet > 0 ? round((($allNet - $cogsAll) / $allNet) * 100, 1) : 0,
+                    'waste'             => round($totalWasteLossBase, 2),
+                    'waste_ratio_pct'   => $allNet > 0 ? round(($totalWasteLossBase / $allNet) * 100, 1) : 0,
+                    'opex'              => round($totalOpexBase, 2),
+                    'opex_ratio_pct'    => $allNet > 0 ? round(($totalOpexBase / $allNet) * 100, 1) : 0,
+                    'net_profit'        => round($netProfitAll, 2),
+                    'net_margin_pct'    => $netMarginAll,
+                ],
+            ],
         ];
     }
 

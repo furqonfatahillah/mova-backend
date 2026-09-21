@@ -2,19 +2,32 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Category;
 use App\Models\Ingredient;
 use Illuminate\Http\Request;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 
 class IngredientController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Ingredient::with(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements'])
+        $query = Ingredient::with(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements', 'categoryModel'])
             ->orderBy('code');
 
         if ($request->filled('type') && in_array($request->type, ['RAW', 'SEMI_FINISHED'])) {
             $query->where('type', $request->type);
+        }
+
+        if ($request->filled('category')) {
+            $query->where(function ($q) use ($request) {
+                $q->where('category', $request->category)
+                  ->orWhereHas('categoryModel', fn($cq) => $cq->where('name', $request->category));
+            });
+        }
+
+        if ($request->filled('category_id')) {
+            $query->where('category_id', $request->category_id);
         }
 
         $ingredients = $query->get();
@@ -45,33 +58,49 @@ class IngredientController extends Controller
                     return $businessId ? $query->where('business_id', $businessId) : $query;
                 }),
             ],
-            'name'       => 'required|string|max:255',
-            'category'   => 'required|string|max:100',
-            'type'       => 'nullable|string|in:RAW,SEMI_FINISHED',
-            'unit_beli'  => 'required|string|max:20',
-            'unit_pakai' => 'required|string|max:20',
-            'konversi'   => 'required|numeric|min:0.001',
-            'harga'      => 'required|numeric|min:0',
-            'stok_awal'  => 'nullable|numeric|min:0',
-            'stok_min'   => 'nullable|numeric|min:0',
-            'tolerance'  => 'nullable|numeric|min:0|max:100',
-            'yield_qty'  => 'nullable|numeric|min:0',
-            'yield_unit' => 'nullable|string|max:20',
-            'active'     => 'nullable|boolean',
+            'name'        => 'required|string|max:255',
+            'category'    => 'nullable|string|max:100',
+            'category_id' => 'nullable|integer',
+            'type'        => 'nullable|string|in:RAW,SEMI_FINISHED',
+            'unit_beli'   => 'required|string|max:20',
+            'unit_pakai'  => 'required|string|max:20',
+            'konversi'    => 'required|numeric|min:0.001',
+            'harga'       => 'required|numeric|min:0',
+            'stok_awal'   => 'nullable|numeric|min:0',
+            'stok_min'    => 'nullable|numeric|min:0',
+            'tolerance'   => 'nullable|numeric|min:0|max:100',
+            'yield_qty'   => 'nullable|numeric|min:0',
+            'yield_unit'  => 'nullable|string|max:20',
+            'active'      => 'nullable|boolean',
         ]);
+
+        if (!empty($data['category_id'])) {
+            $cat = Category::find($data['category_id']);
+            if ($cat) {
+                $data['category'] = $cat->name;
+            }
+        } elseif (!empty($data['category'])) {
+            $cat = Category::firstOrCreate(
+                ['business_id' => $businessId, 'name' => trim($data['category']), 'type' => 'INGREDIENT'],
+                ['slug' => Str::slug($data['category']), 'color' => '#00B14F', 'icon' => 'Package']
+            );
+            $data['category_id'] = $cat->id;
+        } else {
+            $data['category'] = 'Perlengkapan';
+        }
 
         $data['type'] = $data['type'] ?? 'RAW';
         $data['created_by'] = $request->user()?->id;
 
         $ingredient = Ingredient::create($data);
-        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
+        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements', 'categoryModel']);
         $ingredient->append(['current_stock', 'current_stok_min', 'current_harga', 'outlet_stocks']);
         return response()->json($ingredient, 201);
     }
 
     public function show(Ingredient $ingredient)
     {
-        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
+        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements', 'categoryModel']);
         $ingredient->append(['current_stock', 'current_stok_min', 'current_harga', 'outlet_stocks']);
         if ($ingredient->current_harga > 0) {
             $ingredient->harga = $ingredient->current_harga;
@@ -90,25 +119,39 @@ class IngredientController extends Controller
                     return $businessId ? $query->where('business_id', $businessId) : $query;
                 })->ignore($ingredient->id),
             ],
-            'name'       => 'sometimes|string|max:255',
-            'category'   => 'sometimes|string|max:100',
-            'type'       => 'nullable|string|in:RAW,SEMI_FINISHED',
-            'unit_beli'  => 'sometimes|string|max:20',
-            'unit_pakai' => 'sometimes|string|max:20',
-            'konversi'   => 'sometimes|numeric|min:0.001',
-            'harga'      => 'sometimes|numeric|min:0',
-            'stok_awal'  => 'nullable|numeric|min:0',
-            'stok_min'   => 'nullable|numeric|min:0',
-            'tolerance'  => 'nullable|numeric|min:0|max:100',
-            'yield_qty'  => 'nullable|numeric|min:0',
-            'yield_unit' => 'nullable|string|max:20',
-            'active'     => 'nullable|boolean',
+            'name'        => 'sometimes|string|max:255',
+            'category'    => 'sometimes|string|max:100',
+            'category_id' => 'nullable|integer',
+            'type'        => 'nullable|string|in:RAW,SEMI_FINISHED',
+            'unit_beli'   => 'sometimes|string|max:20',
+            'unit_pakai'  => 'sometimes|string|max:20',
+            'konversi'    => 'sometimes|numeric|min:0.001',
+            'harga'       => 'sometimes|numeric|min:0',
+            'stok_awal'   => 'nullable|numeric|min:0',
+            'stok_min'    => 'nullable|numeric|min:0',
+            'tolerance'   => 'nullable|numeric|min:0|max:100',
+            'yield_qty'   => 'nullable|numeric|min:0',
+            'yield_unit'  => 'nullable|string|max:20',
+            'active'      => 'nullable|boolean',
         ]);
+
+        if (array_key_exists('category_id', $data) && !empty($data['category_id'])) {
+            $cat = Category::find($data['category_id']);
+            if ($cat) {
+                $data['category'] = $cat->name;
+            }
+        } elseif (!empty($data['category'])) {
+            $cat = Category::firstOrCreate(
+                ['business_id' => $businessId, 'name' => trim($data['category']), 'type' => 'INGREDIENT'],
+                ['slug' => Str::slug($data['category']), 'color' => '#00B14F', 'icon' => 'Package']
+            );
+            $data['category_id'] = $cat->id;
+        }
 
         $data['updated_by'] = $request->user()?->id;
 
         $ingredient->update($data);
-        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements']);
+        $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements', 'categoryModel']);
         $ingredient->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
         return response()->json($ingredient);
     }

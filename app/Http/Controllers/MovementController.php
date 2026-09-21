@@ -198,6 +198,7 @@ class MovementController extends Controller
                 'code'            => $ing->code,
                 'name'            => $ing->name,
                 'category'        => $ing->category,
+                'type'            => $ing->type ?? 'RAW',
                 'unit_pakai'      => $ing->unit_pakai,
                 'unit_beli'       => $ing->unit_beli,
                 'konversi'        => $ing->konversi,

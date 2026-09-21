@@ -16,6 +16,17 @@ class CustomerController extends Controller
     {
         $businessId = $request->user()->business_id;
 
+        // Auto-assign code to legacy customer records if any missing
+        $missingCodes = Customer::where('business_id', $businessId)
+            ->where(function ($q) {
+                $q->whereNull('code')->orWhere('code', '');
+            })
+            ->get();
+
+        foreach ($missingCodes as $mc) {
+            $mc->update(['code' => Customer::generateCode($businessId)]);
+        }
+
         $query = Customer::with(['creator', 'updater'])
             ->orderByDesc('id');
 
@@ -75,7 +86,6 @@ class CustomerController extends Controller
         $validated = $request->validate([
             'name'       => 'required|string|max:100',
             'phone'      => 'required|string|max:30',
-            'code'       => 'nullable|string|max:30',
             'email'      => 'nullable|email|max:100',
             'address'    => 'nullable|string|max:500',
             'birth_date' => 'nullable|date',
@@ -94,16 +104,8 @@ class CustomerController extends Controller
             ], 422);
         }
 
-        // Auto-generate code if not provided
-        $code = !empty($validated['code']) ? strtoupper(trim($validated['code'])) : Customer::generateCode($businessId);
-
-        $codeExists = Customer::where('business_id', $businessId)
-            ->where('code', $code)
-            ->exists();
-
-        if ($codeExists) {
-            $code = Customer::generateCode($businessId);
-        }
+        // Kode member 100% otomatis digenerate oleh sistem
+        $code = Customer::generateCode($businessId);
 
         $customer = Customer::create([
             'business_id'  => $businessId,
@@ -179,7 +181,6 @@ class CustomerController extends Controller
         $validated = $request->validate([
             'name'         => 'required|string|max:100',
             'phone'        => 'required|string|max:30',
-            'code'         => 'nullable|string|max:30',
             'email'        => 'nullable|email|max:100',
             'address'      => 'nullable|string|max:500',
             'birth_date'   => 'nullable|date',
@@ -200,19 +201,8 @@ class CustomerController extends Controller
             ], 422);
         }
 
-        if (!empty($validated['code'])) {
-            $code = strtoupper(trim($validated['code']));
-            $codeExists = Customer::where('business_id', $businessId)
-                ->where('code', $code)
-                ->where('id', '!=', $customer->id)
-                ->exists();
-
-            if ($codeExists) {
-                return response()->json([
-                    'message' => "Kode member '{$code}' sudah digunakan."
-                ], 422);
-            }
-            $customer->code = $code;
+        if (empty($customer->code)) {
+            $customer->code = Customer::generateCode($businessId);
         }
 
         $customer->name = trim($validated['name']);

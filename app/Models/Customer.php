@@ -107,12 +107,34 @@ class Customer extends Model
     }
 
     /**
-     * Generate unique customer code for a business: e.g. MBR-0001
+     * Generate unique customer code for a business: e.g. MBR-0001, MBR-0002
      */
     public static function generateCode(int $businessId): string
     {
-        $lastId = static::where('business_id', $businessId)->max('id') ?? 0;
-        $nextSeq = $lastId + 1;
-        return sprintf("MBR-%04d", $nextSeq);
+        $codes = static::where('business_id', $businessId)
+            ->whereNotNull('code')
+            ->where('code', '!=', '')
+            ->pluck('code');
+
+        $maxSeq = 0;
+        foreach ($codes as $c) {
+            if (preg_match('/^MBR-(\d+)$/i', trim($c), $matches)) {
+                $num = (int)$matches[1];
+                if ($num > $maxSeq) {
+                    $maxSeq = $num;
+                }
+            }
+        }
+
+        $nextSeq = $maxSeq + 1;
+        $code = sprintf("MBR-%04d", $nextSeq);
+
+        // Ensure absolute uniqueness
+        while (static::where('business_id', $businessId)->where('code', $code)->exists()) {
+            $nextSeq++;
+            $code = sprintf("MBR-%04d", $nextSeq);
+        }
+
+        return $code;
     }
 }

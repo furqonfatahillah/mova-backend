@@ -10,6 +10,8 @@ use App\Models\TransactionModifier;
 use App\Models\Discount;
 use App\Models\UrgentNote;
 use App\Models\OutletMenu;
+use App\Models\Customer;
+use App\Models\PointRedemption;
 use App\Services\CoinService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -192,18 +194,19 @@ class TransactionController extends Controller
     /**
      * Helper to resolve discount calculation & metadata for an order.
      */
-    private function resolveDiscountDetails(array $data, float $grossSubtotal, ?int $outletId, string $date, int $businessId): array
+    private function resolveDiscountDetails(array $data, float $grossSubtotal, ?int $outletId, string $date, int $businessId, ?int $customerId = null): array
     {
         $discount = null;
         if (!empty($data['discount_id'])) {
-            $discount = Discount::where('business_id', $businessId)->find($data['discount_id']);
+            $discount = Discount::with('rewardMenu')->where('business_id', $businessId)->find($data['discount_id']);
         } elseif (!empty($data['discount_code'])) {
             $code = strtoupper(trim($data['discount_code']));
-            $discount = Discount::where('business_id', $businessId)->where('code', $code)->first();
+            $discount = Discount::with('rewardMenu')->where('business_id', $businessId)->where('code', $code)->first();
         }
 
         if ($discount) {
-            $check = $discount->validateForOrder($grossSubtotal, $outletId, $date);
+            $customer = $customerId ? Customer::find($customerId) : null;
+            $check = $discount->validateForOrder($grossSubtotal, $outletId, $date, $customer);
             if ($check['valid']) {
                 $amount = $discount->calculateDiscountAmount($grossSubtotal);
                 return [
@@ -272,7 +275,7 @@ class TransactionController extends Controller
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
 
-        $query = Transaction::with(['menu', 'user', 'outlet', 'shift', 'creator', 'updater', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient'])
+        $query = Transaction::with(['menu', 'user', 'outlet', 'shift', 'creator', 'updater', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient', 'customer'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
@@ -347,6 +350,7 @@ class TransactionController extends Controller
                 'shift_id'                     => 'nullable|exists:shifts,id',
                 'outlet_id'                    => 'nullable|exists:outlets,id',
                 'customer_name'                => 'nullable|string|max:100',
+                'customer_id'                  => 'nullable|exists:customers,id',
                 'order_type'                   => 'nullable|string|in:DINE_IN,TAKEAWAY,DELIVERY',
                 'table_number'                 => 'nullable|string|max:50',
                 'payment_method'               => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
@@ -429,12 +433,14 @@ class TransactionController extends Controller
 
             // Calculate Gross Subtotal & Resolve Discount
             $orderGrossSubtotal = $orderTotal;
+            $customerId = !empty($data['customer_id']) ? (int)$data['customer_id'] : null;
             $discInfo = $this->resolveDiscountDetails(
                 $data,
                 $orderGrossSubtotal,
                 $outletId,
                 $data['date'],
-                (int)($request->user()->business_id ?? 1)
+                (int)($request->user()->business_id ?? 1),
+                $customerId
             );
             $totalDiscountAmount = $discInfo['discount_amount'];
             $orderNetTotal = max(0, $orderGrossSubtotal - $totalDiscountAmount);
@@ -460,7 +466,7 @@ class TransactionController extends Controller
             unset($prep);
 
             $createdTransactions = DB::transaction(function () use (
-                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $outletId, $businessId, $request, $discInfo, $isUrgentOrder
+                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $outletId, $businessId, $request, $discInfo, $isUrgentOrder, $customerId, $orderNetTotal
             ) {
                 $results = [];
 
@@ -486,6 +492,7 @@ class TransactionController extends Controller
                         'amount_paid'     => $orderStatus === 'HOLD' ? 0 : ($data['amount_paid'] ?? null),
                         'change_amount'   => $orderStatus === 'HOLD' ? 0 : ($data['change_amount'] ?? null),
                         'customer_name'   => $data['customer_name'] ?? null,
+                        'customer_id'     => $customerId,
                         'order_type'      => $data['order_type'] ?? 'DINE_IN',
                         'table_number'    => $data['table_number'] ?? null,
                         'payment_method'  => $data['payment_method'] ?? 'CASH',
@@ -647,6 +654,29 @@ class TransactionController extends Controller
                     $discInfo['model']->increment('used_count');
                 }
 
+                // Member Point System: Add +1 point per PAID transaction and handle point promo redemption
+                if ($orderStatus === 'PAID' && $customerId) {
+                    $customer = Customer::find($customerId);
+                    if ($customer) {
+                        $customer->recordVisit($orderNetTotal, 1);
+
+                        // If promo requires member points, deduct points and log redemption
+                        if (!empty($discInfo['model']) && (int)($discInfo['model']->requires_points ?? 0) > 0) {
+                            $pts = (int)$discInfo['model']->requires_points;
+                            $customer->usePoints($pts);
+                            PointRedemption::create([
+                                'business_id'  => $businessId,
+                                'customer_id'  => $customer->id,
+                                'discount_id'  => $discInfo['model']->id,
+                                'order_number' => $orderNumber,
+                                'points_used'  => $pts,
+                                'description'  => "Penukaran {$pts} poin promo '{$discInfo['model']->name}' pada nota {$orderNumber}",
+                                'created_by'   => $request->user()->id,
+                            ]);
+                        }
+                    }
+                }
+
                 // Deduct SaaS platform coins for completed nota
                 if ($orderStatus === 'PAID') {
                     CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
@@ -660,6 +690,8 @@ class TransactionController extends Controller
                 'status'          => $orderStatus,
                 'date'            => $data['date'],
                 'customer_name'   => $data['customer_name'] ?? null,
+                'customer_id'     => $customerId,
+                'customer'        => $customerId ? Customer::find($customerId) : null,
                 'order_type'      => $data['order_type'] ?? 'DINE_IN',
                 'table_number'    => $data['table_number'] ?? null,
                 'payment_method'  => $data['payment_method'] ?? 'CASH',
@@ -718,6 +750,7 @@ class TransactionController extends Controller
             'shift_id'                    => 'nullable|exists:shifts,id',
             'outlet_id'                   => 'nullable|exists:outlets,id',
             'customer_name'               => 'nullable|string|max:100',
+            'customer_id'                 => 'nullable|exists:customers,id',
             'order_type'                  => 'nullable|string|in:DINE_IN,TAKEAWAY,DELIVERY',
             'table_number'                => 'nullable|string|max:50',
             'payment_method'              => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
@@ -788,6 +821,7 @@ class TransactionController extends Controller
                 'amount_paid'    => $orderStatus === 'HOLD' ? 0 : ($data['amount_paid'] ?? null),
                 'change_amount'  => $orderStatus === 'HOLD' ? 0 : ($data['change_amount'] ?? null),
                 'customer_name'  => $data['customer_name'] ?? null,
+                'customer_id'    => $data['customer_id'] ?? null,
                 'order_type'     => $data['order_type'] ?? 'DINE_IN',
                 'table_number'   => $data['table_number'] ?? null,
                 'payment_method' => $data['payment_method'] ?? 'CASH',
@@ -870,6 +904,14 @@ class TransactionController extends Controller
                             $item->unit
                         );
                     }
+                }
+            }
+
+            // Point system for single-item
+            if ($orderStatus === 'PAID' && !empty($data['customer_id'])) {
+                $customer = Customer::find($data['customer_id']);
+                if ($customer) {
+                    $customer->recordVisit($totalItemPrice, 1);
                 }
             }
 
@@ -1012,6 +1054,7 @@ class TransactionController extends Controller
             'payment_method'  => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
             'amount_paid'     => 'required|numeric|min:0',
             'change_amount'   => 'nullable|numeric|min:0',
+            'customer_id'     => 'nullable|exists:customers,id',
             'notes'           => 'nullable|string|max:500',
             'discount_id'     => 'nullable|exists:discounts,id',
             'discount_code'   => 'nullable|string|max:50',
@@ -1021,7 +1064,7 @@ class TransactionController extends Controller
             'discount_rate'   => 'nullable|numeric|min:0',
         ]);
 
-        $transactions = Transaction::with(['menu.recipes.items.ingredient', 'modifiers.ingredient', 'outlet', 'urgentNotes'])
+        $transactions = Transaction::with(['menu.recipes.items.ingredient', 'modifiers.ingredient', 'outlet', 'urgentNotes', 'customer'])
             ->where('order_number', $orderNumber)
             ->where('status', 'HOLD')
             ->get();
@@ -1062,8 +1105,9 @@ class TransactionController extends Controller
             $shiftId = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->value('id');
         }
 
+        $customerId = !empty($data['customer_id']) ? (int)$data['customer_id'] : ($first->customer_id ?? null);
         $grossSubtotal = (float)$transactions->sum(fn($t) => (float)($t->subtotal ?: $t->total_price));
-        $discInfo = $this->resolveDiscountDetails($data, $grossSubtotal, $outletId, $date, $businessId);
+        $discInfo = $this->resolveDiscountDetails($data, $grossSubtotal, $outletId, $date, $businessId, $customerId);
         $totalDiscount = $discInfo['discount_amount'];
         $totalOrder = max(0, $grossSubtotal - $totalDiscount);
 
@@ -1076,7 +1120,7 @@ class TransactionController extends Controller
 
         $changeAmount = (float)($data['change_amount'] ?? max(0, $amountPaid - $totalOrder));
 
-        DB::transaction(function () use ($transactions, $data, $shiftId, $discInfo, $grossSubtotal, $amountPaid, $changeAmount, $date, $outletId, $businessId, $orderNumber, $request) {
+        DB::transaction(function () use ($transactions, $data, $shiftId, $discInfo, $grossSubtotal, $amountPaid, $changeAmount, $date, $outletId, $businessId, $orderNumber, $request, $customerId, $totalOrder) {
             $accumulatedDisc = 0;
             $itemsCount = $transactions->count();
 
@@ -1103,6 +1147,7 @@ class TransactionController extends Controller
                 $t->shift_id = $shiftId;
                 $t->user_id = $request->user()->id;
                 $t->status = 'PAID';
+                $t->customer_id = $customerId;
                 $t->payment_method = $data['payment_method'];
                 $t->amount_paid = $amountPaid;
                 $t->change_amount = $changeAmount;
@@ -1178,6 +1223,27 @@ class TransactionController extends Controller
                 $discInfo['model']->increment('used_count');
             }
 
+            // Member point earning and point redemption on open bill completion
+            if ($customerId) {
+                $customer = Customer::find($customerId);
+                if ($customer) {
+                    $customer->recordVisit($totalOrder, 1);
+                    if ($discInfo && !empty($discInfo['model']) && (int)($discInfo['model']->requires_points ?? 0) > 0) {
+                        $pts = (int)$discInfo['model']->requires_points;
+                        $customer->usePoints($pts);
+                        PointRedemption::create([
+                            'business_id'  => $businessId,
+                            'customer_id'  => $customer->id,
+                            'discount_id'  => $discInfo['model']->id,
+                            'order_number' => $orderNumber,
+                            'points_used'  => $pts,
+                            'description'  => "Penukaran {$pts} poin promo '{$discInfo['model']->name}' pada pelunasan tagihan {$orderNumber}",
+                            'created_by'   => $request->user()->id,
+                        ]);
+                    }
+                }
+            }
+
             // Deduct SaaS platform coins for completed nota
             CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
         });
@@ -1189,6 +1255,8 @@ class TransactionController extends Controller
             'status'         => 'PAID',
             'table_number'   => $first->table_number,
             'customer_name'  => $first->customer_name,
+            'customer_id'    => $customerId,
+            'customer'       => $customerId ? Customer::find($customerId) : null,
             'payment_method' => $data['payment_method'],
             'subtotal'       => $grossSubtotal,
             'discount_amount'=> $discInfo ? $discInfo['discount_amount'] : (float)$transactions->sum('discount_amount'),

@@ -32,6 +32,7 @@ class Transaction extends Model
         'amount_paid',
         'change_amount',
         'customer_name',
+        'customer_id',
         'order_type',
         'table_number',
         'payment_method',
@@ -125,5 +126,10 @@ class Transaction extends Model
     public function urgentNotes()
     {
         return $this->hasMany(UrgentNote::class);
+    }
+
+    public function customer()
+    {
+        return $this->belongsTo(Customer::class);
     }
 }

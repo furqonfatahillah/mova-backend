@@ -16,6 +16,9 @@ class Discount extends Model
         'code',
         'type', // 'PERCENTAGE' or 'FIXED'
         'value',
+        'requires_points',
+        'reward_type', // 'DISCOUNT' or 'FREE_MENU'
+        'reward_menu_id',
         'scope', // 'TRANSACTION', 'CATEGORY', 'MENU_ITEM'
         'scope_target_id',
         'min_order_amount',
@@ -34,6 +37,7 @@ class Discount extends Model
 
     protected $casts = [
         'value'               => 'float',
+        'requires_points'     => 'integer',
         'min_order_amount'    => 'float',
         'max_discount_amount' => 'float',
         'is_auto_apply'       => 'boolean',
@@ -54,6 +58,11 @@ class Discount extends Model
     public function outlet()
     {
         return $this->belongsTo(Outlet::class);
+    }
+
+    public function rewardMenu()
+    {
+        return $this->belongsTo(Menu::class, 'reward_menu_id');
     }
 
     public function transactions()
@@ -93,6 +102,9 @@ class Discount extends Model
 
     public function getFormattedValueAttribute(): string
     {
+        if ($this->reward_type === 'FREE_MENU' && $this->relationLoaded('rewardMenu') && $this->rewardMenu) {
+            return 'Free ' . $this->rewardMenu->name;
+        }
         if ($this->type === 'PERCENTAGE') {
             return rtrim(rtrim(number_format($this->value, 2, '.', ''), '0'), '.') . '%';
         }
@@ -106,9 +118,9 @@ class Discount extends Model
     }
 
     /**
-     * Check if this discount is valid for a given order subtotal, outlet, and date.
+     * Check if this discount is valid for a given order subtotal, outlet, date, and optional customer.
      */
-    public function validateForOrder(float $subtotal, ?int $outletId = null, ?string $date = null): array
+    public function validateForOrder(float $subtotal, ?int $outletId = null, ?string $date = null, ?Customer $customer = null): array
     {
         if (!$this->active) {
             return ['valid' => false, 'message' => "Promo '{$this->name}' saat ini tidak aktif."];
@@ -134,6 +146,22 @@ class Discount extends Model
         if ($this->min_order_amount > 0 && $subtotal < $this->min_order_amount) {
             $formattedMin = 'Rp ' . number_format($this->min_order_amount, 0, ',', '.');
             return ['valid' => false, 'message' => "Minimal belanja {$formattedMin} untuk menggunakan promo '{$this->name}'."];
+        }
+
+        // Validate member points requirement
+        if ($this->requires_points && $this->requires_points > 0) {
+            if (!$customer) {
+                return [
+                    'valid' => false,
+                    'message' => "Promo '{$this->name}' memerlukan penukaran {$this->requires_points} poin member. Pilih member terlebih dahulu."
+                ];
+            }
+            if (!$customer->hasEnoughPoints($this->requires_points)) {
+                return [
+                    'valid' => false,
+                    'message' => "Poin member {$customer->name} tidak mencukupi ({$customer->total_points}/{$this->requires_points} poin)."
+                ];
+            }
         }
 
         return ['valid' => true, 'message' => 'Promo valid'];

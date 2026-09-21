@@ -27,6 +27,7 @@ use App\Http\Controllers\UnitController;
 use App\Http\Controllers\ExpenseCategoryController;
 use App\Http\Controllers\PaymentMethodController;
 use App\Http\Controllers\ReceivableController;
+use App\Http\Controllers\CustomerController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -87,6 +88,10 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/menus/{menu}/recipes', [MenuController::class, 'storeRecipe']);
     Route::post('/menus/{menu}/restock', [MenuController::class, 'restock']);
     Route::apiResource('outlets', OutletController::class);
+
+    // Master Customer / Member & Poin
+    Route::get('/customers/search-pos', [CustomerController::class, 'searchForPos']);
+    Route::apiResource('customers', CustomerController::class);
 
     // Menu Modifiers / Options & Addons
     Route::apiResource('modifier-groups', ModifierController::class);

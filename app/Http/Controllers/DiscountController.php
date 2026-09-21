@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\Discount;
+use App\Models\Customer;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -10,7 +11,7 @@ class DiscountController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Discount::with(['outlet', 'creator', 'updater'])
+        $query = Discount::with(['outlet', 'rewardMenu', 'creator', 'updater'])
             ->orderByDesc('id');
 
         if ($request->has('active') && $request->active !== '' && $request->active !== 'ALL') {
@@ -62,7 +63,10 @@ class DiscountController extends Controller
             'name'                => 'required|string|max:100',
             'code'                => 'nullable|string|max:50',
             'type'                => 'required|string|in:PERCENTAGE,FIXED',
-            'value'               => 'required|numeric|min:0.01',
+            'value'               => 'required|numeric|min:0',
+            'requires_points'     => 'nullable|integer|min:0',
+            'reward_type'         => 'nullable|string|in:DISCOUNT,FREE_MENU',
+            'reward_menu_id'      => 'nullable|exists:menus,id',
             'scope'               => 'nullable|string|in:TRANSACTION,CATEGORY,MENU_ITEM',
             'scope_target_id'     => 'nullable|integer',
             'min_order_amount'    => 'nullable|numeric|min:0',
@@ -93,14 +97,14 @@ class DiscountController extends Controller
         $validated['used_count']  = 0;
 
         $discount = Discount::create($validated);
-        $discount->load(['outlet', 'creator']);
+        $discount->load(['outlet', 'rewardMenu', 'creator']);
 
         return response()->json($discount, 201);
     }
 
     public function show(Discount $discount)
     {
-        $discount->load(['outlet', 'creator', 'updater']);
+        $discount->load(['outlet', 'rewardMenu', 'creator', 'updater']);
         return response()->json($discount);
     }
 
@@ -112,7 +116,10 @@ class DiscountController extends Controller
             'name'                => 'required|string|max:100',
             'code'                => 'nullable|string|max:50',
             'type'                => 'required|string|in:PERCENTAGE,FIXED',
-            'value'               => 'required|numeric|min:0.01',
+            'value'               => 'required|numeric|min:0',
+            'requires_points'     => 'nullable|integer|min:0',
+            'reward_type'         => 'nullable|string|in:DISCOUNT,FREE_MENU',
+            'reward_menu_id'      => 'nullable|exists:menus,id',
             'scope'               => 'nullable|string|in:TRANSACTION,CATEGORY,MENU_ITEM',
             'scope_target_id'     => 'nullable|integer',
             'min_order_amount'    => 'nullable|numeric|min:0',
@@ -141,7 +148,7 @@ class DiscountController extends Controller
 
         $validated['updated_by'] = $request->user()->id;
         $discount->update($validated);
-        $discount->load(['outlet', 'creator', 'updater']);
+        $discount->load(['outlet', 'rewardMenu', 'creator', 'updater']);
 
         return response()->json($discount);
     }
@@ -181,7 +188,8 @@ class DiscountController extends Controller
         $outletId = $request->outlet_id ?? $request->user()->outlet_id;
         $date = $request->date ?? date('Y-m-d');
 
-        $discounts = Discount::validNow($date)
+        $discounts = Discount::with('rewardMenu')
+            ->validNow($date)
             ->where(function ($q) use ($outletId) {
                 if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
                     $q->whereNull('outlet_id')->orWhere('outlet_id', $outletId);
@@ -200,10 +208,11 @@ class DiscountController extends Controller
     public function validateCode(Request $request)
     {
         $data = $request->validate([
-            'code'      => 'required|string',
-            'subtotal'  => 'required|numeric|min:0',
-            'outlet_id' => 'nullable|integer',
-            'date'      => 'nullable|date',
+            'code'        => 'required|string',
+            'subtotal'    => 'required|numeric|min:0',
+            'outlet_id'   => 'nullable|integer',
+            'date'        => 'nullable|date',
+            'customer_id' => 'nullable|integer',
         ]);
 
         $code = strtoupper(trim($data['code']));
@@ -211,7 +220,8 @@ class DiscountController extends Controller
         $outletId = !empty($data['outlet_id']) ? (int)$data['outlet_id'] : $request->user()->outlet_id;
         $date = $data['date'] ?? date('Y-m-d');
 
-        $discount = Discount::where('code', $code)
+        $discount = Discount::with('rewardMenu')
+            ->where('code', $code)
             ->where('business_id', $request->user()->business_id)
             ->first();
 
@@ -222,7 +232,8 @@ class DiscountController extends Controller
             ], 422);
         }
 
-        $check = $discount->validateForOrder($subtotal, $outletId, $date);
+        $customer = !empty($data['customer_id']) ? Customer::find($data['customer_id']) : null;
+        $check = $discount->validateForOrder($subtotal, $outletId, $date, $customer);
         if (!$check['valid']) {
             return response()->json([
                 'valid'   => false,

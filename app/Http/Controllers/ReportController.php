@@ -846,6 +846,7 @@ class ReportController extends Controller
             'QRIS'       => 'QRIS (GoPay/OVO/ShopeePay)',
             'TRANSFER'   => 'Transfer Bank',
             'DEBIT'      => 'Kartu Debit / EDC',
+            'GRAB'       => 'Grab / GrabFood',
             'PETTY_CASH' => 'Kas Kecil',
         ];
         $paymentBreakdown = [];

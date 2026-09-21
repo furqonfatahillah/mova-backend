@@ -23,7 +23,7 @@ class PaymentMethodController extends Controller
         $data = $request->validate([
             'code'       => 'required|string|max:50',
             'name'       => 'required|string|max:100',
-            'type'       => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,OTHER',
+            'type'       => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,OTHER',
             'active'     => 'nullable|boolean',
             'sort_order' => 'nullable|integer',
         ]);
@@ -39,7 +39,7 @@ class PaymentMethodController extends Controller
     {
         $data = $request->validate([
             'name'       => 'sometimes|string|max:100',
-            'type'       => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,OTHER',
+            'type'       => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,OTHER',
             'active'     => 'nullable|boolean',
             'sort_order' => 'nullable|integer',
         ]);

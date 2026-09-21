@@ -174,6 +174,19 @@ class Discount extends Model
     {
         if ($subtotal <= 0) return 0.0;
 
+        if ($this->reward_type === 'FREE_MENU') {
+            $menuPrice = 0.0;
+            if ($this->relationLoaded('rewardMenu') && $this->rewardMenu) {
+                $menuPrice = (float)$this->rewardMenu->price;
+            } elseif ($this->reward_menu_id) {
+                $menu = Menu::find($this->reward_menu_id);
+                $menuPrice = (float)($menu?->price ?? 0);
+            }
+            if ($menuPrice > 0) {
+                return round(min($menuPrice, $subtotal), 2);
+            }
+        }
+
         if ($this->type === 'PERCENTAGE') {
             $disc = ($subtotal * ($this->value / 100.0));
             if ($this->max_discount_amount !== null && $this->max_discount_amount > 0) {

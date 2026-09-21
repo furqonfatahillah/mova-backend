@@ -82,6 +82,13 @@ class UrgentNoteController extends Controller
             $baseQuery->where('outlet_id', $outletId);
         }
 
+        if ($request->filled('from')) {
+            $baseQuery->whereDate('created_at', '>=', $request->from);
+        }
+        if ($request->filled('to')) {
+            $baseQuery->whereDate('created_at', '<=', $request->to);
+        }
+
         $pendingCount = (clone $baseQuery)->where('status', 'PENDING')->count();
         $pendingTransactionsCount = (clone $baseQuery)->where('status', 'PENDING')->distinct('order_number')->count('order_number');
         $resolvedCount = (clone $baseQuery)->where('status', 'RESOLVED')->count();

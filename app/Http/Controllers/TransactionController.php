@@ -281,6 +281,22 @@ class TransactionController extends Controller
         if ($request->menu_id)      $query->where('menu_id', $request->menu_id);
         if ($request->order_number) $query->where('order_number', $request->order_number);
         if ($request->shift_id)     $query->where('shift_id', $request->shift_id);
+
+        if ($request->filled('payment_method') && $request->payment_method !== 'ALL' && $request->payment_method !== 'all') {
+            $query->where('payment_method', $request->payment_method);
+        }
+
+        if ($request->filled('search')) {
+            $s = trim($request->search);
+            $query->where(function ($q) use ($s) {
+                $q->where('order_number', 'like', "%{$s}%")
+                  ->orWhere('customer_name', 'like', "%{$s}%")
+                  ->orWhere('table_number', 'like', "%{$s}%")
+                  ->orWhere('notes', 'like', "%{$s}%")
+                  ->orWhereHas('menu', fn($mq) => $mq->where('name', 'like', "%{$s}%"))
+                  ->orWhereHas('user', fn($uq) => $uq->where('name', 'like', "%{$s}%"));
+            });
+        }
         
         if ($isOutletBounded) {
             $query->where('outlet_id', (int)$user->outlet_id);
@@ -288,7 +304,9 @@ class TransactionController extends Controller
             $query->where('outlet_id', $request->outlet_id);
         }
 
-        if ($request->status)       $query->where('status', $request->status);
+        if ($request->status && $request->status !== 'ALL' && $request->status !== 'all') {
+            $query->where('status', $request->status);
+        }
 
         if ($request->has('is_urgent_note')) {
             $query->where('is_urgent_note', $request->boolean('is_urgent_note'));
@@ -298,9 +316,9 @@ class TransactionController extends Controller
             $query->where('discount_amount', '>', 0);
         }
 
-        $limit = $request->integer('limit', 200);
-        if ($limit <= 0 || $limit > 1000) {
-            $limit = 200;
+        $limit = $request->integer('limit', 500);
+        if ($limit <= 0 || $limit > 2000) {
+            $limit = 500;
         }
 
         return response()->json($query->limit($limit)->get());

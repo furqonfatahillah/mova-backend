@@ -319,7 +319,12 @@ class ReportController extends Controller
             $outletId = (int)$request->outlet_id;
         }
 
-        $current = $this->calculatePnlData($from, $to, $outletId);
+        $notaType = strtoupper($request->input('nota_type', 'ALL'));
+        if (!in_array($notaType, ['ALL', 'GENERATE', 'MANUAL'])) {
+            $notaType = 'ALL';
+        }
+
+        $current = $this->calculatePnlData($from, $to, $outletId, $notaType);
 
         $isComparison = $request->boolean('compare') || $request->filled('compare_with') || $request->filled('compare_from');
         if (!$isComparison) {
@@ -348,7 +353,7 @@ class ReportController extends Controller
             $compareTo   = date('Y-m-d', strtotime('-1 month', strtotime($to)));
         }
 
-        $previous = $this->calculatePnlData($compareFrom, $compareTo, $outletId);
+        $previous = $this->calculatePnlData($compareFrom, $compareTo, $outletId, $notaType);
 
         // Detect Cost Anomalies (e.g. OPEX surge > 20% or COGS ratio increase)
         $anomalies = [];
@@ -462,6 +467,11 @@ class ReportController extends Controller
         $from = $p['from'];
         $to   = $p['to'];
 
+        $notaType = strtoupper($request->input('nota_type', 'ALL'));
+        if (!in_array($notaType, ['ALL', 'GENERATE', 'MANUAL'])) {
+            $notaType = 'ALL';
+        }
+
         $user = $request->user();
         $outletsQuery = Outlet::where('active', true);
         if ($user && $user->business_id) {
@@ -481,7 +491,7 @@ class ReportController extends Controller
         $groupTransactionCount = 0;
 
         foreach ($outlets as $outlet) {
-            $pnl = $this->calculatePnlData($from, $to, $outlet->id);
+            $pnl = $this->calculatePnlData($from, $to, $outlet->id, $notaType);
 
             $netSales      = (float) $pnl['revenue']['net_sales'];
             $grossSales    = (float) $pnl['revenue']['gross_sales'];
@@ -763,7 +773,7 @@ class ReportController extends Controller
     /**
      * Internal P&L Calculation for a single period
      */
-    private function calculatePnlData(string $from, string $to, ?int $outletId = null): array
+    private function calculatePnlData(string $from, string $to, ?int $outletId = null, string $notaType = 'ALL'): array
     {
         // 1. REVENUE (PENDAPATAN USAHA)
         $trxQuery = Transaction::with(['menu.recipes.items'])
@@ -774,36 +784,43 @@ class ReportController extends Controller
         }
         $transactions = $trxQuery->get();
 
-        $grossSales = 0.0;
-        $totalDiscount = 0.0;
-        $netSales = 0.0;
-        $paymentMethodsMap = [];
-        $orderNumbers = [];
-        $itemCount = 0;
+        $allGross = 0.0;
+        $allDiscount = 0.0;
+        $allNet = 0.0;
+        $allItemCount = 0;
+        $allOrderNumbers = [];
+        $allPaymentMethodsMap = [];
 
         $genGross = 0.0;
         $genDiscount = 0.0;
         $genNet = 0.0;
+        $genItemCount = 0;
+        $genOrderNumbers = [];
+        $genPaymentMethodsMap = [];
 
         $manGross = 0.0;
         $manDiscount = 0.0;
         $manNet = 0.0;
+        $manItemCount = 0;
+        $manOrderNumbers = [];
+        $manPaymentMethodsMap = [];
 
-        $orderIsManual = [];
         $orderHasDiscount = [];
 
         foreach ($transactions as $t) {
             $subtotal = (float)($t->subtotal > 0 ? $t->subtotal : ($t->total_price + ($t->discount_amount ?? 0)));
             $discount = (float)($t->discount_amount ?? 0);
             $net = (float)$t->total_price;
-
-            $grossSales += $subtotal;
-            $totalDiscount += $discount;
-            $netSales += $net;
-            $itemCount += (int)$t->qty;
-
+            $qty = (int)$t->qty;
             $orderKey = $t->order_number ?: "TRX-{$t->id}";
-            $orderNumbers[$orderKey] = true;
+            $method = $t->payment_method ?: 'CASH';
+
+            $allGross += $subtotal;
+            $allDiscount += $discount;
+            $allNet += $net;
+            $allItemCount += $qty;
+            $allOrderNumbers[$orderKey] = true;
+            $allPaymentMethodsMap[$method] = ($allPaymentMethodsMap[$method] ?? 0.0) + $net;
 
             if ($discount > 0) {
                 $orderHasDiscount[$orderKey] = true;
@@ -813,33 +830,18 @@ class ReportController extends Controller
                 $manGross += $subtotal;
                 $manDiscount += $discount;
                 $manNet += $net;
-                $orderIsManual[$orderKey] = true;
+                $manItemCount += $qty;
+                $manOrderNumbers[$orderKey] = true;
+                $manPaymentMethodsMap[$method] = ($manPaymentMethodsMap[$method] ?? 0.0) + $net;
             } else {
                 $genGross += $subtotal;
                 $genDiscount += $discount;
                 $genNet += $net;
-                if (!isset($orderIsManual[$orderKey])) {
-                    $orderIsManual[$orderKey] = false;
-                }
-            }
-
-            $method = $t->payment_method ?: 'CASH';
-            $paymentMethodsMap[$method] = ($paymentMethodsMap[$method] ?? 0.0) + $net;
-        }
-
-        $transactionCount = count($orderNumbers);
-        $avgOrderValue = $transactionCount > 0 ? round($netSales / $transactionCount, 0) : 0;
-
-        $genOrderCount = 0;
-        $manOrderCount = 0;
-        foreach ($orderIsManual as $k => $isMan) {
-            if ($isMan) {
-                $manOrderCount++;
-            } else {
-                $genOrderCount++;
+                $genItemCount += $qty;
+                $genOrderNumbers[$orderKey] = true;
+                $genPaymentMethodsMap[$method] = ($genPaymentMethodsMap[$method] ?? 0.0) + $net;
             }
         }
-        $discOrderCount = count($orderHasDiscount);
 
         $methodLabels = [
             'CASH'       => 'Tunai (Cash)',
@@ -849,22 +851,63 @@ class ReportController extends Controller
             'GRAB'       => 'Grab / GrabFood',
             'PETTY_CASH' => 'Kas Kecil',
         ];
-        $paymentBreakdown = [];
-        foreach ($paymentMethodsMap as $mKey => $mTotal) {
-            $paymentBreakdown[] = [
-                'method'     => $mKey,
-                'label'      => $methodLabels[$mKey] ?? $mKey,
-                'total'      => round($mTotal, 2),
-                'percentage' => $netSales > 0 ? round(($mTotal / $netSales) * 100, 1) : 0,
-            ];
+
+        $formatPaymentBreakdown = function ($map, $totalNet) use ($methodLabels) {
+            $res = [];
+            foreach ($map as $mKey => $mTotal) {
+                $res[] = [
+                    'method'     => $mKey,
+                    'label'      => $methodLabels[$mKey] ?? $mKey,
+                    'total'      => round($mTotal, 2),
+                    'percentage' => $totalNet > 0 ? round(($mTotal / $totalNet) * 100, 1) : 0,
+                ];
+            }
+            usort($res, fn($a, $b) => $b['total'] <=> $a['total']);
+            return $res;
+        };
+
+        $genPaymentBreakdown = $formatPaymentBreakdown($genPaymentMethodsMap, $genNet);
+        $manPaymentBreakdown = $formatPaymentBreakdown($manPaymentMethodsMap, $manNet);
+        $allPaymentBreakdown = $formatPaymentBreakdown($allPaymentMethodsMap, $allNet);
+
+        // Select scope according to $notaType
+        if ($notaType === 'GENERATE') {
+            $grossSales = $genGross;
+            $totalDiscount = $genDiscount;
+            $netSales = $genNet;
+            $transactionCount = count($genOrderNumbers);
+            $itemCount = $genItemCount;
+            $paymentBreakdown = $genPaymentBreakdown;
+            $targetTransactions = $transactions->filter(fn($t) => !$t->is_urgent_note);
+            $notaRatio = $allNet > 0 ? ($genNet / $allNet) : 0.0;
+        } elseif ($notaType === 'MANUAL') {
+            $grossSales = $manGross;
+            $totalDiscount = $manDiscount;
+            $netSales = $manNet;
+            $transactionCount = count($manOrderNumbers);
+            $itemCount = $manItemCount;
+            $paymentBreakdown = $manPaymentBreakdown;
+            $targetTransactions = $transactions->filter(fn($t) => (bool)$t->is_urgent_note);
+            $notaRatio = $allNet > 0 ? ($manNet / $allNet) : 0.0;
+        } else { // 'ALL'
+            $grossSales = $allGross;
+            $totalDiscount = $allDiscount;
+            $netSales = $allNet;
+            $transactionCount = count($allOrderNumbers);
+            $itemCount = $allItemCount;
+            $paymentBreakdown = $allPaymentBreakdown;
+            $targetTransactions = $transactions;
+            $notaRatio = 1.0;
         }
-        usort($paymentBreakdown, fn($a, $b) => $b['total'] <=> $a['total']);
+
+        $avgOrderValue = $transactionCount > 0 ? round($netSales / $transactionCount, 0) : 0;
+        $discOrderCount = count($orderHasDiscount);
 
         // 2. COGS (HPP RIIL: RESEP + SUSUT OPNAME)
         $varianceData = $this->buildVarianceArray($from, $to, $outletId);
         
-        $cogsRecipes = 0.0;
-        $cogsVariance = 0.0;
+        $cogsRecipesBase = 0.0;
+        $cogsVarianceBase = 0.0;
         $topIngredientsUsage = [];
 
         foreach ($varianceData as $row) {
@@ -872,10 +915,10 @@ class ReportController extends Controller
             $targetOutletId = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
             $hargaPerPakai = $ing->costPerPakaiForOutlet($targetOutletId);
             $rowRecipeCost = (float)$row['pemakaian_teoritis'] * $hargaPerPakai;
-            $cogsRecipes += $rowRecipeCost;
+            $cogsRecipesBase += $rowRecipeCost;
 
             if ($row['unaccounted_value'] !== null) {
-                $cogsVariance += (float)$row['unaccounted_value'];
+                $cogsVarianceBase += (float)$row['unaccounted_value'];
             }
 
             if ($rowRecipeCost > 0 || (float)$row['pemakaian_teoritis'] > 0) {
@@ -891,10 +934,10 @@ class ReportController extends Controller
             }
         }
 
-        // Tambahkan HPP barang direct retail (non-resep)
+        // Tambahkan HPP barang direct retail (non-resep) for target transactions
         $cogsDirectItems = 0.0;
         $directItemsMap = [];
-        foreach ($transactions as $t) {
+        foreach ($targetTransactions as $t) {
             $m = $t->menu;
             if ($m && ($m->item_type === 'DIRECT' || (!$m->activeRecipe($t->date) && $m->cost_price > 0))) {
                 $itemCost = (float)($m->cost_price * $t->qty);
@@ -923,6 +966,9 @@ class ReportController extends Controller
         usort($topIngredientsUsage, fn($a, $b) => ($b['total_hpp'] ?? $b['cost'] ?? 0) <=> ($a['total_hpp'] ?? $a['cost'] ?? 0));
         $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 15);
 
+        // Apportion recipes & variance when filtered
+        $cogsRecipes = round($cogsRecipesBase * $notaRatio, 2);
+        $cogsVariance = round($cogsVarianceBase * $notaRatio, 2);
         $totalCogs = round($cogsRecipes + $cogsVariance + $cogsDirectItems, 2);
         $cogsRatioPct = $netSales > 0 ? round(($totalCogs / $netSales) * 100, 1) : 0;
 
@@ -943,19 +989,20 @@ class ReportController extends Controller
                 $wasteLossSum += (float)($row['waste_value'] ?? 0);
             }
         }
-        $totalWasteLoss = round($wasteLossSum, 2);
+        $totalWasteLossBase = round($wasteLossSum, 2);
+        $totalWasteLoss = round($totalWasteLossBase * $notaRatio, 2);
         $wasteRatioPct = $netSales > 0 ? round(($totalWasteLoss / $netSales) * 100, 1) : 0;
 
         $wasteReasonConfig = WasteLog::reasonCategories();
         $wasteBreakdown = [];
         foreach ($wasteReasonConfig as $wKey => $wLabel) {
             $wItems = $wasteLogs->where('reason_category', $wKey);
-            $wCost = (float)$wItems->sum('loss_cost');
+            $wCost = (float)$wItems->sum('loss_cost') * $notaRatio;
             if ($wCost > 0) {
                 $wasteBreakdown[] = [
                     'category'   => $wKey,
                     'label'      => $wLabel,
-                    'total'      => $wCost,
+                    'total'      => round($wCost, 2),
                     'count'      => $wItems->count(),
                     'percentage' => $totalWasteLoss > 0 ? round(($wCost / $totalWasteLoss) * 100, 1) : 0,
                 ];
@@ -973,19 +1020,20 @@ class ReportController extends Controller
             });
         }
         $expenses = $opexQuery->get();
-        $totalOpex = round((float)$expenses->sum('amount'), 2);
+        $totalOpexBase = round((float)$expenses->sum('amount'), 2);
+        $totalOpex = round($totalOpexBase * $notaRatio, 2);
         $opexRatioPct = $netSales > 0 ? round(($totalOpex / $netSales) * 100, 1) : 0;
 
         $expenseCategoriesConfig = OperatingExpense::categories();
         $opexBreakdown = [];
         foreach ($expenseCategoriesConfig as $cKey => $cLabel) {
             $cItems = $expenses->where('category', $cKey);
-            $cAmount = (float)$cItems->sum('amount');
+            $cAmount = (float)$cItems->sum('amount') * $notaRatio;
             if ($cAmount > 0) {
                 $opexBreakdown[] = [
                     'category'   => $cKey,
                     'label'      => $cLabel,
-                    'total'      => $cAmount,
+                    'total'      => round($cAmount, 2),
                     'count'      => $cItems->count(),
                     'percentage' => $totalOpex > 0 ? round(($cAmount / $totalOpex) * 100, 1) : 0,
                 ];
@@ -1088,6 +1136,7 @@ class ReportController extends Controller
                 'to'        => $to,
                 'outlet_id' => $outletId,
             ],
+            'nota_type' => $notaType,
             'revenue' => [
                 'gross_sales'        => round($grossSales, 2),
                 'total_discount'     => round($totalDiscount, 2),
@@ -1100,15 +1149,29 @@ class ReportController extends Controller
                     'gross_sales'       => round($genGross, 2),
                     'discount'          => round($genDiscount, 2),
                     'net_sales'         => round($genNet, 2),
-                    'transaction_count' => $genOrderCount,
-                    'share_pct'         => $netSales > 0 ? round(($genNet / $netSales) * 100, 1) : 0,
+                    'transaction_count' => count($genOrderNumbers),
+                    'item_sold_count'   => $genItemCount,
+                    'avg_order_value'   => count($genOrderNumbers) > 0 ? round($genNet / count($genOrderNumbers), 0) : 0,
+                    'share_pct'         => $allNet > 0 ? round(($genNet / $allNet) * 100, 1) : 0,
+                    'payment_breakdown' => $genPaymentBreakdown,
                 ],
                 'nota_manual'        => [
                     'gross_sales'       => round($manGross, 2),
                     'discount'          => round($manDiscount, 2),
                     'net_sales'         => round($manNet, 2),
-                    'transaction_count' => $manOrderCount,
-                    'share_pct'         => $netSales > 0 ? round(($manNet / $netSales) * 100, 1) : 0,
+                    'transaction_count' => count($manOrderNumbers),
+                    'item_sold_count'   => $manItemCount,
+                    'avg_order_value'   => count($manOrderNumbers) > 0 ? round($manNet / count($manOrderNumbers), 0) : 0,
+                    'share_pct'         => $allNet > 0 ? round(($manNet / $allNet) * 100, 1) : 0,
+                    'payment_breakdown' => $manPaymentBreakdown,
+                ],
+                'combined'           => [
+                    'gross_sales'       => round($allGross, 2),
+                    'discount'          => round($allDiscount, 2),
+                    'net_sales'         => round($allNet, 2),
+                    'transaction_count' => count($allOrderNumbers),
+                    'item_sold_count'   => $allItemCount,
+                    'avg_order_value'   => count($allOrderNumbers) > 0 ? round($allNet / count($allOrderNumbers), 0) : 0,
                 ],
                 'discount_summary'   => [
                     'total_discount'    => round($totalDiscount, 2),

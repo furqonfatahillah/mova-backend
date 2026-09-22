@@ -228,6 +228,8 @@ class MenuController extends Controller
         $outletId = $data['outlet_id'] ?? $request->user()?->outlet_id;
         $qty = (float)$data['qty'];
 
+        $costBefore = (float)($menu->cost_price ?? 0);
+
         if ($data['cost_price'] !== null && (float)$data['cost_price'] > 0) {
             $menu->cost_price = (float)$data['cost_price'];
         } elseif (!empty($data['total_cost']) && (float)$data['total_cost'] > 0 && $qty > 0) {
@@ -237,6 +239,20 @@ class MenuController extends Controller
         // Tambah saldo master
         $menu->stock = (float)$menu->stock + $qty;
         $menu->save();
+
+        // ⚡ Record HPP change if cost changed on restock
+        if ($costBefore != (float)$menu->cost_price) {
+            try {
+                \App\Services\MenuHppService::recordForDirectRestock(
+                    $menu,
+                    $costBefore,
+                    (float)$menu->cost_price,
+                    $outletId ? (int)$outletId : null,
+                    $request->user()?->id,
+                    $data['notes'] ?? null
+                );
+            } catch (\Throwable $e) {}
+        }
 
         // Jika outlet spesifik, update atau buat record OutletMenu
         if ($outletId && $outletId !== 'ALL' && Schema::hasTable('outlet_menus')) {
@@ -267,6 +283,7 @@ class MenuController extends Controller
             'items.*.waste_std'     => 'nullable|numeric|min:0|max:100',
         ]);
 
+        $oldHpp = (float)$menu->calculateHpp();
         $nextVersion = ($menu->recipes()->max('version') ?? 0) + 1;
 
         $recipe = Recipe::create([
@@ -286,7 +303,40 @@ class MenuController extends Controller
             ]);
         }
 
+        $newHpp = (float)$menu->calculateHpp();
+
+        // ⚡ Record HPP history for new recipe version
+        try {
+            \App\Services\MenuHppService::recordForRecipeUpdate(
+                $menu,
+                $oldHpp,
+                $newHpp,
+                $request->user()?->id,
+                "Pembaruan resep ke Versi {$nextVersion}"
+            );
+        } catch (\Throwable $e) {}
+
         $recipe->load(['creator', 'updater', 'items.ingredient']);
         return response()->json($recipe, 201);
+    }
+
+    /**
+     * Get Menu HPP fluctuation history & composition breakdown (Weighted Moving Average)
+     */
+    public function hppHistory(Request $request, Menu $menu)
+    {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
+
+        $data = \App\Services\MenuHppService::getHppData(
+            $menu,
+            $outletId,
+            $request->query('from'),
+            $request->query('to'),
+            (int)($request->query('limit') ?: 100)
+        );
+
+        return response()->json($data);
     }
 }

@@ -347,6 +347,18 @@ class Ingredient extends Model
             $this->save();
         }
 
+        // ⚡ Record Menu HPP changes for any recipes that use this ingredient
+        try {
+            \App\Services\MenuHppService::recordForIngredientCostChange(
+                $this,
+                (float)$costBefore,
+                (float)$costAfter,
+                $outletId ? (int)$outletId : null
+            );
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Gagal mencatat riwayat HPP menu saat recalculateMovingAverage: " . $e->getMessage());
+        }
+
         return [
             'cost_before' => round($costBefore, 4),
             'cost_after'  => round($costAfter, 4),

@@ -87,6 +87,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::apiResource('menus', MenuController::class);
     Route::post('/menus/{menu}/recipes', [MenuController::class, 'storeRecipe']);
     Route::post('/menus/{menu}/restock', [MenuController::class, 'restock']);
+    Route::get('/menus/{menu}/hpp-history', [MenuController::class, 'hppHistory']);
     Route::apiResource('outlets', OutletController::class);
 
     // Master Customer / Member & Poin

@@ -18,18 +18,22 @@ class TransferItem extends Model
         'unit_price',
         'total_price',
         'returned_qty',
+        'return_approved_qty',
+        'return_rejected_qty',
         'received_qty',
         'return_reason',
         'notes',
     ];
 
     protected $casts = [
-        'qty'          => 'float',
-        'input_qty'    => 'float',
-        'unit_price'   => 'float',
-        'total_price'  => 'float',
-        'returned_qty' => 'float',
-        'received_qty' => 'float',
+        'qty'                 => 'float',
+        'input_qty'           => 'float',
+        'unit_price'          => 'float',
+        'total_price'         => 'float',
+        'returned_qty'        => 'float',
+        'return_approved_qty' => 'float',
+        'return_rejected_qty' => 'float',
+        'received_qty'        => 'float',
     ];
 
     protected $appends = [

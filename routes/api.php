@@ -112,12 +112,14 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::delete('/batch-preps/{batchPrep}',   [BatchPrepController::class, 'destroyBatch']);
 
     // Transfer Bahan Baku antar Cabang
-    Route::get('/transfers',                     [TransferController::class, 'index']);
-    Route::post('/transfers',                    [TransferController::class, 'store']);
-    Route::get('/transfers/{transfer}',          [TransferController::class, 'show']);
-    Route::post('/transfers/{transfer}/receive', [TransferController::class, 'receive']);
-    Route::post('/transfers/{transfer}/return',  [TransferController::class, 'returnTransfer']);
-    Route::post('/transfers/{transfer}/cancel',  [TransferController::class, 'cancel']);
+    Route::get('/transfers',                            [TransferController::class, 'index']);
+    Route::post('/transfers',                           [TransferController::class, 'store']);
+    Route::get('/transfers/{transfer}',                 [TransferController::class, 'show']);
+    Route::post('/transfers/{transfer}/receive',        [TransferController::class, 'receive']);
+    Route::post('/transfers/{transfer}/return',         [TransferController::class, 'returnTransfer']);
+    Route::post('/transfers/{transfer}/approve-return', [TransferController::class, 'approveReturn']);
+    Route::post('/transfers/{transfer}/reject-return',  [TransferController::class, 'rejectReturn']);
+    Route::post('/transfers/{transfer}/cancel',         [TransferController::class, 'cancel']);
 
     // POS & Open Bills (Dine-in Table Management)
     Route::get('/transactions/open-bills',                               [TransactionController::class, 'openBills']);

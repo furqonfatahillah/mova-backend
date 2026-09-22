@@ -30,6 +30,13 @@ class Transfer extends Model
         'return_reason',
         'return_disposition',
         'return_notes',
+        'return_status',
+        'return_approved_at',
+        'return_approved_by',
+        'return_approval_notes',
+        'return_rejected_at',
+        'return_rejected_by',
+        'return_rejected_reason',
         'notes',
         'driver_name',
         'vehicle_no',
@@ -43,6 +50,8 @@ class Transfer extends Model
         'updated_by_name',
         'received_by_name',
         'returned_by_name',
+        'return_approved_by_name',
+        'return_rejected_by_name',
         'changed_at',
         'changed_by_name',
         'source_display_name',
@@ -69,6 +78,16 @@ class Transfer extends Model
         return $this->belongsTo(User::class, 'returned_by');
     }
 
+    public function returnApprover()
+    {
+        return $this->belongsTo(User::class, 'return_approved_by');
+    }
+
+    public function returnRejecter()
+    {
+        return $this->belongsTo(User::class, 'return_rejected_by');
+    }
+
     public function items()
     {
         return $this->hasMany(TransferItem::class);
@@ -87,6 +106,16 @@ class Transfer extends Model
     public function getReturnedByNameAttribute(): ?string
     {
         return $this->returner?->name;
+    }
+
+    public function getReturnApprovedByNameAttribute(): ?string
+    {
+        return $this->returnApprover?->name;
+    }
+
+    public function getReturnRejectedByNameAttribute(): ?string
+    {
+        return $this->returnRejecter?->name;
     }
 
     public function getSourceDisplayNameAttribute(): string

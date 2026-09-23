@@ -693,8 +693,11 @@ class TransactionController extends Controller
                     }
 
                     $dueDate = !empty($data['due_date']) ? $data['due_date'] : now()->addDays(7)->toDateString();
+                    $amountPaidNow = min((float)($data['amount_paid'] ?? 0), $orderNetTotal);
+                    $kasbonTotal = max(0, $orderNetTotal - $amountPaidNow);
+                    $recStatus = ($kasbonTotal <= 0) ? 'PAID' : (($amountPaidNow > 0) ? 'PARTIAL' : 'UNPAID');
 
-                    \App\Models\Receivable::create([
+                    $rec = \App\Models\Receivable::create([
                         'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
                         'business_id'      => $businessId,
                         'outlet_id'        => $outletId,
@@ -707,12 +710,26 @@ class TransactionController extends Controller
                         'issue_date'       => $data['date'],
                         'due_date'         => $dueDate,
                         'total_amount'     => $orderNetTotal,
-                        'paid_amount'      => 0,
-                        'remaining_amount' => $orderNetTotal,
-                        'status'           => 'UNPAID',
+                        'paid_amount'      => $amountPaidNow,
+                        'remaining_amount' => $kasbonTotal,
+                        'status'           => $recStatus,
                         'notes'            => 'Kasbon POS Kasir — Order #' . $orderNumber,
                         'created_by'       => $request->user()->id,
                     ]);
+
+                    if ($amountPaidNow > 0) {
+                        \App\Models\ReceivablePayment::create([
+                            'payment_no'     => \App\Models\ReceivablePayment::generatePaymentNo($businessId, $data['date']),
+                            'receivable_id'  => $rec->id,
+                            'business_id'    => $businessId,
+                            'outlet_id'      => $outletId,
+                            'payment_date'   => $data['date'],
+                            'amount'         => $amountPaidNow,
+                            'payment_method' => 'CASH',
+                            'notes'          => 'Uang Muka / DP Kasir Saat Checkout',
+                            'received_by'    => $request->user()->id,
+                        ]);
+                    }
                 }
 
                 // Deduct SaaS platform coins for completed nota
@@ -1299,8 +1316,11 @@ class TransactionController extends Controller
                 }
 
                 $dueDate = !empty($data['due_date']) ? $data['due_date'] : now()->addDays(7)->toDateString();
+                $amountPaidNow = min((float)($data['amount_paid'] ?? 0), $totalOrder);
+                $kasbonTotal = max(0, $totalOrder - $amountPaidNow);
+                $recStatus = ($kasbonTotal <= 0) ? 'PAID' : (($amountPaidNow > 0) ? 'PARTIAL' : 'UNPAID');
 
-                \App\Models\Receivable::create([
+                $rec = \App\Models\Receivable::create([
                     'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $date),
                     'business_id'      => $businessId,
                     'outlet_id'        => $outletId,
@@ -1313,12 +1333,26 @@ class TransactionController extends Controller
                     'issue_date'       => $date,
                     'due_date'         => $dueDate,
                     'total_amount'     => $totalOrder,
-                    'paid_amount'      => 0,
-                    'remaining_amount' => $totalOrder,
-                    'status'           => 'UNPAID',
+                    'paid_amount'      => $amountPaidNow,
+                    'remaining_amount' => $kasbonTotal,
+                    'status'           => $recStatus,
                     'notes'            => 'Kasbon POS Kasir (Open Bill) — Order #' . $orderNumber,
                     'created_by'       => $request->user()->id,
                 ]);
+
+                if ($amountPaidNow > 0) {
+                    \App\Models\ReceivablePayment::create([
+                        'payment_no'     => \App\Models\ReceivablePayment::generatePaymentNo($businessId, $date),
+                        'receivable_id'  => $rec->id,
+                        'business_id'    => $businessId,
+                        'outlet_id'      => $outletId,
+                        'payment_date'   => $date,
+                        'amount'         => $amountPaidNow,
+                        'payment_method' => 'CASH',
+                        'notes'          => 'Uang Muka / DP Kasir Saat Checkout',
+                        'received_by'    => $request->user()->id,
+                    ]);
+                }
             }
 
             // Deduct SaaS platform coins for completed nota

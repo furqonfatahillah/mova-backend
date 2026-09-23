@@ -16,12 +16,17 @@ class ReceivableController extends Controller
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
 
-        $query = Receivable::with(['payments.receiver', 'outlet', 'creator'])
+        $query = Receivable::with(['payments.receiver', 'outlet', 'creator', 'customer', 'transaction'])
             ->orderBy('issue_date', 'desc')
             ->orderBy('id', 'desc');
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
+        }
+
+        // Customer ID Filter
+        if ($request->filled('customer_id')) {
+            $query->where('customer_id', $request->customer_id);
         }
 
         // Status Filter
@@ -106,7 +111,7 @@ class ReceivableController extends Controller
         $countUnpaid  = $allTenantReceivables->where('status', 'UNPAID')->count();
         $countPartial = $allTenantReceivables->where('status', 'PARTIAL')->count();
         $countPaid    = $allTenantReceivables->where('status', 'PAID')->count();
-        $totalCustomers = $allTenantReceivables->pluck('customer_name')->unique()->count();
+        $totalCustomers = $allTenantReceivables->pluck('customer_name')->map(fn($n) => strtolower(trim($n)))->unique()->count();
 
         return response()->json([
             'data'  => $items,
@@ -125,10 +130,82 @@ class ReceivableController extends Controller
         ]);
     }
 
+    /**
+     * Customer Debt Summary view: grouped by customer with unpaid transactions
+     */
+    public function byCustomer(Request $request)
+    {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+
+        $query = Receivable::with(['customer', 'outlet', 'payments'])
+            ->where('status', '!=', 'CANCELLED');
+
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $query->where('outlet_id', $outletId);
+        }
+
+        if ($request->filled('q')) {
+            $q = trim($request->q);
+            $query->where(function ($sub) use ($q) {
+                $sub->where('customer_name', 'like', "%{$q}%")
+                    ->orWhere('customer_phone', 'like', "%{$q}%")
+                    ->orWhere('notes', 'like', "%{$q}%");
+            });
+        }
+
+        $all = $query->get();
+
+        // Group by customer_id if present, or normalized customer_name
+        $grouped = $all->groupBy(function ($item) {
+            if ($item->customer_id) {
+                return "ID_" . $item->customer_id;
+            }
+            return "NAME_" . strtolower(trim($item->customer_name));
+        });
+
+        $result = [];
+        foreach ($grouped as $key => $items) {
+            $first = $items->first();
+            $totalKasbon = (float)$items->sum('total_amount');
+            $totalPaid = (float)$items->sum('paid_amount');
+            $totalRemaining = (float)$items->sum('remaining_amount');
+
+            $unpaidItems = $items->where('remaining_amount', '>', 0)->values();
+
+            $result[] = [
+                'group_key'         => $key,
+                'customer_id'       => $first->customer_id,
+                'customer_name'     => $first->customer_name,
+                'customer_phone'    => $first->customer_phone,
+                'customer_address'  => $first->customer_address,
+                'total_transactions'=> $items->count(),
+                'unpaid_count'      => $unpaidItems->count(),
+                'total_kasbon'      => $totalKasbon,
+                'total_paid'        => $totalPaid,
+                'total_remaining'   => $totalRemaining,
+                'latest_issue_date' => $items->max('issue_date'),
+                'oldest_due_date'   => $unpaidItems->min('due_date') ?? $items->min('due_date'),
+                'has_overdue'       => $unpaidItems->contains(fn($i) => $i->is_overdue),
+                'unpaid_items'      => $unpaidItems,
+                'all_items'         => $items->values(),
+            ];
+        }
+
+        // Sort by total_remaining DESC (highest active debt first)
+        usort($result, fn($a, $b) => $b['total_remaining'] <=> $a['total_remaining']);
+
+        return response()->json([
+            'data' => $result
+        ]);
+    }
+
     public function store(Request $request)
     {
         $data = $request->validate([
             'outlet_id'         => 'nullable|exists:outlets,id',
+            'customer_id'       => 'nullable|exists:customers,id',
             'customer_name'     => 'required|string|max:150',
             'customer_phone'    => 'nullable|string|max:50',
             'customer_address'  => 'nullable|string',
@@ -171,6 +248,7 @@ class ReceivableController extends Controller
                 'business_id'      => $businessId,
                 'outlet_id'        => $outletId,
                 'transaction_id'   => $data['transaction_id'] ?? null,
+                'customer_id'      => $data['customer_id'] ?? null,
                 'order_number'     => $data['order_number'] ?? null,
                 'customer_name'    => $data['customer_name'],
                 'customer_phone'   => $data['customer_phone'] ?? null,
@@ -196,7 +274,7 @@ class ReceivableController extends Controller
                     'amount'         => $initialPaid,
                     'payment_method' => $data['payment_method'] ?? 'CASH',
                     'reference_no'   => $data['reference_no'] ?? null,
-                    'notes'          => 'Uang Muka / Pembayaran Awal',
+                    'notes'          => 'Uang Muka / Pembayaran Awal Kasbon',
                     'received_by'    => $user->id,
                 ]);
             }
@@ -204,19 +282,20 @@ class ReceivableController extends Controller
             return $rec;
         });
 
-        $receivable->load(['payments.receiver', 'outlet', 'creator']);
+        $receivable->load(['payments.receiver', 'outlet', 'creator', 'customer']);
         return response()->json($receivable, 201);
     }
 
     public function show(Receivable $receivable)
     {
-        $receivable->load(['payments.receiver', 'outlet', 'creator', 'updater', 'transaction']);
+        $receivable->load(['payments.receiver', 'outlet', 'creator', 'updater', 'transaction', 'customer']);
         return response()->json($receivable);
     }
 
     public function update(Request $request, Receivable $receivable)
     {
         $data = $request->validate([
+            'customer_id'      => 'nullable|exists:customers,id',
             'customer_name'    => 'sometimes|required|string|max:150',
             'customer_phone'   => 'nullable|string|max:50',
             'customer_address' => 'nullable|string',
@@ -230,14 +309,14 @@ class ReceivableController extends Controller
             'updated_by' => $request->user()->id,
         ]);
 
-        $receivable->load(['payments.receiver', 'outlet', 'creator', 'updater']);
+        $receivable->load(['payments.receiver', 'outlet', 'creator', 'updater', 'customer']);
         return response()->json($receivable);
     }
 
     public function destroy(Receivable $receivable)
     {
         $receivable->delete();
-        return response()->json(['message' => 'Data piutang berhasil dihapus']);
+        return response()->json(['message' => 'Data kasbon berhasil dihapus']);
     }
 
     public function addPayment(Request $request, Receivable $receivable)
@@ -253,7 +332,7 @@ class ReceivableController extends Controller
         $amount = (float)$data['amount'];
         if ($amount > ($receivable->remaining_amount + 0.01)) {
             return response()->json([
-                'message' => "Nominal pembayaran (Rp " . number_format($amount, 0, ',', '.') . ") melebihi sisa piutang (Rp " . number_format($receivable->remaining_amount, 0, ',', '.') . ")."
+                'message' => "Nominal pembayaran (Rp " . number_format($amount, 0, ',', '.') . ") melebihi sisa kasbon (Rp " . number_format($receivable->remaining_amount, 0, ',', '.') . ")."
             ], 422);
         }
 
@@ -293,14 +372,118 @@ class ReceivableController extends Controller
             ]);
         });
 
-        $receivable->refresh()->load(['payments.receiver', 'outlet', 'creator', 'updater']);
+        $receivable->refresh()->load(['payments.receiver', 'outlet', 'creator', 'updater', 'customer']);
         return response()->json($receivable);
+    }
+
+    /**
+     * Bulk Payment across multiple kasbon transactions of a customer
+     */
+    public function bulkPayment(Request $request)
+    {
+        $data = $request->validate([
+            'customer_name'    => 'nullable|string',
+            'customer_id'      => 'nullable|integer',
+            'receivable_ids'   => 'nullable|array',
+            'receivable_ids.*' => 'integer|exists:receivables,id',
+            'amount'           => 'required|numeric|min:1',
+            'payment_date'     => 'required|date',
+            'payment_method'   => 'required|string|max:50',
+            'reference_no'     => 'nullable|string|max:100',
+            'notes'            => 'nullable|string',
+        ]);
+
+        $user = $request->user();
+        $paymentAmount = (float)$data['amount'];
+
+        // Find candidate unpaid receivables
+        $query = Receivable::where('status', '!=', 'PAID')
+            ->where('status', '!=', 'CANCELLED')
+            ->where('remaining_amount', '>', 0);
+
+        if (!empty($data['receivable_ids'])) {
+            $query->whereIn('id', $data['receivable_ids']);
+        } elseif (!empty($data['customer_id'])) {
+            $query->where('customer_id', $data['customer_id']);
+        } elseif (!empty($data['customer_name'])) {
+            $query->where('customer_name', $data['customer_name']);
+        } else {
+            return response()->json(['message' => 'Harap tentukan pelanggan atau nota yang ingin dibayar.'], 422);
+        }
+
+        $receivables = $query->orderBy('issue_date', 'asc')->orderBy('id', 'asc')->get();
+
+        if ($receivables->isEmpty()) {
+            return response()->json(['message' => 'Tidak ditemukan tagihan kasbon aktif untuk pelanggan ini.'], 404);
+        }
+
+        $totalUnpaid = (float)$receivables->sum('remaining_amount');
+        if ($paymentAmount > ($totalUnpaid + 0.01)) {
+            return response()->json([
+                'message' => 'Nominal pembayaran (Rp ' . number_format($paymentAmount, 0, ',', '.') . ') melebihi total kasbon aktif (Rp ' . number_format($totalUnpaid, 0, ',', '.') . ').'
+            ], 422);
+        }
+
+        $remainingPayment = $paymentAmount;
+        $updatedReceivables = [];
+
+        DB::transaction(function () use ($receivables, $data, $user, &$remainingPayment, &$updatedReceivables) {
+            foreach ($receivables as $rec) {
+                if ($remainingPayment <= 0) break;
+
+                $payForThis = min($remainingPayment, (float)$rec->remaining_amount);
+                if ($payForThis <= 0) continue;
+
+                $businessId = $rec->business_id ?? $user?->business_id;
+                $paymentNo = ReceivablePayment::generatePaymentNo($businessId, $data['payment_date']);
+
+                ReceivablePayment::create([
+                    'payment_no'     => $paymentNo,
+                    'receivable_id'  => $rec->id,
+                    'business_id'    => $businessId,
+                    'outlet_id'      => $rec->outlet_id,
+                    'payment_date'   => $data['payment_date'],
+                    'amount'         => $payForThis,
+                    'payment_method' => $data['payment_method'],
+                    'reference_no'   => $data['reference_no'] ?? null,
+                    'notes'          => $data['notes'] ? "Pelunasan Sekaligus: {$data['notes']}" : 'Pembayaran Sekaligus Kasbon Pelanggan',
+                    'received_by'    => $user->id,
+                ]);
+
+                $totalPaid = (float)$rec->payments()->sum('amount');
+                $newRemaining = max(0, (float)$rec->total_amount - $totalPaid);
+
+                $newStatus = 'UNPAID';
+                if ($newRemaining <= 0) {
+                    $newStatus = 'PAID';
+                } elseif ($totalPaid > 0) {
+                    $newStatus = 'PARTIAL';
+                }
+
+                $rec->update([
+                    'paid_amount'      => $totalPaid,
+                    'remaining_amount' => $newRemaining,
+                    'status'           => $newStatus,
+                    'updated_by'       => $user->id,
+                ]);
+
+                $remainingPayment -= $payForThis;
+                $updatedReceivables[] = $rec->fresh();
+            }
+        });
+
+        return response()->json([
+            'message' => 'Pembayaran sekaligus berhasil dicatat.',
+            'amount_paid' => $paymentAmount,
+            'updated_count' => count($updatedReceivables),
+            'data' => $updatedReceivables
+        ]);
     }
 
     public function deletePayment(Receivable $receivable, ReceivablePayment $payment)
     {
         if ($payment->receivable_id !== $receivable->id) {
-            return response()->json(['message' => 'Pembayaran tidak sesuai dengan piutang terkait.'], 400);
+            return response()->json(['message' => 'Pembayaran tidak sesuai dengan kasbon terkait.'], 400);
         }
 
         $user = auth()->user();
@@ -326,7 +509,7 @@ class ReceivableController extends Controller
             ]);
         });
 
-        $receivable->refresh()->load(['payments.receiver', 'outlet', 'creator', 'updater']);
+        $receivable->refresh()->load(['payments.receiver', 'outlet', 'creator', 'updater', 'customer']);
         return response()->json($receivable);
     }
 }

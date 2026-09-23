@@ -353,7 +353,7 @@ class TransactionController extends Controller
                 'customer_id'                  => 'nullable|exists:customers,id',
                 'order_type'                   => 'nullable|string|in:DINE_IN,TAKEAWAY,DELIVERY',
                 'table_number'                 => 'nullable|string|max:50',
-                'payment_method'               => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
+                'payment_method'               => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
                 'amount_paid'                  => 'nullable|numeric|min:0',
                 'change_amount'                => 'nullable|numeric|min:0',
                 'notes'                        => 'nullable|string|max:500',
@@ -677,6 +677,44 @@ class TransactionController extends Controller
                     }
                 }
 
+                // Auto-create Kasbon / Receivable record if payment method is KASBON or PIUTANG
+                if (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG'])) {
+                    $custName = $data['customer_name'] ?? 'Pelanggan Kasbon';
+                    $custPhone = null;
+                    $custAddr = null;
+
+                    if ($customerId) {
+                        $cObj = \App\Models\Customer::find($customerId);
+                        if ($cObj) {
+                            $custName = $cObj->name;
+                            $custPhone = $cObj->phone;
+                            $custAddr = $cObj->address;
+                        }
+                    }
+
+                    $dueDate = !empty($data['due_date']) ? $data['due_date'] : now()->addDays(7)->toDateString();
+
+                    \App\Models\Receivable::create([
+                        'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
+                        'business_id'      => $businessId,
+                        'outlet_id'        => $outletId,
+                        'transaction_id'   => $results[0]->id ?? null,
+                        'customer_id'      => $customerId,
+                        'order_number'     => $orderNumber,
+                        'customer_name'    => $custName,
+                        'customer_phone'   => $custPhone,
+                        'customer_address' => $custAddr,
+                        'issue_date'       => $data['date'],
+                        'due_date'         => $dueDate,
+                        'total_amount'     => $orderNetTotal,
+                        'paid_amount'      => 0,
+                        'remaining_amount' => $orderNetTotal,
+                        'status'           => 'UNPAID',
+                        'notes'            => 'Kasbon POS Kasir — Order #' . $orderNumber,
+                        'created_by'       => $request->user()->id,
+                    ]);
+                }
+
                 // Deduct SaaS platform coins for completed nota
                 if ($orderStatus === 'PAID') {
                     CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
@@ -753,7 +791,7 @@ class TransactionController extends Controller
             'customer_id'                 => 'nullable|exists:customers,id',
             'order_type'                  => 'nullable|string|in:DINE_IN,TAKEAWAY,DELIVERY',
             'table_number'                => 'nullable|string|max:50',
-            'payment_method'              => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
+            'payment_method'              => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
             'amount_paid'                 => 'nullable|numeric|min:0',
             'change_amount'               => 'nullable|numeric|min:0',
             'notes'                       => 'nullable|string|max:500',
@@ -1051,7 +1089,7 @@ class TransactionController extends Controller
     public function payOpenBill(Request $request, $orderNumber)
     {
         $data = $request->validate([
-            'payment_method'  => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
+            'payment_method'  => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
             'amount_paid'     => 'required|numeric|min:0',
             'change_amount'   => 'nullable|numeric|min:0',
             'customer_id'     => 'nullable|exists:customers,id',
@@ -1242,6 +1280,45 @@ class TransactionController extends Controller
                         ]);
                     }
                 }
+            }
+
+            // Auto-create Kasbon / Receivable record if payment method is KASBON or PIUTANG
+            if (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG'])) {
+                $firstTrx = $transactions->first();
+                $custName = $firstTrx->customer_name ?? 'Pelanggan Kasbon';
+                $custPhone = null;
+                $custAddr = null;
+
+                if ($customerId) {
+                    $cObj = \App\Models\Customer::find($customerId);
+                    if ($cObj) {
+                        $custName = $cObj->name;
+                        $custPhone = $cObj->phone;
+                        $custAddr = $cObj->address;
+                    }
+                }
+
+                $dueDate = !empty($data['due_date']) ? $data['due_date'] : now()->addDays(7)->toDateString();
+
+                \App\Models\Receivable::create([
+                    'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $date),
+                    'business_id'      => $businessId,
+                    'outlet_id'        => $outletId,
+                    'transaction_id'   => $firstTrx->id ?? null,
+                    'customer_id'      => $customerId,
+                    'order_number'     => $orderNumber,
+                    'customer_name'    => $custName,
+                    'customer_phone'   => $custPhone,
+                    'customer_address' => $custAddr,
+                    'issue_date'       => $date,
+                    'due_date'         => $dueDate,
+                    'total_amount'     => $totalOrder,
+                    'paid_amount'      => 0,
+                    'remaining_amount' => $totalOrder,
+                    'status'           => 'UNPAID',
+                    'notes'            => 'Kasbon POS Kasir (Open Bill) — Order #' . $orderNumber,
+                    'created_by'       => $request->user()->id,
+                ]);
             }
 
             // Deduct SaaS platform coins for completed nota
@@ -1531,7 +1608,7 @@ class TransactionController extends Controller
             'items'           => 'required|array|min:1',
             'items.*.id'      => 'required|integer|exists:transactions,id',
             'items.*.qty'     => 'required|integer|min:1',
-            'payment_method'  => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
+            'payment_method'  => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
             'amount_paid'     => 'required|numeric|min:0',
             'change_amount'   => 'nullable|numeric|min:0',
             'customer_name'   => 'nullable|string|max:100',
@@ -1800,7 +1877,7 @@ class TransactionController extends Controller
             'total_splits'   => 'required|integer|min:2|max:20',
             'split_index'    => 'required|integer|min:1',
             'split_amount'   => 'required|numeric|min:1',
-            'payment_method' => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB',
+            'payment_method' => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
             'amount_paid'    => 'required|numeric|min:0',
             'change_amount'  => 'nullable|numeric|min:0',
             'customer_name'  => 'nullable|string|max:100',

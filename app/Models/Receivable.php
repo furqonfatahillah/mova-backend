@@ -15,6 +15,7 @@ class Receivable extends Model
         'business_id',
         'outlet_id',
         'transaction_id',
+        'customer_id',
         'order_number',
         'customer_name',
         'customer_phone',
@@ -75,6 +76,11 @@ class Receivable extends Model
     public function transaction()
     {
         return $this->belongsTo(Transaction::class);
+    }
+
+    public function customer()
+    {
+        return $this->belongsTo(Customer::class);
     }
 
     public function outlet()

@@ -124,4 +124,52 @@ class OutletController extends Controller
         $outlet->delete();
         return response()->json(['message' => 'Outlet berhasil dihapus.']);
     }
+
+    public function bulkImport(Request $request)
+    {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+
+        $items = $request->input('items', []);
+        if (empty($items) || !is_array($items)) {
+            return response()->json(['message' => 'Data import kosong atau tidak valid.'], 422);
+        }
+
+        $importedCount = 0;
+
+        \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+            foreach ($items as $idx => $row) {
+                if (empty($row['name'])) continue;
+
+                $code = !empty($row['code']) ? trim($row['code']) : ('OUT-' . str_pad($idx + 1 + Outlet::where('business_id', $businessId)->count(), 3, '0', STR_PAD_LEFT));
+                $name = trim($row['name']);
+                $typeRaw = !empty($row['type']) ? strtoupper(trim($row['type'])) : 'CABANG';
+                $type = in_array($typeRaw, ['CABANG', 'PUSAT', 'GUDANG']) ? $typeRaw : 'CABANG';
+
+                Outlet::updateOrCreate(
+                    [
+                        'business_id' => $businessId,
+                        'name'        => $name,
+                    ],
+                    [
+                        'code'       => $code,
+                        'address'    => $row['address'] ?? null,
+                        'phone'      => $row['phone'] ?? null,
+                        'pic_name'   => $row['pic_name'] ?? null,
+                        'is_main'    => isset($row['is_main']) ? (bool)$row['is_main'] : false,
+                        'active'     => true,
+                        'created_by' => $user?->id,
+                        'updated_by' => $user?->id,
+                    ]
+                );
+
+                $importedCount++;
+            }
+        });
+
+        return response()->json([
+            'message' => "Berhasil meng-import {$importedCount} outlet/gudang dari file Excel.",
+            'imported_count' => $importedCount,
+        ]);
+    }
 }

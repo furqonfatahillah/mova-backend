@@ -512,4 +512,93 @@ class ReceivableController extends Controller
         $receivable->refresh()->load(['payments.receiver', 'outlet', 'creator', 'updater', 'customer']);
         return response()->json($receivable);
     }
+
+    public function bulkImport(Request $request)
+    {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+        $outletId = $user?->outlet_id ?? 1;
+
+        $items = $request->input('items', []);
+        if (empty($items) || !is_array($items)) {
+            return response()->json(['message' => 'Data import kosong atau tidak valid.'], 422);
+        }
+
+        $importedCount = 0;
+
+        DB::transaction(function () use ($items, $businessId, $outletId, $user, &$importedCount) {
+            foreach ($items as $idx => $row) {
+                if (empty($row['customer_name'])) continue;
+
+                $custName = trim($row['customer_name']);
+                $custPhone = !empty($row['customer_phone']) ? trim($row['customer_phone']) : null;
+                $custAddr = !empty($row['customer_address']) ? trim($row['customer_address']) : null;
+
+                // Auto-create or find Customer
+                $customer = null;
+                if ($custPhone) {
+                    $customer = \App\Models\Customer::firstOrCreate(
+                        ['business_id' => $businessId, 'phone' => $custPhone],
+                        ['name' => $custName, 'address' => $custAddr]
+                    );
+                } else {
+                    $customer = \App\Models\Customer::firstOrCreate(
+                        ['business_id' => $businessId, 'name' => $custName],
+                        ['phone' => $custPhone, 'address' => $custAddr]
+                    );
+                }
+
+                $totalAmount = (float)($row['total_amount'] ?? 0);
+                if ($totalAmount <= 0) continue;
+
+                $initialPaid = (float)($row['initial_paid'] ?? 0);
+                $remaining = max(0, $totalAmount - $initialPaid);
+                $status = ($remaining <= 0) ? 'PAID' : (($initialPaid > 0) ? 'PARTIAL' : 'UNPAID');
+
+                $issueDate = !empty($row['issue_date']) ? $row['issue_date'] : now()->toDateString();
+                $dueDate = !empty($row['due_date']) ? $row['due_date'] : now()->addDays(7)->toDateString();
+
+                $recNo = Receivable::generateReceivableNo($businessId, $issueDate);
+
+                $rec = Receivable::create([
+                    'receivable_no'    => $recNo,
+                    'business_id'      => $businessId,
+                    'outlet_id'        => $outletId,
+                    'customer_id'      => $customer?->id,
+                    'customer_name'    => $custName,
+                    'customer_phone'   => $custPhone,
+                    'customer_address' => $custAddr,
+                    'issue_date'       => $issueDate,
+                    'due_date'         => $dueDate,
+                    'total_amount'     => $totalAmount,
+                    'paid_amount'      => $initialPaid,
+                    'remaining_amount' => $remaining,
+                    'status'           => $status,
+                    'notes'            => $row['notes'] ?? 'Imported from Excel',
+                    'created_by'       => $user?->id,
+                ]);
+
+                if ($initialPaid > 0) {
+                    \App\Models\ReceivablePayment::create([
+                        'payment_no'     => \App\Models\ReceivablePayment::generatePaymentNo($businessId, $issueDate),
+                        'receivable_id'  => $rec->id,
+                        'business_id'    => $businessId,
+                        'outlet_id'      => $outletId,
+                        'payment_date'   => $issueDate,
+                        'amount'         => $initialPaid,
+                        'payment_method' => 'CASH',
+                        'notes'          => 'Uang Muka / DP Awal (Import Excel)',
+                        'received_by'    => $user?->id,
+                    ]);
+                }
+
+                $importedCount++;
+            }
+        });
+
+        return response()->json([
+            'message' => "Berhasil meng-import {$importedCount} data kasbon/piutang dari file Excel.",
+            'imported_count' => $importedCount,
+        ]);
+    }
 }

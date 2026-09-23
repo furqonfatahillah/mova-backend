@@ -339,4 +339,59 @@ class MenuController extends Controller
 
         return response()->json($data);
     }
+
+    public function bulkImport(Request $request)
+    {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+
+        $items = $request->input('items', []);
+        if (empty($items) || !is_array($items)) {
+            return response()->json(['message' => 'Data import kosong atau tidak valid.'], 422);
+        }
+
+        $importedCount = 0;
+
+        \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+            foreach ($items as $idx => $row) {
+                if (empty($row['name'])) continue;
+
+                $code = !empty($row['code']) ? trim($row['code']) : ('MNU-' . str_pad($idx + 1 + Menu::where('business_id', $businessId)->count(), 3, '0', STR_PAD_LEFT));
+                $name = trim($row['name']);
+
+                $categoryName = !empty($row['category']) ? trim($row['category']) : 'Umum';
+                $cat = \App\Models\Category::firstOrCreate(
+                    ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'MENU'],
+                    ['slug' => \Illuminate\Support\Str::slug($categoryName), 'color' => '#7C3AED', 'icon' => 'Utensils']
+                );
+
+                Menu::updateOrCreate(
+                    [
+                        'business_id' => $businessId,
+                        'name'        => $name,
+                    ],
+                    [
+                        'code'         => $code,
+                        'barcode'      => $row['barcode'] ?? null,
+                        'category_id'  => $cat->id,
+                        'category'     => $cat->name,
+                        'item_type'    => !empty($row['item_type']) ? strtoupper($row['item_type']) : 'RECIPE',
+                        'price'        => (float)($row['price'] ?? 0),
+                        'cost_price'   => (float)($row['cost_price'] ?? 0),
+                        'description'  => $row['description'] ?? null,
+                        'is_available' => isset($row['is_available']) ? (bool)$row['is_available'] : true,
+                        'created_by'   => $user?->id,
+                        'updated_by'   => $user?->id,
+                    ]
+                );
+
+                $importedCount++;
+            }
+        });
+
+        return response()->json([
+            'message' => "Berhasil meng-import {$importedCount} master menu dari file Excel.",
+            'imported_count' => $importedCount,
+        ]);
+    }
 }

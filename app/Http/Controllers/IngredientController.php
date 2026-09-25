@@ -218,4 +218,62 @@ class IngredientController extends Controller
             'imported_count' => $importedCount,
         ]);
     }
+
+    public function bulkImportPerlengkapan(Request $request)
+    {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+
+        $items = $request->input('items', []);
+        if (empty($items) || !is_array($items)) {
+            return response()->json(['message' => 'Data import perlengkapan kosong atau tidak valid.'], 422);
+        }
+
+        $importedCount = 0;
+
+        DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+            foreach ($items as $idx => $row) {
+                if (empty($row['name'])) continue;
+
+                $name = trim($row['name']);
+                $code = !empty($row['code']) ? trim($row['code']) : ('PLK-' . str_pad($idx + 1 + Ingredient::where('business_id', $businessId)->count(), 3, '0', STR_PAD_LEFT));
+
+                $categoryName = !empty($row['category']) ? trim($row['category']) : 'Perlengkapan';
+                $cat = Category::firstOrCreate(
+                    ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'INGREDIENT'],
+                    ['slug' => Str::slug($categoryName), 'color' => '#00B14F', 'icon' => 'Package']
+                );
+
+                Ingredient::updateOrCreate(
+                    [
+                        'business_id' => $businessId,
+                        'name'        => $name,
+                    ],
+                    [
+                        'code'        => $code,
+                        'category_id' => $cat->id,
+                        'category'    => $cat->name,
+                        'type'        => 'RAW',
+                        'unit_beli'   => $row['unit_beli'] ?? 'Slop',
+                        'unit_pakai'  => $row['unit_pakai'] ?? 'pcs',
+                        'konversi'    => (float)($row['konversi'] ?? 50),
+                        'harga'       => (float)($row['harga'] ?? 0),
+                        'stok_min'    => (float)($row['minstok'] ?? 0),
+                        'stok_awal'   => (float)($row['initial_stock'] ?? 0),
+                        'tolerance'   => (float)($row['tolerance'] ?? 5),
+                        'notes'       => $row['notes'] ?? 'Imported Perlengkapan from Excel',
+                        'created_by'  => $user?->id,
+                        'updated_by'  => $user?->id,
+                    ]
+                );
+
+                $importedCount++;
+            }
+        });
+
+        return response()->json([
+            'message' => "Berhasil meng-import {$importedCount} data master perlengkapan dari file Excel.",
+            'imported_count' => $importedCount,
+        ]);
+    }
 }

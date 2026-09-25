@@ -192,6 +192,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
 
     // Reports / Analytics
     Route::get('/reports/dashboard',           [ReportController::class, 'dashboard']);
+    Route::get('/reports/widgets',             [ReportController::class, 'dashboardWidgets']);
     Route::get('/reports/variance/ingredients',[ReportController::class, 'varianceIngredients']);
     Route::get('/reports/variance/menus',      [ReportController::class, 'varianceMenus']);
     Route::get('/reports/profitability',       [ReportController::class, 'profitability']);

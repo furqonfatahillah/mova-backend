@@ -41,6 +41,43 @@ class SalesReportController extends Controller
         return [$businessName, $outletName];
     }
 
+    private function resolveComparePeriod(Request $request, string $from, string $to): ?array
+    {
+        if (!$request->boolean('compare') && !$request->filled('compare_with') && !$request->filled('compare_from')) {
+            return null;
+        }
+
+        $mode = $request->input('compare_with', 'previous_month');
+
+        if ($mode === 'previous_month') {
+            $compareFrom = date('Y-m-d', strtotime('-1 month', strtotime($from)));
+            $compareTo   = date('Y-m-d', strtotime('-1 month', strtotime($to)));
+        } elseif ($mode === 'previous_period') {
+            $days = max(1, (int)round((strtotime($to) - strtotime($from)) / 86400) + 1);
+            $compareTo   = date('Y-m-d', strtotime('-1 day', strtotime($from)));
+            $compareFrom = date('Y-m-d', strtotime("-{$days} days", strtotime($compareTo)));
+        } elseif ($mode === 'previous_year') {
+            $compareFrom = date('Y-m-d', strtotime('-1 year', strtotime($from)));
+            $compareTo   = date('Y-m-d', strtotime('-1 year', strtotime($to)));
+        } elseif ($mode === 'custom' || $request->filled('compare_from')) {
+            $compareFrom = $request->input('compare_from', date('Y-m-d', strtotime('-1 month', strtotime($from))));
+            $compareTo   = $request->input('compare_to', date('Y-m-d', strtotime('-1 month', strtotime($to))));
+        } else {
+            $compareFrom = date('Y-m-d', strtotime('-1 month', strtotime($from)));
+            $compareTo   = date('Y-m-d', strtotime('-1 month', strtotime($to)));
+        }
+
+        return ['from' => $compareFrom, 'to' => $compareTo, 'mode' => $mode];
+    }
+
+    private function calcGrowthPct(float $current, float $previous): float
+    {
+        if ($previous == 0.0) {
+            return $current > 0 ? 100.0 : 0.0;
+        }
+        return round((($current - $previous) / abs($previous)) * 100, 2);
+    }
+
     /**
      * 1. Laporan Penjualan per Produk
      */
@@ -96,6 +133,34 @@ class SalesReportController extends Controller
             }
         }
 
+        // Comparison Period Data
+        $comparePeriod = $this->resolveComparePeriod($request, $request->from, $request->to);
+        $compareGrouped = [];
+        if ($comparePeriod) {
+            $cQuery = Transaction::with(['menu'])
+                ->where('business_id', $businessId)
+                ->whereBetween('date', [$comparePeriod['from'], $comparePeriod['to']]);
+            if ($outletId) {
+                $cQuery->where('outlet_id', $outletId);
+            }
+            $cTransactions = $cQuery->get();
+            foreach ($cTransactions as $t) {
+                $menuId = $t->menu_id ?: ('CUSTOM_' . ($t->notes ?: 'Lain-lain'));
+                if (!isset($compareGrouped[$menuId])) {
+                    $compareGrouped[$menuId] = [
+                        'qty_sold'        => 0,
+                        'total_sales'     => 0.0,
+                        'discount_amount' => 0.0,
+                    ];
+                }
+                if ($t->status === 'PAID') {
+                    $compareGrouped[$menuId]['qty_sold'] += (int)$t->qty;
+                    $compareGrouped[$menuId]['total_sales'] += (float)$t->subtotal;
+                    $compareGrouped[$menuId]['discount_amount'] += (float)$t->discount_amount;
+                }
+            }
+        }
+
         $items = array_values($grouped);
 
         // Filter by search if provided
@@ -110,9 +175,17 @@ class SalesReportController extends Controller
         // Sort by total_sales descending (or qty_sold)
         usort($items, fn($a, $b) => $b['total_sales'] <=> $a['total_sales']);
 
-        // Assign row numbers
+        // Assign row numbers & attach comparison per item
         foreach ($items as $idx => &$item) {
             $item['no'] = $idx + 1;
+            $key = $item['menu_id'] ?: ('CUSTOM_' . ($item['name'] ?: 'Lain-lain'));
+            $cData = $compareGrouped[$key] ?? ['qty_sold' => 0, 'total_sales' => 0.0, 'discount_amount' => 0.0];
+            $item['compare_qty_sold']    = $cData['qty_sold'];
+            $item['compare_total_sales'] = $cData['total_sales'];
+            $item['delta_qty']           = $item['qty_sold'] - $cData['qty_sold'];
+            $item['delta_sales']         = $item['total_sales'] - $cData['total_sales'];
+            $item['growth_qty_pct']      = $this->calcGrowthPct((float)$item['qty_sold'], (float)$cData['qty_sold']);
+            $item['growth_sales_pct']    = $this->calcGrowthPct((float)$item['total_sales'], (float)$cData['total_sales']);
         }
         unset($item);
 
@@ -124,6 +197,35 @@ class SalesReportController extends Controller
             'total_sales'       => array_sum(array_column($items, 'total_sales')),
             'total_refund'      => array_sum(array_column($items, 'total_refund')),
         ];
+
+        if ($comparePeriod) {
+            $compareTotalSales = array_sum(array_column($compareGrouped, 'total_sales'));
+            $compareTotalQty   = array_sum(array_column($compareGrouped, 'qty_sold'));
+            $compareDiscount   = array_sum(array_column($compareGrouped, 'discount_amount'));
+            $summary['comparison'] = [
+                'enabled'      => true,
+                'mode'         => $comparePeriod['mode'],
+                'period'       => ['from' => $comparePeriod['from'], 'to' => $comparePeriod['to']],
+                'sales'        => [
+                    'current'    => $summary['total_sales'],
+                    'previous'   => $compareTotalSales,
+                    'delta'      => $summary['total_sales'] - $compareTotalSales,
+                    'growth_pct' => $this->calcGrowthPct($summary['total_sales'], $compareTotalSales),
+                ],
+                'qty'          => [
+                    'current'    => $summary['total_qty_sold'],
+                    'previous'   => $compareTotalQty,
+                    'delta'      => $summary['total_qty_sold'] - $compareTotalQty,
+                    'growth_pct' => $this->calcGrowthPct((float)$summary['total_qty_sold'], (float)$compareTotalQty),
+                ],
+                'discount'     => [
+                    'current'    => $summary['total_discount'],
+                    'previous'   => $compareDiscount,
+                    'delta'      => $summary['total_discount'] - $compareDiscount,
+                    'growth_pct' => $this->calcGrowthPct($summary['total_discount'], $compareDiscount),
+                ],
+            ];
+        }
 
         return response()->json([
             'report_title'  => 'LAPORAN PENJUALAN PER PRODUK',
@@ -324,6 +426,52 @@ class SalesReportController extends Controller
             'total_receivable'  => array_sum(array_column($items, 'receivable_amount')),
         ];
 
+        $comparePeriod = $this->resolveComparePeriod($request, $request->from, $request->to);
+        if ($comparePeriod) {
+            $cQuery = Transaction::where('business_id', $businessId)
+                ->where('status', 'PAID')
+                ->whereBetween('date', [$comparePeriod['from'], $comparePeriod['to']]);
+            if ($outletId) {
+                $cQuery->where('outlet_id', $outletId);
+            }
+            $cTrx = $cQuery->get();
+            $cTotalPaid = 0.0;
+            $cTotalReceivable = 0.0;
+            foreach ($cTrx as $t) {
+                $pm = $t->payment_method ?: 'Tunai';
+                $isKasbon = in_array(strtoupper($pm), ['KASBON', 'PIUTANG']);
+                if ($isKasbon) {
+                    $cTotalReceivable += (float)$t->subtotal;
+                } else {
+                    $cTotalPaid += (float)$t->subtotal;
+                }
+            }
+
+            $summary['comparison'] = [
+                'enabled'      => true,
+                'mode'         => $comparePeriod['mode'],
+                'period'       => ['from' => $comparePeriod['from'], 'to' => $comparePeriod['to']],
+                'total_paid'   => [
+                    'current'    => $summary['total_paid'],
+                    'previous'   => $cTotalPaid,
+                    'delta'      => $summary['total_paid'] - $cTotalPaid,
+                    'growth_pct' => $this->calcGrowthPct($summary['total_paid'], $cTotalPaid),
+                ],
+                'receivable'   => [
+                    'current'    => $summary['total_receivable'],
+                    'previous'   => $cTotalReceivable,
+                    'delta'      => $summary['total_receivable'] - $cTotalReceivable,
+                    'growth_pct' => $this->calcGrowthPct($summary['total_receivable'], $cTotalReceivable),
+                ],
+                'total_transaction' => [
+                    'current'    => $summary['total_transaction'],
+                    'previous'   => $cTotalPaid + $cTotalReceivable,
+                    'delta'      => $summary['total_transaction'] - ($cTotalPaid + $cTotalReceivable),
+                    'growth_pct' => $this->calcGrowthPct($summary['total_transaction'], $cTotalPaid + $cTotalReceivable),
+                ],
+            ];
+        }
+
         return response()->json([
             'report_title'  => 'LAPORAN PEMBAYARAN PENJUALAN',
             'business_name' => $businessName,
@@ -446,6 +594,52 @@ class SalesReportController extends Controller
             'total_profit'     => array_sum(array_column($items, 'profit')),
         ];
 
+        $comparePeriod = $this->resolveComparePeriod($request, $request->from, $request->to);
+        if ($comparePeriod) {
+            $cQuery = Transaction::where('business_id', $businessId)
+                ->where('status', 'PAID')
+                ->whereBetween('date', [$comparePeriod['from'], $comparePeriod['to']]);
+            if ($outletId) {
+                $cQuery->where('outlet_id', $outletId);
+            }
+            if ($request->filled('payment_method') && $request->payment_method !== 'ALL') {
+                $cQuery->where('payment_method', $request->payment_method);
+            }
+            $cTransactions = $cQuery->get();
+            $cTotalSale = 0.0;
+            $cTotalQty  = 0;
+            $cTotalDisc = 0.0;
+            foreach ($cTransactions as $ct) {
+                $cTotalSale += (float)$ct->subtotal;
+                $cTotalQty  += (int)$ct->qty;
+                $cTotalDisc += (float)($ct->discount_amount ?: 0);
+            }
+
+            $summary['comparison'] = [
+                'enabled' => true,
+                'mode'    => $comparePeriod['mode'],
+                'period'  => ['from' => $comparePeriod['from'], 'to' => $comparePeriod['to']],
+                'sales'   => [
+                    'current'    => $summary['total_sale'],
+                    'previous'   => $cTotalSale,
+                    'delta'      => $summary['total_sale'] - $cTotalSale,
+                    'growth_pct' => $this->calcGrowthPct($summary['total_sale'], $cTotalSale),
+                ],
+                'qty'     => [
+                    'current'    => $summary['total_qty'],
+                    'previous'   => $cTotalQty,
+                    'delta'      => $summary['total_qty'] - $cTotalQty,
+                    'growth_pct' => $this->calcGrowthPct((float)$summary['total_qty'], (float)$cTotalQty),
+                ],
+                'discount'=> [
+                    'current'    => $summary['total_discount'],
+                    'previous'   => $cTotalDisc,
+                    'delta'      => $summary['total_discount'] - $cTotalDisc,
+                    'growth_pct' => $this->calcGrowthPct($summary['total_discount'], $cTotalDisc),
+                ],
+            ];
+        }
+
         return response()->json([
             'report_title'  => 'Laporan Transaksi Penjualan',
             'business_name' => $businessName,
@@ -541,6 +735,41 @@ class SalesReportController extends Controller
             'total_paid'       => array_sum(array_column($items, 'total_paid')),
             'total_receivable' => array_sum(array_column($items, 'receivable')),
         ];
+
+        $comparePeriod = $this->resolveComparePeriod($request, $request->from, $request->to);
+        if ($comparePeriod) {
+            $cQuery = Transaction::where('business_id', $businessId)
+                ->where('status', 'PAID')
+                ->whereBetween('date', [$comparePeriod['from'], $comparePeriod['to']]);
+            if ($outletId) {
+                $cQuery->where('outlet_id', $outletId);
+            }
+            $cTrx = $cQuery->get();
+            $cTotalAmount = 0.0;
+            $cTotalQty    = 0;
+            foreach ($cTrx as $ct) {
+                $cTotalAmount += (float)$ct->subtotal;
+                $cTotalQty    += (int)$ct->qty;
+            }
+
+            $summary['comparison'] = [
+                'enabled' => true,
+                'mode'    => $comparePeriod['mode'],
+                'period'  => ['from' => $comparePeriod['from'], 'to' => $comparePeriod['to']],
+                'sales'   => [
+                    'current'    => $summary['total_amount'],
+                    'previous'   => $cTotalAmount,
+                    'delta'      => $summary['total_amount'] - $cTotalAmount,
+                    'growth_pct' => $this->calcGrowthPct($summary['total_amount'], $cTotalAmount),
+                ],
+                'qty'     => [
+                    'current'    => $summary['total_qty'],
+                    'previous'   => $cTotalQty,
+                    'delta'      => $summary['total_qty'] - $cTotalQty,
+                    'growth_pct' => $this->calcGrowthPct((float)$summary['total_qty'], (float)$cTotalQty),
+                ],
+            ];
+        }
 
         return response()->json([
             'report_title'  => 'LAPORAN DAFTAR PENJUALAN PER CUSTOMER',

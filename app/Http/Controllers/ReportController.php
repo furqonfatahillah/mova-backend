@@ -10,7 +10,11 @@ use App\Models\Opname;
 use App\Models\OperatingExpense;
 use App\Models\WasteLog;
 use App\Models\Outlet;
+use App\Models\Receivable;
+use App\Models\Shift;
+use App\Models\CashTransaction;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class ReportController extends Controller
 {
@@ -1434,6 +1438,226 @@ class ReportController extends Controller
             ];
         }
         return $result;
+    }
+
+    /**
+     * Dedicated Aggregated Endpoint for Customizable Dashboard Widgets
+     */
+    public function dashboardWidgets(Request $request)
+    {
+        $p = $this->validatePeriod($request);
+        $from = $p['from'];
+        $to   = $p['to'];
+        $user = $request->user();
+        $businessId = $user->business_id;
+
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
+
+        // 1. Tren Penjualan Harian (Sales Trend)
+        $salesTrendQuery = Transaction::select(
+                'date',
+                DB::raw('COUNT(DISTINCT COALESCE(order_number, id)) as order_count'),
+                DB::raw('SUM(qty) as total_qty'),
+                DB::raw('SUM(total_price) as total_revenue')
+            )
+            ->where('business_id', $businessId)
+            ->where('status', 'PAID')
+            ->whereBetween('date', [$from, $to]);
+        if ($outletId) {
+            $salesTrendQuery->where('outlet_id', $outletId);
+        }
+        $salesTrend = $salesTrendQuery->groupBy('date')->orderBy('date', 'asc')->get();
+
+        // 2. Laba / Rugi Summary (P&L)
+        $pnl = $this->calculatePnlData($from, $to, $outletId, 'ALL');
+        $pnlSummary = [
+            'gross_sales'  => (float)($pnl['revenue']['gross_sales'] ?? 0),
+            'discount'     => (float)($pnl['revenue']['total_discounts'] ?? 0),
+            'net_sales'    => (float)($pnl['revenue']['net_sales'] ?? 0),
+            'cogs'         => (float)($pnl['cogs']['total_cogs'] ?? 0),
+            'gross_profit' => (float)($pnl['gross_profit'] ?? 0),
+            'opex'         => (float)($pnl['opex']['total_opex'] ?? 0),
+            'net_profit'   => (float)($pnl['net_profit'] ?? 0),
+            'net_margin'   => (float)($pnl['net_profit_pct'] ?? 0),
+        ];
+
+        // 3. Beban Perusahaan / Pengeluaran (Operating Expenses Breakdown)
+        $opexQuery = OperatingExpense::where('business_id', $businessId)
+            ->whereBetween('date', [$from, $to]);
+        if ($outletId) {
+            $opexQuery->where('outlet_id', $outletId);
+        }
+        $opexRecords = $opexQuery->get();
+        $totalOpex = (float)$opexRecords->sum('amount');
+        $opexByCategory = $opexRecords->groupBy('category')->map(function ($items, $cat) use ($totalOpex) {
+            $sum = (float)$items->sum('amount');
+            return [
+                'category'   => $cat ?: 'Lain-lain',
+                'amount'     => $sum,
+                'percentage' => $totalOpex > 0 ? round(($sum / $totalOpex) * 100, 1) : 0,
+            ];
+        })->sortByDesc('amount')->values()->take(6);
+
+        // 4. Arus Kas (Cash Flow)
+        $cashQuery = CashTransaction::where('business_id', $businessId)
+            ->whereBetween('date', [$from, $to]);
+        if ($outletId) {
+            $cashQuery->where('outlet_id', $outletId);
+        }
+        $cashTransactions = $cashQuery->get();
+        $cashIn = (float)$cashTransactions->where('type', 'IN')->sum('amount');
+        $cashOut = (float)$cashTransactions->where('type', 'OUT')->sum('amount');
+        $cashSales = (float)Transaction::where('business_id', $businessId)
+            ->where('status', 'PAID')
+            ->where('payment_method', 'CASH')
+            ->whereBetween('date', [$from, $to])
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->sum('total_price');
+        $totalCashIn = $cashIn + $cashSales;
+        $totalCashOut = $cashOut + $totalOpex;
+        $cashFlowSummary = [
+            'cash_in'     => $totalCashIn,
+            'cash_out'    => $totalCashOut,
+            'net'         => $totalCashIn - $totalCashOut,
+            'operational' => $cashSales,
+        ];
+
+        // 5. Penjualan & Piutang (Sales & Receivables)
+        $recQuery = Receivable::where('business_id', $businessId);
+        if ($outletId) {
+            $recQuery->where('outlet_id', $outletId);
+        }
+        $unpaidReceivables = (float)$recQuery->clone()->whereIn('status', ['UNPAID', 'PARTIAL'])->sum('remaining_amount');
+        $overdueReceivables = (float)$recQuery->clone()->whereIn('status', ['UNPAID', 'PARTIAL'])->where('due_date', '<', date('Y-m-d'))->sum('remaining_amount');
+        $paidSales = max(0, $pnlSummary['net_sales'] - $unpaidReceivables);
+        $salesReceivables = [
+            'net_sales'          => $pnlSummary['net_sales'],
+            'paid_sales'         => $paidSales,
+            'unpaid_receivables' => $unpaidReceivables,
+            'overdue_receivables'=> $overdueReceivables,
+            'order_count'        => (int)Transaction::where('business_id', $businessId)->where('status', 'PAID')->whereBetween('date', [$from, $to])->when($outletId, fn($q) => $q->where('outlet_id', $outletId))->distinct('order_number')->count('order_number'),
+        ];
+
+        // 6. Barang Stok Minimum (Low Stock Items)
+        $minStockItems = Ingredient::where('business_id', $businessId)
+            ->where('active', true)
+            ->where('stok_min', '>', 0)
+            ->get()
+            ->map(function ($ing) use ($outletId) {
+                $stock = $outletId ? $ing->stockForOutlet($outletId) : (method_exists($ing, 'consolidatedStock') ? $ing->consolidatedStock() : (float)$ing->stok_awal);
+                $minStock = (float)($ing->stok_min ?? 0);
+                return [
+                    'id'            => $ing->id,
+                    'name'          => $ing->name,
+                    'category'      => $ing->category ?: 'Bahan',
+                    'current_stock' => round((float)$stock, 2),
+                    'min_stock'     => round($minStock, 2),
+                    'unit'          => $ing->unit_pakai ?: 'satuan',
+                    'status'        => $stock <= 0 ? 'HABIS' : ($stock <= $minStock ? 'KRITIS' : 'AMAN'),
+                ];
+            })
+            ->filter(fn($item) => $item['current_stock'] <= $item['min_stock'])
+            ->sortBy('current_stock')
+            ->values()
+            ->take(8);
+
+        // 7. Aktifitas Terakhir Anda (Recent Activities)
+        $recentTransactions = Transaction::with(['menu', 'user'])
+            ->where('business_id', $businessId)
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->orderBy('id', 'desc')
+            ->take(15)
+            ->get()
+            ->map(function ($t) {
+                return [
+                    'id'             => $t->id,
+                    'type'           => 'TRANSACTION',
+                    'order_number'   => $t->order_number ?: "TRX-{$t->id}",
+                    'title'          => 'Pesanan ' . ($t->order_number ?: "TRX-{$t->id}"),
+                    'description'    => ($t->menu?->name ?: ($t->notes ?: 'Menu')) . ' (' . $t->qty . 'x)',
+                    'amount'         => (float)$t->total_price,
+                    'payment_method' => $t->payment_method ?: 'CASH',
+                    'user_name'      => $t->user?->name ?: 'Kasir',
+                    'date'           => $t->date,
+                    'time'           => $t->created_at ? $t->created_at->format('H:i') : '-',
+                ];
+            });
+
+        // 8. Menu / Produk Terlaris (Top Selling Menu)
+        $topProducts = Transaction::select(
+                'menu_id',
+                DB::raw('MAX(notes) as custom_name'),
+                DB::raw('SUM(qty) as total_qty'),
+                DB::raw('SUM(total_price) as total_revenue')
+            )
+            ->with(['menu'])
+            ->where('business_id', $businessId)
+            ->where('status', 'PAID')
+            ->whereBetween('date', [$from, $to])
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->groupBy('menu_id')
+            ->orderByDesc('total_qty')
+            ->take(5)
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'menu_id' => $item->menu_id,
+                    'name'    => $item->menu?->name ?: ($item->custom_name ?: 'Produk Khusus'),
+                    'qty'     => (int)$item->total_qty,
+                    'revenue' => (float)$item->total_revenue,
+                    'price'   => $item->total_qty > 0 ? round($item->total_revenue / $item->total_qty, 0) : 0,
+                ];
+            });
+
+        // 9. Status Resep & Cost Control
+        $costControl = [
+            'status_counts'       => ['NORMAL' => 0, 'WASPADA' => 0, 'TIDAK WAJAR' => 0],
+            'total_variance_loss' => 0,
+            'total_waste_value'   => 0,
+            'total_combined_loss' => 0,
+            'top_waste'           => [],
+        ];
+        try {
+            $dashData = $this->dashboard($request)->getData(true);
+            $costControl = [
+                'status_counts'       => $dashData['status_counts'] ?? ['NORMAL' => 0, 'WASPADA' => 0, 'TIDAK WAJAR' => 0],
+                'total_variance_loss' => $dashData['total_variance_loss'] ?? 0,
+                'total_waste_value'   => $dashData['total_waste_value'] ?? 0,
+                'total_combined_loss' => $dashData['total_combined_loss'] ?? 0,
+                'top_waste'           => array_slice($dashData['top_waste'] ?? [], 0, 5),
+            ];
+        } catch (\Throwable $e) {}
+
+        // 10. Shift Kasir Aktif
+        $activeShift = Shift::with(['user', 'outlet'])
+            ->where('business_id', $businessId)
+            ->where('status', 'OPEN')
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->first();
+        $shiftSummary = $activeShift ? [
+            'id'           => $activeShift->id,
+            'cashier_name' => $activeShift->user?->name ?: 'Kasir',
+            'outlet_name'  => $activeShift->outlet?->name ?: 'Cabang',
+            'started_at'   => $activeShift->started_at ? $activeShift->started_at->format('H:i') : '-',
+            'initial_cash' => (float)$activeShift->initial_cash,
+            'total_sales'  => (float)$activeShift->total_sales,
+        ] : null;
+
+        return response()->json([
+            'sales_trend'       => $salesTrend,
+            'pnl'               => $pnlSummary,
+            'opex_breakdown'    => $opexByCategory,
+            'cash_flow'         => $cashFlowSummary,
+            'sales_receivables' => $salesReceivables,
+            'min_stock_items'   => $minStockItems,
+            'recent_activities' => $recentTransactions,
+            'top_products'      => $topProducts,
+            'cost_control'      => $costControl,
+            'active_shift'      => $shiftSummary,
+            'period'            => compact('from', 'to'),
+            'outlet_id'         => $outletId,
+        ]);
     }
 }
 

@@ -38,4 +38,9 @@ class PointRedemption extends Model
     {
         return $this->belongsTo(User::class, 'created_by');
     }
+
+    public function transaction(): BelongsTo
+    {
+        return $this->belongsTo(Transaction::class, 'order_number', 'order_number');
+    }
 }

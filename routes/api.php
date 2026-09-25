@@ -28,6 +28,7 @@ use App\Http\Controllers\ExpenseCategoryController;
 use App\Http\Controllers\PaymentMethodController;
 use App\Http\Controllers\ReceivableController;
 use App\Http\Controllers\CustomerController;
+use App\Http\Controllers\SalesReportController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -196,4 +197,14 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/profitability',       [ReportController::class, 'profitability']);
     Route::get('/reports/profit-loss',          [ReportController::class, 'profitAndLoss']);
     Route::get('/reports/outlet-benchmark',    [ReportController::class, 'outletBenchmark']);
+
+    // Sales Reports (Laporan Penjualan POS)
+    Route::get('/reports/sales/by-product',           [SalesReportController::class, 'salesByProduct']);
+    Route::get('/reports/sales/point-redemptions',     [SalesReportController::class, 'pointRedemptions']);
+    Route::get('/reports/sales/payments',              [SalesReportController::class, 'salesPayments']);
+    Route::get('/reports/sales/transactions',          [SalesReportController::class, 'salesTransactionsDetailed']);
+    Route::get('/reports/sales/by-customer',           [SalesReportController::class, 'salesByCustomer']);
+    Route::get('/reports/sales/peak-hours',            [SalesReportController::class, 'peakHours']);
+    Route::get('/reports/sales/customer-receivables',  [SalesReportController::class, 'customerReceivables']);
+    Route::get('/reports/sales/promos',                [SalesReportController::class, 'promos']);
 });

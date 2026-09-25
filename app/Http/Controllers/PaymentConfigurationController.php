@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\BankAccount;
 use App\Models\PaymentGatewaySetting;
+use App\Models\Transaction;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -16,17 +17,30 @@ class PaymentConfigurationController extends Controller
 
     public function indexBankAccounts(Request $request)
     {
-        $businessId = $request->user()->business_id;
-        $query = BankAccount::with(['outlet'])
-            ->where('business_id', $businessId)
+        $user = $request->user();
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || Boolean($user->is_superadmin_platform ?? false);
+
+        $query = BankAccount::with(['outlet', 'business'])
             ->orderBy('is_primary', 'desc')
             ->orderBy('created_at', 'desc');
+
+        if ($isPlatformAdmin && ($request->boolean('all_tenants') || $request->filled('business_id'))) {
+            if ($request->filled('business_id') && $request->business_id !== 'ALL' && $request->business_id !== 'all') {
+                $query->where('business_id', $request->business_id);
+            }
+        } else {
+            $query->where('business_id', $user->business_id);
+        }
 
         if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
             $query->where(function ($q) use ($request) {
                 $q->where('outlet_id', $request->outlet_id)
                   ->orWhereNull('outlet_id');
             });
+        }
+
+        if ($request->filled('account_type') && in_array(strtoupper($request->account_type), ['BANK', 'EWALLET'])) {
+            $query->where('account_type', strtoupper($request->account_type));
         }
 
         return response()->json([
@@ -37,75 +51,96 @@ class PaymentConfigurationController extends Controller
 
     public function storeBankAccount(Request $request)
     {
-        $businessId = $request->user()->business_id;
+        $user = $request->user();
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || Boolean($user->is_superadmin_platform ?? false);
 
         $validated = $request->validate([
-            'bank_name'      => 'required|string|max:100',
-            'bank_code'      => 'nullable|string|max:20',
-            'account_number' => 'required|string|max:50',
-            'account_holder' => 'required|string|max:255',
-            'branch'         => 'nullable|string|max:255',
-            'outlet_id'      => 'nullable|exists:outlets,id',
-            'qr_image_url'   => 'nullable|string',
-            'is_primary'     => 'nullable|boolean',
-            'is_active'      => 'nullable|boolean',
-            'notes'          => 'nullable|string|max:500',
+            'business_id'         => 'nullable|exists:businesses,id',
+            'account_type'        => 'nullable|string|in:BANK,EWALLET',
+            'bank_name'           => 'required|string|max:100',
+            'bank_code'           => 'nullable|string|max:20',
+            'account_number'      => 'required|string|max:50',
+            'account_holder'      => 'required|string|max:255',
+            'branch'              => 'nullable|string|max:255',
+            'outlet_id'           => 'nullable|exists:outlets,id',
+            'qr_image_url'        => 'nullable|string',
+            'is_primary'          => 'nullable|boolean',
+            'is_active'           => 'nullable|boolean',
+            'verification_status' => 'nullable|string|in:VERIFIED,PENDING,REJECTED',
+            'payout_schedule'     => 'nullable|string|in:INSTANT,DAILY,MANUAL',
+            'notes'               => 'nullable|string|max:500',
         ]);
 
-        $validated['business_id'] = $businessId;
-        $validated['created_by']  = $request->user()->id;
+        $targetBusinessId = ($isPlatformAdmin && !empty($validated['business_id']))
+            ? $validated['business_id']
+            : $user->business_id;
 
-        // If this is set as primary, unset other accounts in the same business
+        $validated['business_id']         = $targetBusinessId;
+        $validated['account_type']        = $validated['account_type'] ?? 'BANK';
+        $validated['verification_status'] = $validated['verification_status'] ?? 'VERIFIED';
+        $validated['payout_schedule']     = $validated['payout_schedule'] ?? 'DAILY';
+        $validated['created_by']          = $user->id;
+
+        // If this is set as primary, unset other accounts in the same business & account_type
         if (!empty($validated['is_primary'])) {
-            BankAccount::where('business_id', $businessId)->update(['is_primary' => false]);
+            BankAccount::where('business_id', $targetBusinessId)->update(['is_primary' => false]);
         } else {
             // If it's the very first account, make it primary automatically
-            $existingCount = BankAccount::where('business_id', $businessId)->count();
+            $existingCount = BankAccount::where('business_id', $targetBusinessId)->count();
             if ($existingCount === 0) {
                 $validated['is_primary'] = true;
             }
         }
 
         $account = BankAccount::create($validated);
-        $account->load('outlet');
+        $account->load(['outlet', 'business']);
 
         return response()->json([
             'status'  => 'success',
-            'message' => 'Nomor rekening berhasil didaftarkan',
+            'message' => ($account->account_type === 'EWALLET' ? 'E-Wallet' : 'Nomor rekening') . ' berhasil didaftarkan',
             'data'    => $account,
         ], 201);
     }
 
     public function updateBankAccount(Request $request, $id)
     {
-        $businessId = $request->user()->business_id;
-        $account = BankAccount::where('business_id', $businessId)->findOrFail($id);
+        $user = $request->user();
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || Boolean($user->is_superadmin_platform ?? false);
+
+        $query = BankAccount::query();
+        if (!$isPlatformAdmin) {
+            $query->where('business_id', $user->business_id);
+        }
+        $account = $query->findOrFail($id);
 
         $validated = $request->validate([
-            'bank_name'      => 'sometimes|required|string|max:100',
-            'bank_code'      => 'nullable|string|max:20',
-            'account_number' => 'sometimes|required|string|max:50',
-            'account_holder' => 'sometimes|required|string|max:255',
-            'branch'         => 'nullable|string|max:255',
-            'outlet_id'      => 'nullable|exists:outlets,id',
-            'qr_image_url'   => 'nullable|string',
-            'is_primary'     => 'nullable|boolean',
-            'is_active'      => 'nullable|boolean',
-            'notes'          => 'nullable|string|max:500',
+            'account_type'        => 'sometimes|string|in:BANK,EWALLET',
+            'bank_name'           => 'sometimes|required|string|max:100',
+            'bank_code'           => 'nullable|string|max:20',
+            'account_number'      => 'sometimes|required|string|max:50',
+            'account_holder'      => 'sometimes|required|string|max:255',
+            'branch'              => 'nullable|string|max:255',
+            'outlet_id'           => 'nullable|exists:outlets,id',
+            'qr_image_url'        => 'nullable|string',
+            'is_primary'          => 'nullable|boolean',
+            'is_active'           => 'nullable|boolean',
+            'verification_status' => 'nullable|string|in:VERIFIED,PENDING,REJECTED',
+            'payout_schedule'     => 'nullable|string|in:INSTANT,DAILY,MANUAL',
+            'notes'               => 'nullable|string|max:500',
         ]);
 
-        $validated['updated_by'] = $request->user()->id;
+        $validated['updated_by'] = $user->id;
 
         if (!empty($validated['is_primary']) && !$account->is_primary) {
-            BankAccount::where('business_id', $businessId)->update(['is_primary' => false]);
+            BankAccount::where('business_id', $account->business_id)->update(['is_primary' => false]);
         }
 
         $account->update($validated);
-        $account->load('outlet');
+        $account->load(['outlet', 'business']);
 
         return response()->json([
             'status'  => 'success',
-            'message' => 'Data rekening berhasil diperbarui',
+            'message' => 'Data rekening / e-wallet berhasil diperbarui',
             'data'    => $account,
         ]);
     }
@@ -361,5 +396,210 @@ class PaymentConfigurationController extends Controller
     {
         if (empty($key) || strlen($key) < 8) return '****';
         return substr($key, 0, 4) . '****' . substr($key, -4);
+    }
+
+    // ==========================================
+    // 3. MIDTRANS TRANSACTION CHARGE & STATUS
+    // ==========================================
+
+    public function chargeMidtransQris(Request $request)
+    {
+        $businessId = $request->user()->business_id;
+        $config = PaymentGatewaySetting::where('business_id', $businessId)->first();
+
+        if (!$config || empty($config->midtrans_server_key)) {
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Kredensial Midtrans belum diatur. Silakan masukkan Server Key di menu Master Bisnis > Rekening & Payment Gateway.',
+            ], 422);
+        }
+
+        $grossAmount = (int) round($request->input('gross_amount', 0));
+        if ($grossAmount < 1000) {
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Nominal pembayaran QRIS minimal Rp 1.000.',
+            ], 422);
+        }
+
+        $orderId = $request->input('order_id') ?: ('MOVA-' . date('YmdHis') . '-' . rand(100, 999));
+        $customerName = $request->input('customer_name') ?: 'Pelanggan POS';
+
+        $baseUrl = ($config->environment === 'production')
+            ? 'https://api.midtrans.com/v2/charge'
+            : 'https://api.sandbox.midtrans.com/v2/charge';
+
+        $payload = [
+            'payment_type' => 'qris',
+            'transaction_details' => [
+                'order_id'     => $orderId,
+                'gross_amount' => $grossAmount,
+            ],
+            'customer_details' => [
+                'first_name' => $customerName,
+            ],
+            'qris' => [
+                'acquirer' => 'gopay',
+            ],
+        ];
+
+        try {
+            $response = Http::withBasicAuth($config->midtrans_server_key, '')
+                ->withHeaders([
+                    'Accept'       => 'application/json',
+                    'Content-Type' => 'application/json',
+                ])
+                ->timeout(12)
+                ->post($baseUrl, $payload);
+
+            $data = $response->json();
+
+            if ($response->successful() && isset($data['status_code']) && in_array($data['status_code'], ['200', '201'])) {
+                // Find QR Code URL
+                $qrImageUrl = null;
+                if (!empty($data['actions'])) {
+                    foreach ($data['actions'] as $act) {
+                        if (($act['name'] ?? '') === 'generate-qr-code') {
+                            $qrImageUrl = $act['url'] ?? null;
+                            break;
+                        }
+                    }
+                }
+
+                return response()->json([
+                    'status'        => 'success',
+                    'order_id'      => $orderId,
+                    'gross_amount'  => $grossAmount,
+                    'qr_string'     => $data['qr_string'] ?? null,
+                    'qr_image_url'  => $qrImageUrl,
+                    'expiry_time'   => $data['expiry_time'] ?? null,
+                    'environment'   => $config->environment,
+                    'midtrans_data' => $data,
+                ]);
+            }
+
+            $errMsg = $data['status_message'] ?? ($data['message'] ?? 'Gagal menghubungi Midtrans');
+            return response()->json([
+                'status'  => 'error',
+                'message' => "Midtrans error: {$errMsg}",
+                'details' => $data,
+            ], 400);
+
+        } catch (\Throwable $e) {
+            Log::error("Midtrans QRIS Charge error: " . $e->getMessage());
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Terjadi kesalahan sistem saat memproses QRIS: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function checkMidtransStatus(Request $request, string $orderId)
+    {
+        $businessId = $request->user()->business_id;
+        $config = PaymentGatewaySetting::where('business_id', $businessId)->first();
+
+        if (!$config || empty($config->midtrans_server_key)) {
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Kredensial Midtrans belum diatur.',
+            ], 422);
+        }
+
+        $baseUrl = ($config->environment === 'production')
+            ? "https://api.midtrans.com/v2/{$orderId}/status"
+            : "https://api.sandbox.midtrans.com/v2/{$orderId}/status";
+
+        try {
+            $response = Http::withBasicAuth($config->midtrans_server_key, '')
+                ->withHeaders(['Accept' => 'application/json'])
+                ->timeout(8)
+                ->get($baseUrl);
+
+            $data = $response->json();
+            $transactionStatus = $data['transaction_status'] ?? 'unknown';
+            $isPaid = in_array($transactionStatus, ['settlement', 'capture']);
+
+            if ($isPaid) {
+                // Automatically update transaction status in database if records exist
+                Transaction::where('business_id', $businessId)
+                    ->where('order_number', $orderId)
+                    ->where('status', '!=', 'PAID')
+                    ->update([
+                        'status'         => 'PAID',
+                        'payment_method' => 'QRIS',
+                    ]);
+            }
+
+            return response()->json([
+                'status'             => 'success',
+                'order_id'           => $orderId,
+                'is_paid'            => $isPaid,
+                'transaction_status' => $transactionStatus,
+                'gross_amount'       => $data['gross_amount'] ?? null,
+                'payment_type'       => $data['payment_type'] ?? 'qris',
+                'settlement_time'    => $data['settlement_time'] ?? null,
+            ]);
+
+        } catch (\Throwable $e) {
+            Log::error("Midtrans status check error: " . $e->getMessage());
+            return response()->json([
+                'status'  => 'error',
+                'message' => 'Gagal mengecek status pembayaran: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function handleMidtransWebhook(Request $request)
+    {
+        $payload = $request->all();
+        $orderId = $payload['order_id'] ?? null;
+        $statusCode = $payload['status_code'] ?? null;
+        $grossAmount = $payload['gross_amount'] ?? null;
+        $signatureKey = $payload['signature_key'] ?? null;
+        $transactionStatus = $payload['transaction_status'] ?? null;
+
+        if (!$orderId || !$statusCode || !$grossAmount || !$signatureKey) {
+            return response()->json(['message' => 'Invalid webhook payload'], 400);
+        }
+
+        // Find transaction to know which business owns this order
+        $trx = Transaction::where('order_number', $orderId)->first();
+        $businessId = $trx?->business_id;
+
+        $config = null;
+        if ($businessId) {
+            $config = PaymentGatewaySetting::where('business_id', $businessId)->first();
+        } else {
+            $config = PaymentGatewaySetting::whereNotNull('midtrans_server_key')->first();
+        }
+
+        if (!$config || empty($config->midtrans_server_key)) {
+            Log::warning("Midtrans Webhook: Server key not found for order {$orderId}");
+            return response()->json(['message' => 'Configuration not found'], 404);
+        }
+
+        // Verify SHA512 Signature: sha512(order_id + status_code + gross_amount + ServerKey)
+        $expectedSignature = hash('sha512', $orderId . $statusCode . $grossAmount . $config->midtrans_server_key);
+        if ($signatureKey !== $expectedSignature) {
+            Log::warning("Midtrans Webhook: Invalid signature for order {$orderId}");
+            return response()->json(['message' => 'Invalid signature key'], 403);
+        }
+
+        if (in_array($transactionStatus, ['settlement', 'capture'])) {
+            Transaction::where('order_number', $orderId)
+                ->update([
+                    'status'         => 'PAID',
+                    'payment_method' => 'QRIS',
+                ]);
+            Log::info("Midtrans Webhook: Order {$orderId} successfully marked as PAID");
+        } elseif (in_array($transactionStatus, ['cancel', 'expire', 'deny'])) {
+            Transaction::where('order_number', $orderId)
+                ->where('status', 'HOLD')
+                ->update(['status' => 'CANCELLED']);
+            Log::info("Midtrans Webhook: Order {$orderId} marked as {$transactionStatus}");
+        }
+
+        return response()->json(['status' => 'success', 'message' => 'Webhook processed successfully']);
     }
 }

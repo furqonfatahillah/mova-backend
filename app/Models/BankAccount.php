@@ -12,6 +12,7 @@ class BankAccount extends Model
     protected $fillable = [
         'business_id',
         'outlet_id',
+        'account_type',
         'bank_name',
         'bank_code',
         'account_number',
@@ -20,6 +21,8 @@ class BankAccount extends Model
         'qr_image_url',
         'is_primary',
         'is_active',
+        'verification_status',
+        'payout_schedule',
         'notes',
         'created_by',
         'updated_by',

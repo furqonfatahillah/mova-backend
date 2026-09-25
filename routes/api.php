@@ -39,6 +39,7 @@ Route::post('/verify-reset-code',   [AuthController::class, 'verifyResetCode']);
 Route::post('/reset-password',      [AuthController::class, 'resetPassword']);
 Route::get('/public/businesses', [BusinessController::class, 'publicList']);
 Route::get('/public/outlets', [OutletController::class, 'publicList']);
+Route::post('/payment-gateways/midtrans/webhook', [PaymentConfigurationController::class, 'handleMidtransWebhook']);
 
 // Protected routes (require Sanctum token and enforce outlet scoping)
 Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::class])->group(function () {
@@ -221,4 +222,6 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/payment-gateways/config',          [PaymentConfigurationController::class, 'getGatewayConfig']);
     Route::post('/payment-gateways/config',         [PaymentConfigurationController::class, 'saveGatewayConfig']);
     Route::post('/payment-gateways/test-connection',[PaymentConfigurationController::class, 'testGatewayConnection']);
+    Route::post('/payment-gateways/midtrans/charge-qris',   [PaymentConfigurationController::class, 'chargeMidtransQris']);
+    Route::get('/payment-gateways/midtrans/status/{orderId}',[PaymentConfigurationController::class, 'checkMidtransStatus']);
 });

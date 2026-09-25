@@ -29,6 +29,7 @@ use App\Http\Controllers\PaymentMethodController;
 use App\Http\Controllers\ReceivableController;
 use App\Http\Controllers\CustomerController;
 use App\Http\Controllers\SalesReportController;
+use App\Http\Controllers\PaymentConfigurationController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -208,4 +209,16 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/sales/peak-hours',            [SalesReportController::class, 'peakHours']);
     Route::get('/reports/sales/customer-receivables',  [SalesReportController::class, 'customerReceivables']);
     Route::get('/reports/sales/promos',                [SalesReportController::class, 'promos']);
+
+    // Rekening Bank & Payment Gateway Settings (Midtrans & Xendit)
+    Route::get('/bank-accounts',                    [PaymentConfigurationController::class, 'indexBankAccounts']);
+    Route::post('/bank-accounts',                   [PaymentConfigurationController::class, 'storeBankAccount']);
+    Route::put('/bank-accounts/{id}',               [PaymentConfigurationController::class, 'updateBankAccount']);
+    Route::delete('/bank-accounts/{id}',            [PaymentConfigurationController::class, 'destroyBankAccount']);
+    Route::patch('/bank-accounts/{id}/set-primary',  [PaymentConfigurationController::class, 'setPrimaryBankAccount']);
+    Route::patch('/bank-accounts/{id}/toggle-active',[PaymentConfigurationController::class, 'toggleActiveBankAccount']);
+
+    Route::get('/payment-gateways/config',          [PaymentConfigurationController::class, 'getGatewayConfig']);
+    Route::post('/payment-gateways/config',         [PaymentConfigurationController::class, 'saveGatewayConfig']);
+    Route::post('/payment-gateways/test-connection',[PaymentConfigurationController::class, 'testGatewayConnection']);
 });

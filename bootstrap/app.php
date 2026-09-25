@@ -14,6 +14,7 @@ return Application::configure(basePath: dirname(__DIR__))
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->statefulApi();
         $middleware->redirectGuestsTo(fn () => null);
+        $middleware->append(\App\Http\Middleware\GzipResponse::class);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //

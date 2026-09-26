@@ -95,7 +95,7 @@ class TransferController extends Controller
             'driver_name'           => 'nullable|string|max:100',
             'vehicle_no'            => 'nullable|string|max:50',
             'items'                 => 'required|array|min:1',
-            'items.*.item_type'     => 'nullable|string|in:INGREDIENT,PRODUCT',
+            'items.*.item_type'     => 'nullable|string|in:INGREDIENT,PRODUCT,PERLENGKAPAN',
             'items.*.ingredient_id' => 'nullable|exists:ingredients,id',
             'items.*.menu_id'       => 'nullable|exists:menus,id',
             'items.*.qty'           => 'nullable|numeric|min:0.0001',
@@ -420,7 +420,7 @@ class TransferController extends Controller
 
                     TransferItem::create([
                         'transfer_id'   => $transfer->id,
-                        'item_type'     => 'INGREDIENT',
+                        'item_type'     => in_array($itemType, ['PERLENGKAPAN', 'INGREDIENT']) ? $itemType : 'INGREDIENT',
                         'ingredient_id' => $ingredient->id,
                         'qty'           => $baseQty,
                         'unit'          => $baseUnit,
@@ -692,7 +692,7 @@ class TransferController extends Controller
                             } catch (\Throwable $e) {}
                             $menu->increment('stock', $receivedInputQty);
                         }
-                    } elseif ($item->item_type === 'INGREDIENT' && $item->ingredient_id) {
+                    } elseif (in_array($item->item_type, ['INGREDIENT', 'PERLENGKAPAN']) && $item->ingredient_id) {
                         $ingredient = Ingredient::find($item->ingredient_id);
                         if ($ingredient) {
                             $inputUnit = $item->input_unit ?: $item->unit;
@@ -1084,7 +1084,7 @@ class TransferController extends Controller
                             } catch (\Throwable $e) {}
                             $menu->increment('stock', $approvedQty);
                         }
-                    } elseif ($item->item_type === 'INGREDIENT' && $item->ingredient_id) {
+                    } elseif (in_array($item->item_type, ['INGREDIENT', 'PERLENGKAPAN']) && $item->ingredient_id) {
                         $ing = Ingredient::find($item->ingredient_id);
                         if ($ing && $transfer->source_outlet_id) {
                             $sourcePricePerBeli = $ing->hargaForOutlet($transfer->source_outlet_id);
@@ -1117,7 +1117,7 @@ class TransferController extends Controller
                     $ingredientId = null;
                     $menuId = null;
 
-                    if ($item->item_type === 'INGREDIENT' && $item->ingredient_id) {
+                    if (in_array($item->item_type, ['INGREDIENT', 'PERLENGKAPAN']) && $item->ingredient_id) {
                         $ing = Ingredient::find($item->ingredient_id);
                         $ingredientId = $ing?->id;
                         $costPerUnit = (float)($ing?->cost_per_unit ?? $ing?->harga ?? 0);

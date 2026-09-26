@@ -992,5 +992,61 @@ class MovementController extends Controller
             'id'     => $newUnit->id,
         ];
     }
+
+    /**
+     * Fitur Hapus / Rollback Mutasi Stok (Khusus Data Terakhir & Otoritas Owner Bisnis)
+     * Mengembalikan saldo stok dan menghitung ulang Moving Average bahan secara otomatis.
+     */
+    public function destroy(Request $request, StockMovement $movement)
+    {
+        $user = $request->user();
+        if (!$user || (!$user->isOwnerBisnis() && !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Hanya Owner Bisnis atau Admin Platform yang berwenang menghapus data mutasi stok.'
+            ], 403);
+        }
+
+        // Cek apakah ada mutasi stok yang lebih baru untuk bahan & outlet ini
+        $hasNewerMovement = StockMovement::where('ingredient_id', $movement->ingredient_id)
+            ->where('outlet_id', $movement->outlet_id)
+            ->where(function ($q) use ($movement) {
+                $q->where('date', '>', $movement->date)
+                  ->orWhere(function ($sub) use ($movement) {
+                      $sub->where('date', $movement->date)->where('id', '>', $movement->id);
+                  });
+            })
+            ->exists();
+
+        if ($hasNewerMovement) {
+            return response()->json([
+                'message' => 'Hanya transaksi mutasi paling terakhir pada bahan & cabang ini yang dapat dihapus agar saldo dan perhitungan HPP Moving Average tetap akurat.'
+            ], 422);
+        }
+
+        $ingredientId = $movement->ingredient_id;
+        $outletId     = $movement->outlet_id;
+        $refNo        = $movement->ref ?: "MVT-{$movement->id}";
+
+        DB::transaction(function () use ($movement, $ingredientId, $outletId) {
+            // Jika mutasi terkait hutang pembelian
+            if ($movement->payable_id) {
+                PayablePayment::where('payable_id', $movement->payable_id)->delete();
+                Payable::where('id', $movement->payable_id)->delete();
+            }
+
+            // Hapus record mutasi
+            $movement->delete();
+
+            // Hitung ulang Moving Average dan Saldo Stok
+            $ingredient = Ingredient::find($ingredientId);
+            if ($ingredient && $outletId) {
+                $ingredient->recomputeMovingAverageFromHistory((int)$outletId);
+            }
+        });
+
+        return response()->json([
+            'message' => "Transaksi mutasi {$refNo} berhasil dihapus. Saldo stok dan Moving Average (HPP) telah dikalkulasikan ulang secara real-time.",
+        ]);
+    }
 }
 

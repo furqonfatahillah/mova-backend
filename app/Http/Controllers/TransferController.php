@@ -1265,4 +1265,118 @@ class TransferController extends Controller
             'transfer' => $transfer,
         ]);
     }
+
+    /**
+     * Fitur Hapus / Rollback Transfer Stok (Khusus Data Terakhir & Otoritas Owner Bisnis)
+     * Mengembalikan saldo stok, memulihkan status barang, dan menghitung ulang Moving Average secara real-time.
+     */
+    public function destroy(Request $request, Transfer $transfer)
+    {
+        $user = $request->user();
+        if (!$user || (!$user->isOwnerBisnis() && !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Hanya Owner Bisnis atau Admin Platform yang berwenang menghapus transaksi transfer stok.'
+            ], 403);
+        }
+
+        // Cek apakah ada transfer berikutnya yang lebih baru pada cabang yang terlibat
+        $hasNewerTransfer = Transfer::where('business_id', $transfer->business_id)
+            ->where('id', '!=', $transfer->id)
+            ->where(function ($q) use ($transfer) {
+                if ($transfer->source_outlet_id) {
+                    $q->where('source_outlet_id', $transfer->source_outlet_id)
+                      ->orWhere('destination_outlet_id', $transfer->source_outlet_id);
+                }
+                if ($transfer->destination_outlet_id) {
+                    $q->orWhere('source_outlet_id', $transfer->destination_outlet_id)
+                      ->orWhere('destination_outlet_id', $transfer->destination_outlet_id);
+                }
+            })
+            ->where(function ($q) use ($transfer) {
+                $q->where('date', '>', $transfer->date)
+                  ->orWhere(function ($sub) use ($transfer) {
+                      $sub->where('date', $transfer->date)->where('id', '>', $transfer->id);
+                  });
+            })
+            ->exists();
+
+        if ($hasNewerTransfer) {
+            return response()->json([
+                'message' => 'Hanya transaksi transfer terakhir pada cabang ini yang dapat dihapus agar saldo stok dan kalkulasi HPP Moving Average tetap runut dan konsisten.'
+            ], 422);
+        }
+
+        DB::transaction(function () use ($transfer) {
+            // 1. Rollback & Hapus Hutang Supplier (jika ada)
+            if ($transfer->payable_id) {
+                PayablePayment::where('payable_id', $transfer->payable_id)->delete();
+                Payable::where('id', $transfer->payable_id)->delete();
+            }
+
+            // 2. Kumpulkan bahan dan outlet yang terdampak sebelum penghapusan
+            $affectedIngredients = [];
+
+            if ($transfer->source_outlet_id) {
+                foreach ($transfer->items as $item) {
+                    if ($item->ingredient_id) {
+                        $affectedIngredients[$item->ingredient_id][$transfer->source_outlet_id] = true;
+                    } elseif ($item->item_type === 'PRODUCT' && $item->menu_id) {
+                        $menu = Menu::find($item->menu_id);
+                        if ($menu && $menu->track_stock) {
+                            $inputQty = (float)($item->input_qty ?? $item->qty);
+                            if (Schema::hasTable('outlet_menus')) {
+                                $sourceOm = OutletMenu::where('outlet_id', $transfer->source_outlet_id)->where('menu_id', $menu->id)->first();
+                                $sourceOm?->increment('stock', $inputQty);
+                            }
+                            $menu->increment('stock', $inputQty);
+                        }
+                    }
+                }
+            }
+
+            if ($transfer->destination_outlet_id && in_array($transfer->status, ['COMPLETED', 'PARTIALLY_RETURNED', 'RETURNED'])) {
+                foreach ($transfer->items as $item) {
+                    if ($item->ingredient_id) {
+                        $affectedIngredients[$item->ingredient_id][$transfer->destination_outlet_id] = true;
+                    } elseif ($item->item_type === 'PRODUCT' && $item->menu_id) {
+                        $menu = Menu::find($item->menu_id);
+                        if ($menu && $menu->track_stock) {
+                            $receivedQty = (float)($item->received_qty ?? ($item->input_qty ?? $item->qty));
+                            if (Schema::hasTable('outlet_menus')) {
+                                $destOm = OutletMenu::where('outlet_id', $transfer->destination_outlet_id)->where('menu_id', $menu->id)->first();
+                                $destOm?->decrement('stock', $receivedQty);
+                            }
+                            $menu->decrement('stock', $receivedQty);
+                        }
+                    }
+                }
+            }
+
+            // 3. Hapus seluruh mutasi stok terkait transfer ini
+            StockMovement::where('transfer_id', $transfer->id)->delete();
+
+            // 4. Hapus Waste Log jika ada retur transfer yang dicatat sebagai waste
+            if (Schema::hasTable('waste_logs')) {
+                WasteLog::where('notes', 'like', "%{$transfer->transfer_no}%")->delete();
+            }
+
+            // 5. Hapus Transfer Items & Record Transfer
+            $transfer->items()->delete();
+            $transfer->delete();
+
+            // 6. Hitung ulang Moving Average & Saldo Stok untuk semua bahan dan cabang terdampak
+            foreach ($affectedIngredients as $ingredientId => $outlets) {
+                $ing = Ingredient::find($ingredientId);
+                if ($ing) {
+                    foreach (array_keys($outlets) as $outId) {
+                        $ing->recomputeMovingAverageFromHistory((int)$outId);
+                    }
+                }
+            }
+        });
+
+        return response()->json([
+            'message' => "Transfer {$transfer->transfer_no} berhasil dihapus. Stok telah dikembalikan dan seluruh HPP Moving Average telah dihitung ulang secara real-time.",
+        ]);
+    }
 }

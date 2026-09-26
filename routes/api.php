@@ -133,6 +133,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/transfers/{transfer}/approve-return', [TransferController::class, 'approveReturn']);
     Route::post('/transfers/{transfer}/reject-return',  [TransferController::class, 'rejectReturn']);
     Route::post('/transfers/{transfer}/cancel',         [TransferController::class, 'cancel']);
+    Route::delete('/transfers/{transfer}',              [TransferController::class, 'destroy']);
 
     // POS & Open Bills (Dine-in Table Management)
     Route::get('/transactions/open-bills',                               [TransactionController::class, 'openBills']);
@@ -161,6 +162,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/movements',          [MovementController::class, 'index']);
     Route::post('/movements/bulk',     [MovementController::class, 'bulkStore']);
     Route::post('/movements',         [MovementController::class, 'store']);
+    Route::delete('/movements/{movement}', [MovementController::class, 'destroy']);
     Route::get('/stock-card/summary', [MovementController::class, 'stockCardSummary']);
     Route::get('/stock-card',         [MovementController::class, 'stockCard']);
     Route::post('/stock-card/bulk-import-initial', [MovementController::class, 'bulkImportInitial']);

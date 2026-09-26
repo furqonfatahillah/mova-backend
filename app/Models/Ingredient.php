@@ -366,4 +366,109 @@ class Ingredient extends Model
             'last_price'  => $purchasePricePerUnitBeli,
         ];
     }
+
+    /**
+     * Rekalkulasi Ulang Moving Average & Saldo Stok Berdasarkan Seluruh Mutasi Historis
+     * Dipanggil saat terjadi pembatalan / penghapusan transaksi terakhir (Rollback).
+     */
+    public function recomputeMovingAverageFromHistory(int $outletId): array
+    {
+        $konversi = max((float)$this->konversi, 1);
+        $outletRow = OutletIngredient::where('outlet_id', $outletId)->where('ingredient_id', $this->id)->first();
+        $initialStock = $outletRow ? (float)$outletRow->stok_awal : ($outletId === 1 ? (float)$this->stok_awal : 0.0);
+        $initialHarga = $outletRow && $outletRow->harga !== null ? (float)$outletRow->harga : (float)$this->harga;
+        $initialCostPerPakai = $initialHarga / $konversi;
+
+        $runningStock = max($initialStock, 0.0);
+        $runningCostPerPakai = $initialCostPerPakai;
+        $lastPurchasePrice = $initialHarga;
+
+        // Ambil seluruh pergerakan stok untuk bahan dan outlet ini secara kronologis
+        $movements = StockMovement::where('ingredient_id', $this->id)
+            ->where('outlet_id', $outletId)
+            ->orderBy('date', 'asc')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        foreach ($movements as $m) {
+            $qty = (float)$m->qty;
+            if (in_array($m->type, ['PURCHASE', 'TRANSFER_IN', 'PREP_OUTPUT'])) {
+                // Mutasi masuk yang mempengaruhi moving average
+                $incomingPricePerBeli = (float)($m->unit_price ?: ($m->total_price > 0 && $qty > 0 ? $m->total_price / ($qty / $konversi) : $runningCostPerPakai * $konversi));
+                $incomingPricePerPakai = $incomingPricePerBeli / $konversi;
+                $lastPurchasePrice = $incomingPricePerBeli;
+
+                $costBefore = $runningCostPerPakai;
+                if ($runningStock + $qty > 0) {
+                    $costAfter = (($runningStock * $runningCostPerPakai) + ($qty * $incomingPricePerPakai)) / ($runningStock + $qty);
+                } else {
+                    $costAfter = $incomingPricePerPakai;
+                }
+
+                $m->cost_before = round($costBefore, 4);
+                $m->cost_after = round($costAfter, 4);
+                $m->saveQuietly();
+
+                $runningCostPerPakai = $costAfter;
+                $runningStock += $qty;
+            } elseif (in_array($m->type, ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS'])) {
+                $costBefore = $runningCostPerPakai;
+                if ($m->unit_price > 0) {
+                    $incomingPricePerPakai = (float)$m->unit_price / $konversi;
+                    if ($runningStock + $qty > 0) {
+                        $costAfter = (($runningStock * $runningCostPerPakai) + ($qty * $incomingPricePerPakai)) / ($runningStock + $qty);
+                    } else {
+                        $costAfter = $incomingPricePerPakai;
+                    }
+                } else {
+                    $costAfter = $runningCostPerPakai;
+                }
+
+                $m->cost_before = round($costBefore, 4);
+                $m->cost_after = round($costAfter, 4);
+                $m->saveQuietly();
+
+                $runningCostPerPakai = $costAfter;
+                $runningStock += $qty;
+            } else {
+                // Mutasi keluar (SALE_USAGE, WASTE, ADJUSTMENT_OUT, TRANSFER_OUT, PREP_USAGE)
+                $m->cost_before = round($runningCostPerPakai, 4);
+                $m->cost_after = round($runningCostPerPakai, 4);
+                $m->saveQuietly();
+
+                $runningStock -= $qty;
+            }
+        }
+
+        $newHargaBeli = round($runningCostPerPakai * $konversi, 2);
+
+        if ($outletRow) {
+            $outletRow->harga = $newHargaBeli;
+            $outletRow->last_purchase_price = $lastPurchasePrice;
+            $outletRow->save();
+        }
+
+        $isMainOutlet = (bool)(Outlet::find($outletId)?->is_main || $outletId === 1);
+        if ($isMainOutlet) {
+            $this->harga = $newHargaBeli;
+            $this->last_purchase_price = $lastPurchasePrice;
+            $this->save();
+        }
+
+        // Sinkronisasi update riwayat HPP Menu
+        try {
+            \App\Services\MenuHppService::recordForIngredientCostChange(
+                $this,
+                (float)$initialCostPerPakai,
+                (float)$runningCostPerPakai,
+                $outletId
+            );
+        } catch (\Throwable $e) {}
+
+        return [
+            'cost_per_pakai' => round($runningCostPerPakai, 4),
+            'harga_beli'     => $newHargaBeli,
+            'stock'          => round($runningStock, 3),
+        ];
+    }
 }

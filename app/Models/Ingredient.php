@@ -308,10 +308,19 @@ class Ingredient extends Model
         $currentStock = $outletId ? $this->stockForOutlet($outletId) : $this->consolidatedStock();
         $effectiveStock = max($currentStock, 0.0);
 
-        if ($effectiveStock + $incomingQtyPakai > 0) {
+        // Check if there are existing movements for this ingredient
+        $hasMovements = StockMovement::where('ingredient_id', $this->id)
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->exists();
+
+        if ($effectiveStock > 0 && ($effectiveStock + $incomingQtyPakai > 0)) {
             $oldValue = $effectiveStock * $costBefore;
             $newValue = $incomingQtyPakai * $incomingPricePerPakai;
             $costAfter = ($oldValue + $newValue) / ($effectiveStock + $incomingQtyPakai);
+        } elseif ($hasMovements && $costBefore > 0) {
+            // Ketika stok fisik sudah habis (0) tetapi sudah memiliki riwayat rata-rata berjalan sebelumnya,
+            // tetap dirata-ratakan dengan harga pembelian yang baru masuk
+            $costAfter = ($costBefore + $incomingPricePerPakai) / 2;
         } else {
             $costAfter = $incomingPricePerPakai;
         }
@@ -382,6 +391,8 @@ class Ingredient extends Model
         $runningStock = max($initialStock, 0.0);
         $runningCostPerPakai = $initialCostPerPakai;
         $lastPurchasePrice = $initialHarga;
+        $hasInitialStock = $initialStock > 0;
+        $hasProcessedFirstIn = false;
 
         // Ambil seluruh pergerakan stok untuk bahan dan outlet ini secara kronologis
         $movements = StockMovement::where('ingredient_id', $this->id)
@@ -399,12 +410,19 @@ class Ingredient extends Model
                 $lastPurchasePrice = $incomingPricePerBeli;
 
                 $costBefore = $runningCostPerPakai;
-                if ($runningStock + $qty > 0) {
+                if ($runningStock > 0 && ($runningStock + $qty > 0)) {
                     $costAfter = (($runningStock * $runningCostPerPakai) + ($qty * $incomingPricePerPakai)) / ($runningStock + $qty);
+                } elseif (!$hasInitialStock && !$hasProcessedFirstIn) {
+                    $costAfter = $incomingPricePerPakai;
+                    $costBefore = $incomingPricePerPakai;
+                } elseif ($runningCostPerPakai > 0) {
+                    // Ketika stok habis (0), tetap dirata-ratakan dengan moving average sebelumnya
+                    $costAfter = ($runningCostPerPakai + $incomingPricePerPakai) / 2;
                 } else {
                     $costAfter = $incomingPricePerPakai;
                 }
 
+                $hasProcessedFirstIn = true;
                 $m->cost_before = round($costBefore, 4);
                 $m->cost_after = round($costAfter, 4);
                 $m->saveQuietly();
@@ -415,8 +433,13 @@ class Ingredient extends Model
                 $costBefore = $runningCostPerPakai;
                 if ($m->unit_price > 0) {
                     $incomingPricePerPakai = (float)$m->unit_price / $konversi;
-                    if ($runningStock + $qty > 0) {
+                    if ($runningStock > 0 && ($runningStock + $qty > 0)) {
                         $costAfter = (($runningStock * $runningCostPerPakai) + ($qty * $incomingPricePerPakai)) / ($runningStock + $qty);
+                    } elseif (!$hasInitialStock && !$hasProcessedFirstIn) {
+                        $costAfter = $incomingPricePerPakai;
+                        $costBefore = $incomingPricePerPakai;
+                    } elseif ($runningCostPerPakai > 0) {
+                        $costAfter = ($runningCostPerPakai + $incomingPricePerPakai) / 2;
                     } else {
                         $costAfter = $incomingPricePerPakai;
                     }
@@ -424,6 +447,7 @@ class Ingredient extends Model
                     $costAfter = $runningCostPerPakai;
                 }
 
+                $hasProcessedFirstIn = true;
                 $m->cost_before = round($costBefore, 4);
                 $m->cost_after = round($costAfter, 4);
                 $m->saveQuietly();

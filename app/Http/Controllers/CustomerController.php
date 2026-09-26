@@ -248,6 +248,55 @@ class CustomerController extends Controller
     }
 
     /**
+     * Bulk delete customers for the current business.
+     */
+    public function bulkDelete(Request $request)
+    {
+        $businessId = $request->user()->business_id ?? null;
+        $ids = $request->input('ids', []);
+
+        if (empty($ids) || !is_array($ids)) {
+            return response()->json(['message' => 'Tidak ada member yang dipilih.'], 400);
+        }
+
+        $query = Customer::whereIn('id', $ids);
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
+        $customers = $query->get();
+
+        if ($customers->isEmpty()) {
+            return response()->json(['message' => 'Data member tidak ditemukan atau tidak memiliki hak akses.'], 404);
+        }
+
+        $deletedCount = 0;
+        $deactivatedCount = 0;
+
+        DB::transaction(function () use ($customers, &$deletedCount, &$deactivatedCount) {
+            foreach ($customers as $customer) {
+                $trxCount = $customer->transactions()->count();
+                if ($trxCount > 0) {
+                    $customer->update(['active' => false]);
+                    $deactivatedCount++;
+                } else {
+                    $customer->delete();
+                    $deletedCount++;
+                }
+            }
+        });
+
+        $msgParts = [];
+        if ($deletedCount > 0) $msgParts[] = "{$deletedCount} member dihapus";
+        if ($deactivatedCount > 0) $msgParts[] = "{$deactivatedCount} member dinonaktifkan (karena memiliki riwayat transaksi)";
+
+        return response()->json([
+            'message' => 'Berhasil memproses: ' . implode(', ', $msgParts) . '.',
+            'deleted_count' => $deletedCount,
+            'deactivated_count' => $deactivatedCount
+        ]);
+    }
+
+    /**
      * Autocomplete search for POS cashier.
      */
     public function searchForPos(Request $request)

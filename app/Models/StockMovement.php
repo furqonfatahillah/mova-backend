@@ -15,6 +15,7 @@ class StockMovement extends Model
         'date', 'ingredient_id', 'outlet_id', 'type', 'waste_reason', 'qty',
         'unit_price', 'total_price', 'cost_before', 'cost_after',
         'note', 'transaction_id', 'shift_id', 'transfer_id', 'batch_prep_id', 'user_id',
+        'payment_type', 'supplier_name', 'purchase_no', 'payable_id',
         'created_by', 'updated_by'
     ];
 
@@ -73,6 +74,11 @@ class StockMovement extends Model
     public function user()
     {
         return $this->belongsTo(\App\Models\User::class);
+    }
+
+    public function payable()
+    {
+        return $this->belongsTo(Payable::class);
     }
 
     /** Returns +qty for IN movements, -qty for OUT movements */

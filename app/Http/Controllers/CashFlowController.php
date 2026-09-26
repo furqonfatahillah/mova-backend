@@ -9,6 +9,8 @@ use App\Models\OperatingExpense;
 use App\Models\WasteLog;
 use App\Models\Receivable;
 use App\Models\ReceivablePayment;
+use App\Models\Payable;
+use App\Models\PayablePayment;
 use App\Http\Controllers\ReportController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -132,14 +134,21 @@ class CashFlowController extends Controller
         }
         $purchaseMovements = $movQuery->get();
 
-        $stockPurchasesTotal = 0.0;
+        $stockPurchasesCashTotal = 0.0;
+        $unpaidCreditPurchasesTotal = 0.0;
         $purchaseItemsSummary = [];
         foreach ($purchaseMovements as $m) {
             $ing = $m->ingredient;
             $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
             $unitCost = $m->unit_price > 0 ? (float)$m->unit_price : ($ing ? (float)$ing->harga / $konversi : 0);
             $totalCost = $m->total_price > 0 ? (float)$m->total_price : round((float)$m->qty * $unitCost, 2);
-            $stockPurchasesTotal += $totalCost;
+
+            $isCredit = (strtoupper($m->payment_type ?? '') === 'HUTANG');
+            if ($isCredit) {
+                $unpaidCreditPurchasesTotal += $totalCost;
+            } else {
+                $stockPurchasesCashTotal += $totalCost;
+            }
 
             if ($ing) {
                 $ingId = $ing->id;
@@ -158,6 +167,15 @@ class CashFlowController extends Controller
         usort($purchaseItemsSummary, fn($a, $b) => $b['total'] <=> $a['total']);
         $topPurchases = array_slice($purchaseItemsSummary, 0, 5);
 
+        // Kas keluar untuk pembayaran hutang supplier (Cicilan & Pelunasan Hutang + DP)
+        $payablePaymentQuery = PayablePayment::whereBetween('payment_date', [$from, $to]);
+        if ($outletId) {
+            $payablePaymentQuery->where(function ($q) use ($outletId) {
+                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
+            });
+        }
+        $supplierDebtCashOut = (float)$payablePaymentQuery->sum('amount');
+
         // Tambahan pembelian bahan langsung dari buku kas jika ada
         $extraSuppQuery = CashTransaction::where('category', 'SUPPLIER_PURCHASE')
             ->where('type', 'OUT')
@@ -168,7 +186,9 @@ class CashFlowController extends Controller
             });
         }
         $extraSupplierCash = (float)$extraSuppQuery->sum('amount');
-        $totalInventoryCashOut = $stockPurchasesTotal + $extraSupplierCash;
+
+        // Total arus kas keluar untuk persediaan: Belanja Tunai + Pembayaran Hutang Supplier + Kas Keluar Supplier Langsung
+        $totalInventoryCashOut = $stockPurchasesCashTotal + $supplierDebtCashOut + $extraSupplierCash;
 
         // C. Pengeluaran Kas untuk Beban Operasional Toko (Cash Paid for OPEX)
         $opexQuery = OperatingExpense::whereBetween('date', [$from, $to]);
@@ -421,9 +441,11 @@ class CashFlowController extends Controller
                     'total_inflows'          => round($totalOperatingInflows, 2),
                 ],
                 'outflows' => [
-                    'stock_purchases' => round($totalInventoryCashOut, 2),
-                    'opex_expenses'   => round($totalOperatingExpensesCashOut, 2),
-                    'total_outflows'  => round($totalOperatingOutflows, 2),
+                    'stock_purchases'        => round($totalInventoryCashOut, 2),
+                    'stock_purchases_direct' => round($stockPurchasesCashTotal, 2),
+                    'supplier_debt_payments' => round($supplierDebtCashOut, 2),
+                    'opex_expenses'          => round($totalOperatingExpensesCashOut, 2),
+                    'total_outflows'         => round($totalOperatingOutflows, 2),
                 ],
                 'top_purchases' => $topPurchases,
                 'net'           => $netOperatingCashFlow,

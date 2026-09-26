@@ -10,6 +10,10 @@ use App\Models\Ingredient;
 use App\Models\Menu;
 use App\Models\OutletMenu;
 use App\Models\WasteLog;
+use App\Models\Payable;
+use App\Models\PayablePayment;
+use App\Models\Supplier;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -101,6 +105,12 @@ class TransferController extends Controller
             'items.*.unit_price'    => 'nullable|numeric|min:0',
             'items.*.total_price'   => 'nullable|numeric|min:0',
             'items.*.notes'         => 'nullable|string|max:255',
+            'payment_type'          => 'nullable|string|in:INTERNAL,CASH,BANK,TRANSFER,QRIS,HUTANG',
+            'payment_method'        => 'nullable|string|max:50',
+            'supplier_name'         => 'nullable|string|max:150',
+            'purchase_no'           => 'nullable|string|max:100',
+            'due_date'              => 'nullable|date',
+            'initial_paid'          => 'nullable|numeric|min:0',
         ], [
             'items.min' => 'Pilih minimal satu barang atau bahan untuk ditransfer.',
         ]);
@@ -471,6 +481,71 @@ class TransferController extends Controller
                 }
             }
 
+            // Hitung total nilai transfer dari seluruh item
+            $totalTransferAmount = (float)TransferItem::where('transfer_id', $transfer->id)->sum('total_price');
+
+            $rawPaymentType = strtoupper(trim($validated['payment_type'] ?? 'INTERNAL'));
+            $isHutang = in_array($rawPaymentType, ['HUTANG', 'TEMPO']);
+            $paymentType = $isHutang ? 'HUTANG' : $rawPaymentType;
+            $initialPaid = (float)($validated['initial_paid'] ?? 0);
+            $payableId = null;
+
+            if ($isHutang && $totalTransferAmount > 0) {
+                $suppName = trim($validated['supplier_name'] ?? ($sourceOutlet ? $sourceOutlet->name : $sourceName));
+                $supp = Supplier::firstOrCreate(
+                    ['business_id' => $businessIdToAssign, 'name' => $suppName],
+                    ['active' => true]
+                );
+
+                $paidAmt = min($initialPaid, $totalTransferAmount);
+                $remAmt = max(0, $totalTransferAmount - $paidAmt);
+                $payStatus = ($remAmt <= 0) ? 'PAID' : ($paidAmt > 0 ? 'PARTIAL' : 'UNPAID');
+
+                $payable = Payable::create([
+                    'payable_no'       => Payable::generatePayableNo($businessIdToAssign, $date),
+                    'purchase_no'      => $validated['purchase_no'] ?? $transferNo,
+                    'business_id'      => $businessIdToAssign,
+                    'outlet_id'        => $destOutletId ?? $sourceOutletId,
+                    'supplier_id'      => $supp->id,
+                    'supplier_name'    => $suppName,
+                    'issue_date'       => $date,
+                    'due_date'         => $validated['due_date'] ?? Carbon::parse($date)->addDays(30)->toDateString(),
+                    'total_amount'     => $totalTransferAmount,
+                    'paid_amount'      => $paidAmt,
+                    'remaining_amount' => $remAmt,
+                    'status'           => $payStatus,
+                    'notes'            => "Transfer / Pengadaan Stok: {$transferNo} ({$transfer->total_items} item)",
+                    'created_by'       => $userId,
+                ]);
+
+                $payableId = $payable->id;
+
+                if ($paidAmt > 0) {
+                    PayablePayment::create([
+                        'payment_no'     => PayablePayment::generatePaymentNo($businessIdToAssign, $date),
+                        'payable_id'     => $payable->id,
+                        'business_id'    => $businessIdToAssign,
+                        'outlet_id'      => $destOutletId ?? $sourceOutletId,
+                        'payment_date'   => $date,
+                        'amount'         => $paidAmt,
+                        'payment_method' => $validated['payment_method'] ?? 'CASH',
+                        'notes'          => "Uang Muka (DP) Transfer {$transferNo}",
+                        'paid_by'        => $userId,
+                    ]);
+                }
+            }
+
+            $transfer->update([
+                'payment_type'   => $paymentType,
+                'payment_method' => $validated['payment_method'] ?? null,
+                'total_amount'   => $totalTransferAmount,
+                'supplier_name'  => $validated['supplier_name'] ?? null,
+                'purchase_no'    => $validated['purchase_no'] ?? null,
+                'due_date'       => $validated['due_date'] ?? null,
+                'initial_paid'   => $initialPaid,
+                'payable_id'     => $payableId,
+            ]);
+
             return $transfer;
         });
 
@@ -482,6 +557,7 @@ class TransferController extends Controller
             'creator',
             'updater',
             'receiver',
+            'payable',
             'stockMovements'
         ]);
 

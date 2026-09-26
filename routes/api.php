@@ -30,6 +30,7 @@ use App\Http\Controllers\ReceivableController;
 use App\Http\Controllers\CustomerController;
 use App\Http\Controllers\SalesReportController;
 use App\Http\Controllers\PaymentConfigurationController;
+use App\Http\Controllers\PayableController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -87,8 +88,10 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
 
     // Master Data
     Route::post('/ingredients/bulk-import',    [IngredientController::class, 'bulkImport']);
+    Route::post('/ingredients/bulk-delete',    [IngredientController::class, 'bulkDelete']);
     Route::post('/perlengkapans/bulk-import',  [IngredientController::class, 'bulkImportPerlengkapan']);
     Route::post('/menus/bulk-import',          [MenuController::class, 'bulkImport']);
+    Route::post('/menus/bulk-delete',          [MenuController::class, 'bulkDelete']);
     Route::post('/receivables/bulk-import',    [ReceivableController::class, 'bulkImport']);
     Route::post('/outlets/bulk-import',        [OutletController::class, 'bulkImport']);
     Route::apiResource('ingredients', IngredientController::class);
@@ -99,6 +102,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::apiResource('outlets', OutletController::class);
 
     // Master Customer / Member & Poin
+    Route::post('/customers/bulk-delete', [CustomerController::class, 'bulkDelete']);
     Route::get('/customers/search-pos', [CustomerController::class, 'searchForPos']);
     Route::apiResource('customers', CustomerController::class);
 
@@ -154,9 +158,11 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
 
     // Stock & Kartu Stok
     Route::get('/movements',          [MovementController::class, 'index']);
+    Route::post('/movements/bulk',     [MovementController::class, 'bulkStore']);
     Route::post('/movements',         [MovementController::class, 'store']);
     Route::get('/stock-card/summary', [MovementController::class, 'stockCardSummary']);
     Route::get('/stock-card',         [MovementController::class, 'stockCard']);
+    Route::post('/stock-card/bulk-import-initial', [MovementController::class, 'bulkImportInitial']);
 
     // Waste & Spoilage Tracking (Bahan Terbuang & Rusak)
     Route::get('/waste-logs/analytics', [WasteController::class, 'analytics']);
@@ -186,6 +192,14 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/receivables/{receivable}/payments',                   [ReceivableController::class, 'addPayment']);
     Route::delete('/receivables/{receivable}/payments/{payment}',       [ReceivableController::class, 'deletePayment']);
     Route::apiResource('receivables', ReceivableController::class);
+
+    // Hutang Supplier (Accounts Payable & Pembayaran Hutang)
+    Route::get('/payables/suppliers',                                   [PayableController::class, 'suppliers']);
+    Route::get('/payables/report',                                      [PayableController::class, 'report']);
+    Route::post('/payables/bulk-payment',                               [PayableController::class, 'bulkPayment']);
+    Route::post('/payables/{payable}/payments',                         [PayableController::class, 'addPayment']);
+    Route::delete('/payables/{payable}/payments/{payment}',             [PayableController::class, 'deletePayment']);
+    Route::apiResource('payables', PayableController::class);
 
     // Arus Kas Nyata (Cash Flow Statement & Mutasi Kas CapEx/Financing)
     Route::get('/cash-flow/statement',          [CashFlowController::class, 'statement']);

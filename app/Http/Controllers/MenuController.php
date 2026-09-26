@@ -208,8 +208,62 @@ class MenuController extends Controller
 
     public function destroy(Menu $menu)
     {
-        $menu->delete();
+        \Illuminate\Support\Facades\DB::transaction(function () use ($menu) {
+            \Illuminate\Support\Facades\DB::table('recipe_items')->where('menu_id', $menu->id)->delete();
+            \Illuminate\Support\Facades\DB::table('menu_modifiers')->where('menu_id', $menu->id)->delete();
+            \Illuminate\Support\Facades\DB::table('menu_outlets')->where('menu_id', $menu->id)->delete();
+            $menu->delete();
+        });
         return response()->json(['message' => 'Deleted']);
+    }
+
+    public function bulkDelete(Request $request)
+    {
+        $request->validate([
+            'ids'   => 'required|array|min:1',
+            'ids.*' => 'integer',
+        ]);
+
+        $user = $request->user();
+        $businessId = $user?->business_id;
+        $ids = $request->input('ids', []);
+
+        $query = Menu::whereIn('id', $ids);
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
+        $menus = $query->get();
+
+        if ($menus->isEmpty()) {
+            return response()->json(['message' => 'Tidak ada data menu yang ditemukan untuk dihapus.'], 404);
+        }
+
+        $deletedCount = 0;
+        \Illuminate\Support\Facades\DB::transaction(function () use ($menus, &$deletedCount) {
+            $validIds = $menus->pluck('id')->toArray();
+
+            \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('menu_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('menu_modifiers')->whereIn('menu_id', $validIds)->delete();
+            if (\Illuminate\Support\Facades\Schema::hasTable('menu_outlets')) {
+                \Illuminate\Support\Facades\DB::table('menu_outlets')->whereIn('menu_id', $validIds)->delete();
+            }
+            if (\Illuminate\Support\Facades\Schema::hasTable('outlet_menus')) {
+                \Illuminate\Support\Facades\DB::table('outlet_menus')->whereIn('menu_id', $validIds)->delete();
+            }
+            if (\Illuminate\Support\Facades\Schema::hasTable('bundle_items')) {
+                \Illuminate\Support\Facades\DB::table('bundle_items')->whereIn('menu_id', $validIds)->orWhereIn('bundled_menu_id', $validIds)->delete();
+            }
+
+            foreach ($menus as $m) {
+                $m->delete();
+                $deletedCount++;
+            }
+        });
+
+        return response()->json([
+            'message'       => "Berhasil menghapus {$deletedCount} data menu.",
+            'deleted_count' => $deletedCount,
+        ]);
     }
 
     /**
@@ -356,8 +410,32 @@ class MenuController extends Controller
             foreach ($items as $idx => $row) {
                 if (empty($row['name'])) continue;
 
-                $code = !empty($row['code']) ? trim($row['code']) : ('MNU-' . str_pad($idx + 1 + Menu::where('business_id', $businessId)->count(), 3, '0', STR_PAD_LEFT));
                 $name = trim($row['name']);
+                $lowerName = strtolower($name);
+
+                // Filter out accidental header / banner rows
+                if (
+                    str_starts_with($name, '===') ||
+                    str_contains($lowerName, 'template import') ||
+                    str_contains($lowerName, 'petunjuk') ||
+                    str_contains($lowerName, 'daftar menu') ||
+                    in_array($lowerName, ['kode menu', 'nama menu', 'nama menu*', 'kategori', 'kategori*', 'tipe item', 'harga jual'])
+                ) {
+                    continue;
+                }
+
+                $code = !empty($row['code']) ? trim($row['code']) : null;
+
+                // If user didn't specify a code, auto-generate next safe code for this business without collision
+                if (empty($code)) {
+                    $seq = Menu::where('business_id', $businessId)->count() + 1;
+                    do {
+                        $candidateCode = 'MNU-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                        $exists = Menu::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                        $seq++;
+                    } while ($exists);
+                    $code = $candidateCode;
+                }
 
                 $categoryName = !empty($row['category']) ? trim($row['category']) : 'Umum';
                 $cat = \App\Models\Category::firstOrCreate(
@@ -368,10 +446,10 @@ class MenuController extends Controller
                 Menu::updateOrCreate(
                     [
                         'business_id' => $businessId,
-                        'name'        => $name,
+                        'code'        => $code,
                     ],
                     [
-                        'code'         => $code,
+                        'name'         => $name,
                         'barcode'      => $row['barcode'] ?? null,
                         'category_id'  => $cat->id,
                         'category'     => $cat->name,

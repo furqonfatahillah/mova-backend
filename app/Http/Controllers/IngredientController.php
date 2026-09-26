@@ -182,8 +182,77 @@ class IngredientController extends Controller
 
     public function destroy(Ingredient $ingredient)
     {
-        $ingredient->delete();
-        return response()->json(['message' => 'Deleted']);
+        \Illuminate\Support\Facades\DB::transaction(function () use ($ingredient) {
+            \Illuminate\Support\Facades\DB::table('recipe_items')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('prep_recipe_items')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('sub_recipe_items')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('prep_recipes')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('menu_modifiers')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('waste_logs')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('stock_movements')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('opnames')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('outlet_ingredients')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('transfer_items')->where('ingredient_id', $ingredient->id)->delete();
+            \Illuminate\Support\Facades\DB::table('transfers')->where('ingredient_id', $ingredient->id)->delete();
+            if (\Illuminate\Support\Facades\Schema::hasTable('payables')) {
+                \Illuminate\Support\Facades\DB::table('payables')->where('ingredient_id', $ingredient->id)->update(['ingredient_id' => null]);
+            }
+            $ingredient->delete();
+        });
+
+        return response()->json(['message' => 'Bahan berhasil dihapus.']);
+    }
+
+    public function bulkDelete(Request $request)
+    {
+        $request->validate([
+            'ids'   => 'required|array|min:1',
+            'ids.*' => 'integer',
+        ]);
+
+        $user = $request->user();
+        $businessId = $user?->business_id;
+        $ids = $request->input('ids', []);
+
+        $query = Ingredient::whereIn('id', $ids);
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
+        $ingredients = $query->get();
+
+        if ($ingredients->isEmpty()) {
+            return response()->json(['message' => 'Tidak ada data bahan yang ditemukan untuk dihapus.'], 404);
+        }
+
+        $deletedCount = 0;
+        \Illuminate\Support\Facades\DB::transaction(function () use ($ingredients, &$deletedCount) {
+            $validIds = $ingredients->pluck('id')->toArray();
+
+            \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('prep_recipe_items')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('sub_recipe_items')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('prep_recipes')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('menu_modifiers')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('waste_logs')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('stock_movements')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('opnames')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('outlet_ingredients')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('transfer_items')->whereIn('ingredient_id', $validIds)->delete();
+            \Illuminate\Support\Facades\DB::table('transfers')->whereIn('ingredient_id', $validIds)->delete();
+            if (\Illuminate\Support\Facades\Schema::hasTable('payables')) {
+                \Illuminate\Support\Facades\DB::table('payables')->whereIn('ingredient_id', $validIds)->update(['ingredient_id' => null]);
+            }
+
+            foreach ($ingredients as $ing) {
+                $ing->delete();
+                $deletedCount++;
+            }
+        });
+
+        return response()->json([
+            'message'       => "Berhasil menghapus {$deletedCount} data master.",
+            'deleted_count' => $deletedCount,
+        ]);
     }
 
     public function bulkImport(Request $request)
@@ -202,8 +271,33 @@ class IngredientController extends Controller
             foreach ($items as $idx => $row) {
                 if (empty($row['name'])) continue;
 
-                $code = !empty($row['code']) ? trim($row['code']) : ('BHN-' . str_pad($idx + 1 + Ingredient::where('business_id', $businessId)->count(), 3, '0', STR_PAD_LEFT));
                 $name = trim($row['name']);
+                $lowerName = strtolower($name);
+
+                // Filter out accidental header / banner rows
+                if (
+                    str_starts_with($name, '===') ||
+                    str_contains($lowerName, 'template import') ||
+                    str_contains($lowerName, 'petunjuk') ||
+                    str_contains($lowerName, 'data bahan') ||
+                    in_array($lowerName, ['kode bahan', 'nama bahan', 'nama bahan*', 'kategori', 'tipe bahan', 'satuan beli', 'satuan pakai'])
+                ) {
+                    continue;
+                }
+
+                $code = !empty($row['code']) ? trim($row['code']) : null;
+                $name = trim($row['name']);
+
+                // If user didn't specify a code, auto-generate next safe code for this business without collision
+                if (empty($code)) {
+                    $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                    do {
+                        $candidateCode = 'BHN-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                        $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                        $seq++;
+                    } while ($exists);
+                    $code = $candidateCode;
+                }
 
                 $categoryName = !empty($row['category']) ? trim($row['category']) : 'BAHAN_BAKU';
                 $cat = Category::firstOrCreate(
@@ -231,13 +325,14 @@ class IngredientController extends Controller
                     }
                 }
 
+                // Match strictly by (business_id, code) so custom codes are honored per business
                 Ingredient::updateOrCreate(
                     [
                         'business_id' => $businessId,
-                        'name'        => $name,
+                        'code'        => $code,
                     ],
                     [
-                        'code'          => $code,
+                        'name'          => $name,
                         'category_id'   => $cat->id,
                         'category'      => $cat->name,
                         'type'          => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
@@ -282,7 +377,30 @@ class IngredientController extends Controller
                 if (empty($row['name'])) continue;
 
                 $name = trim($row['name']);
-                $code = !empty($row['code']) ? trim($row['code']) : ('PLK-' . str_pad($idx + 1 + Ingredient::where('business_id', $businessId)->count(), 3, '0', STR_PAD_LEFT));
+                $lowerName = strtolower($name);
+
+                if (
+                    str_starts_with($name, '===') ||
+                    str_contains($lowerName, 'template import') ||
+                    str_contains($lowerName, 'petunjuk') ||
+                    str_contains($lowerName, 'data perlengkapan') ||
+                    in_array($lowerName, ['kode perlengkapan', 'nama perlengkapan', 'nama perlengkapan*', 'kategori', 'satuan beli', 'satuan pakai'])
+                ) {
+                    continue;
+                }
+
+                $code = !empty($row['code']) ? trim($row['code']) : null;
+
+                // If user didn't specify a code, auto-generate next safe code for this business without collision
+                if (empty($code)) {
+                    $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                    do {
+                        $candidateCode = 'PLK-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                        $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                        $seq++;
+                    } while ($exists);
+                    $code = $candidateCode;
+                }
 
                 $categoryName = !empty($row['category']) ? trim($row['category']) : 'Perlengkapan';
                 $cat = Category::firstOrCreate(
@@ -308,13 +426,14 @@ class IngredientController extends Controller
                     }
                 }
 
+                // Match strictly by (business_id, code) so custom codes are honored per business
                 Ingredient::updateOrCreate(
                     [
                         'business_id' => $businessId,
-                        'name'        => $name,
+                        'code'        => $code,
                     ],
                     [
-                        'code'          => $code,
+                        'name'          => $name,
                         'category_id'   => $cat->id,
                         'category'      => $cat->name,
                         'type'          => 'RAW',

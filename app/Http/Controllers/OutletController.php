@@ -141,18 +141,44 @@ class OutletController extends Controller
             foreach ($items as $idx => $row) {
                 if (empty($row['name'])) continue;
 
-                $code = !empty($row['code']) ? trim($row['code']) : ('OUT-' . str_pad($idx + 1 + Outlet::where('business_id', $businessId)->count(), 3, '0', STR_PAD_LEFT));
                 $name = trim($row['name']);
+                $lowerName = strtolower($name);
+
+                // Filter out accidental header / banner rows
+                if (
+                    str_starts_with($name, '===') ||
+                    str_contains($lowerName, 'template import') ||
+                    str_contains($lowerName, 'petunjuk') ||
+                    str_contains($lowerName, 'daftar outlet') ||
+                    in_array($lowerName, ['kode outlet', 'nama outlet', 'nama outlet*', 'tipe', 'alamat'])
+                ) {
+                    continue;
+                }
+
+                $code = !empty($row['code']) ? trim($row['code']) : null;
+
+                // If user didn't specify a code, auto-generate next safe code for this business without collision
+                if (empty($code)) {
+                    $seq = Outlet::where('business_id', $businessId)->count() + 1;
+                    do {
+                        $candidateCode = 'OUT-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                        $exists = Outlet::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                        $seq++;
+                    } while ($exists);
+                    $code = $candidateCode;
+                }
+
                 $typeRaw = !empty($row['type']) ? strtoupper(trim($row['type'])) : 'CABANG';
                 $type = in_array($typeRaw, ['CABANG', 'PUSAT', 'GUDANG']) ? $typeRaw : 'CABANG';
 
                 Outlet::updateOrCreate(
                     [
                         'business_id' => $businessId,
-                        'name'        => $name,
+                        'code'        => $code,
                     ],
                     [
-                        'code'       => $code,
+                        'name'       => $name,
+                        'type'       => $type,
                         'address'    => $row['address'] ?? null,
                         'phone'      => $row['phone'] ?? null,
                         'pic_name'   => $row['pic_name'] ?? null,

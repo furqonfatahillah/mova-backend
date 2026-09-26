@@ -41,6 +41,14 @@ class Transfer extends Model
         'driver_name',
         'vehicle_no',
         'total_items',
+        'payment_type',
+        'payment_method',
+        'total_amount',
+        'supplier_name',
+        'purchase_no',
+        'due_date',
+        'initial_paid',
+        'payable_id',
         'created_by',
         'updated_by',
     ];
@@ -96,6 +104,11 @@ class Transfer extends Model
     public function stockMovements()
     {
         return $this->hasMany(StockMovement::class);
+    }
+
+    public function payable()
+    {
+        return $this->belongsTo(Payable::class);
     }
 
     public function getReceivedByNameAttribute(): ?string

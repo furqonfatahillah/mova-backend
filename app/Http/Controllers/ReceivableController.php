@@ -531,6 +531,19 @@ class ReceivableController extends Controller
                 if (empty($row['customer_name'])) continue;
 
                 $custName = trim($row['customer_name']);
+                $lowerCust = strtolower($custName);
+
+                // Filter out accidental header / banner rows
+                if (
+                    str_starts_with($custName, '===') ||
+                    str_contains($lowerCust, 'template import') ||
+                    str_contains($lowerCust, 'petunjuk') ||
+                    str_contains($lowerCust, 'daftar tagihan') ||
+                    in_array($lowerCust, ['nama pelanggan', 'nama pelanggan*', 'nama debitur', 'nomor hp', 'total tagihan'])
+                ) {
+                    continue;
+                }
+
                 $custPhone = !empty($row['customer_phone']) ? trim($row['customer_phone']) : null;
                 $custAddr = !empty($row['customer_address']) ? trim($row['customer_address']) : null;
 

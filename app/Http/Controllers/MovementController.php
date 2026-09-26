@@ -482,9 +482,16 @@ class MovementController extends Controller
         $grandTotalNilai = 0;
         $totalLowStock = 0;
 
+        $isHoldingOutlet = (bool)$outlet->is_main || ((int)$outletId === 1);
+
         foreach ($ingredients as $ing) {
             $outletRow = $ing->outletIngredients->first();
-            $stokAwalMaster = $outletRow ? (float) $outletRow->stok_awal : ($outletId === 1 ? (float) $ing->stok_awal : 0.0);
+            $stokAwalMaster = 0.0;
+            if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                $stokAwalMaster = (float)$outletRow->stok_awal;
+            } elseif ($isHoldingOutlet) {
+                $stokAwalMaster = (float)$ing->stok_awal;
+            }
             $stokMinOutlet  = $outletRow && $outletRow->stok_min !== null ? (float) $outletRow->stok_min : (float) $ing->stok_min;
 
             $priorSum = isset($priorMovements[$ing->id]) ? (float)$priorMovements[$ing->id] : 0.0;
@@ -576,8 +583,15 @@ class MovementController extends Controller
 
         // Opening balance and par level calculation per outlet
         if ($outletId) {
+            $ot = \App\Models\Outlet::find($outletId);
+            $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
             $outletRow = $ingredient->outletIngredients->firstWhere('outlet_id', $outletId);
-            $stokAwalMaster = $outletRow ? (float) $outletRow->stok_awal : ($outletId === 1 ? (float) $ingredient->stok_awal : 0.0);
+            $stokAwalMaster = 0.0;
+            if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                $stokAwalMaster = (float)$outletRow->stok_awal;
+            } elseif ($isHolding) {
+                $stokAwalMaster = (float)$ingredient->stok_awal;
+            }
             $stokMinOutlet  = $outletRow && $outletRow->stok_min !== null ? (float) $outletRow->stok_min : (float) $ingredient->stok_min;
         } else {
             // Consolidated across all branches

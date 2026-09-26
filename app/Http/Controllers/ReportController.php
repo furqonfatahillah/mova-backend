@@ -1357,6 +1357,12 @@ class ReportController extends Controller
         }
         $opnames = $opnQuery->get()->keyBy('ingredient_id');
 
+        $isHoldingOutlet = false;
+        if ($outletId) {
+            $ot = \App\Models\Outlet::find($outletId);
+            $isHoldingOutlet = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
+        }
+
         $result = [];
         foreach ($ingredients as $ing) {
             // ⚡ Only process THIS ingredient's movements — O(k) per ingredient
@@ -1366,7 +1372,12 @@ class ReportController extends Controller
             // Opening stock calculation
             if ($outletId) {
                 $outletRow = $ing->outletIngredients->firstWhere('outlet_id', $outletId);
-                $stokAwalMaster = $outletRow ? (float) $outletRow->stok_awal : ($outletId === 1 ? (float) $ing->stok_awal : 0.0);
+                $stokAwalMaster = 0.0;
+                if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                    $stokAwalMaster = (float)$outletRow->stok_awal;
+                } elseif ($isHoldingOutlet) {
+                    $stokAwalMaster = (float)$ing->stok_awal;
+                }
             } else {
                 $sumInit = (float) $ing->outletIngredients->sum('stok_awal');
                 $stokAwalMaster = $sumInit > 0 ? $sumInit : (float) $ing->stok_awal;

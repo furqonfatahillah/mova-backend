@@ -103,7 +103,16 @@ class Ingredient extends Model
             ? $this->outletIngredients->firstWhere('outlet_id', $outletId)
             : $this->outletIngredients()->where('outlet_id', $outletId)->first();
 
-        $stokAwal = $outletRow ? (float) $outletRow->stok_awal : ($outletId === 1 ? (float) $this->stok_awal : 0.0);
+        $stokAwal = 0.0;
+        if ($outletRow && (float)$outletRow->stok_awal > 0) {
+            $stokAwal = (float)$outletRow->stok_awal;
+        } else {
+            $ot = $outletRow?->outlet ?? \App\Models\Outlet::find($outletId);
+            $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
+            if ($isHolding) {
+                $stokAwal = (float)$this->stok_awal;
+            }
+        }
 
         if ($this->precomputedMovements !== null) {
             $movSum = (float) ($this->precomputedMovements[$outletId] ?? 0.0);
@@ -220,9 +229,13 @@ class Ingredient extends Model
             : $this->outletIngredients()->get()->keyBy('outlet_id');
 
         foreach ($outlets as $outlet) {
-            $initial = isset($outletIngs[$outlet->id])
-                ? (float) $outletIngs[$outlet->id]->stok_awal
-                : ($outlet->id === 1 ? (float) $this->stok_awal : 0.0);
+            $outletRow = $outletIngs[$outlet->id] ?? null;
+            $initial = 0.0;
+            if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                $initial = (float)$outletRow->stok_awal;
+            } elseif ($outlet->is_main || (int)$outlet->id === 1) {
+                $initial = (float)$this->stok_awal;
+            }
 
             $netMov = isset($movementsGrouped[$outlet->id]) ? (float) $movementsGrouped[$outlet->id] : 0.0;
             $current = round($initial + $netMov, 3);
@@ -394,7 +407,14 @@ class Ingredient extends Model
 
         $konversi = max((float)$this->konversi, 1);
         $outletRow = OutletIngredient::where('outlet_id', $outletId)->where('ingredient_id', $this->id)->first();
-        $initialStock = $outletRow ? (float)$outletRow->stok_awal : ($outletId === 1 ? (float)$this->stok_awal : 0.0);
+        $ot = \App\Models\Outlet::find($outletId);
+        $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
+        $initialStock = 0.0;
+        if ($outletRow && (float)$outletRow->stok_awal > 0) {
+            $initialStock = (float)$outletRow->stok_awal;
+        } elseif ($isHolding) {
+            $initialStock = (float)$this->stok_awal;
+        }
         $initialHarga = $outletRow && $outletRow->harga !== null ? (float)$outletRow->harga : (float)$this->harga;
         $initialCostPerPakai = $initialHarga / $konversi;
 

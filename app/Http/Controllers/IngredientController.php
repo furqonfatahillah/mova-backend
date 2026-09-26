@@ -73,6 +73,7 @@ class IngredientController extends Controller
             'tolerance'   => 'nullable|numeric|min:0|max:100',
             'yield_qty'   => 'nullable|numeric|min:0',
             'yield_unit'  => 'nullable|string|max:20',
+            'outlet_id'   => 'nullable',
             'active'      => 'nullable|boolean',
         ]);
 
@@ -105,6 +106,7 @@ class IngredientController extends Controller
             $data['unit_pakai_id'] = $unitPakaiInfo['id'];
         }
 
+        $targetOutletId = $request->input('outlet_id');
         $data['last_purchase_price'] = $data['harga'] ?? null;
         $ingredient = Ingredient::create($data);
 
@@ -114,13 +116,22 @@ class IngredientController extends Controller
             $businessOutlets = \App\Models\Outlet::all();
         }
         foreach ($businessOutlets as $bo) {
+            $isTarget = false;
+            if ($targetOutletId === 'ALL' || $targetOutletId === 'all') {
+                $isTarget = true;
+            } elseif (!empty($targetOutletId)) {
+                $isTarget = ((int)$bo->id === (int)$targetOutletId);
+            } else {
+                $isTarget = ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id);
+            }
+
             \App\Models\OutletIngredient::updateOrCreate(
                 [
                     'outlet_id'     => $bo->id,
                     'ingredient_id' => $ingredient->id,
                 ],
                 [
-                    'stok_awal'           => ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id) ? (float)($data['stok_awal'] ?? 0) : 0,
+                    'stok_awal'           => $isTarget ? (float)($data['stok_awal'] ?? 0) : 0,
                     'stok_min'            => (float)($data['stok_min'] ?? 0),
                     'harga'               => (float)($data['harga'] ?? 0),
                     'last_purchase_price' => (float)($data['harga'] ?? 0),

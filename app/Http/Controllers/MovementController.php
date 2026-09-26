@@ -480,7 +480,7 @@ class MovementController extends Controller
             $stokAkhir = round($stokAwalPeriod + $totalMasuk - $totalKeluar, 3);
             $hargaBeliOutlet = $ing->hargaForOutlet($outletId);
             $hargaPerPakai = $hargaBeliOutlet / max($ing->konversi, 1);
-            $nilaiStok = round(max($stokAkhir, 0) * $hargaPerPakai, 0);
+            $nilaiStok = round(max($stokAkhir, 0) * $hargaPerPakai, 2);
 
             $isLow = $stokAkhir <= $stokMinOutlet;
             if ($isLow) $totalLowStock++;
@@ -689,7 +689,7 @@ class MovementController extends Controller
             'stok_akhir'       => $stokAkhir,
             'stok_min'         => $stokMinOutlet,
             'is_below_min'     => $stokAkhir < $stokMinOutlet,
-            'nilai_stok_akhir' => round($stokAkhir * $hargaPerPakai, 0),
+            'nilai_stok_akhir' => round($stokAkhir * $hargaPerPakai, 2),
             'rows'             => $rows,
         ]);
     }

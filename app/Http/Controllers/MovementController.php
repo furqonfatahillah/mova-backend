@@ -75,18 +75,28 @@ class MovementController extends Controller
         $ingredient = Ingredient::findOrFail($data['ingredient_id']);
         $konversi = max((float)$ingredient->konversi, 1);
 
+        $isUnitBeli = (($request->unit_type ?? 'BELI') === 'BELI');
+        $qtyPakai = $isUnitBeli ? (float)$data['qty'] * $konversi : (float)$data['qty'];
+
         $costBefore = $ingredient->costPerPakaiForOutlet($outletId);
         $costAfter  = $costBefore;
         $sourcePricePerBeli = $ingredient->hargaForOutlet($outletId);
         $unitPrice  = $isUnitBeli ? $sourcePricePerBeli : $costBefore;
         $totalPrice = round(($qtyPakai / $konversi) * $sourcePricePerBeli, 2);
 
-        $isUnitBeli = ($request->unit_type === 'BELI');
-        $qtyPakai = $isUnitBeli ? (float)$data['qty'] * $konversi : (float)$data['qty'];
+        $targetOutlet = Outlet::find($outletId);
+        $isHolding = $targetOutlet ? (bool)$targetOutlet->is_main : ($outletId == 1);
 
         $rawPaymentType = strtoupper(trim($request->payment_type ?? 'CASH'));
-        $isHutang = in_array($rawPaymentType, ['HUTANG', 'TEMPO']);
-        $paymentType = $isHutang ? 'HUTANG' : ($rawPaymentType === 'TRANSFER' ? 'TRANSFER' : 'CASH');
+        if (!$isHolding) {
+            // Outlet Cabang: Pembelian Kas Only (Petty Cash Cabang)
+            $paymentType = 'CASH';
+            $isHutang = false;
+        } else {
+            // Holding: Hutang, Kas, dan Bank
+            $isHutang = in_array($rawPaymentType, ['HUTANG', 'TEMPO']);
+            $paymentType = $isHutang ? 'HUTANG' : (in_array($rawPaymentType, ['BANK', 'TRANSFER', 'QRIS']) ? 'BANK' : 'CASH');
+        }
         $payableId = null;
 
         if ($data['type'] === 'PURCHASE') {
@@ -235,11 +245,19 @@ class MovementController extends Controller
         } else {
             $outletId = $validated['outlet_id'] ?? $user?->outlet_id ?? 1;
         }
-        $businessId = $user?->business_id;
+        $targetOutlet = Outlet::find($outletId);
+        $isHolding = $targetOutlet ? (bool)$targetOutlet->is_main : ($outletId == 1);
 
         $rawPaymentType = strtoupper(trim($validated['payment_type'] ?? 'CASH'));
-        $isHutang = in_array($rawPaymentType, ['HUTANG', 'TEMPO']);
-        $paymentType = $isHutang ? 'HUTANG' : (in_array($rawPaymentType, ['BANK', 'TRANSFER', 'QRIS']) ? $rawPaymentType : 'CASH');
+        if (!$isHolding) {
+            // Outlet Cabang: Pembelian Kas Only (Petty Cash Cabang)
+            $paymentType = 'CASH';
+            $isHutang = false;
+        } else {
+            // Holding: Hutang, Kas, dan Bank
+            $isHutang = in_array($rawPaymentType, ['HUTANG', 'TEMPO']);
+            $paymentType = $isHutang ? 'HUTANG' : (in_array($rawPaymentType, ['BANK', 'TRANSFER', 'QRIS']) ? $rawPaymentType : 'CASH');
+        }
 
         $result = DB::transaction(function () use ($validated, $user, $outletId, $businessId, $isHutang, $paymentType) {
             $itemsData = [];

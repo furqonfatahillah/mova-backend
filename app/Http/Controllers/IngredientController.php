@@ -428,13 +428,27 @@ class IngredientController extends Controller
                     ]
                 );
 
+                $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
+                $matchedOutlet = null;
+                if (!empty($targetOutletName)) {
+                    $matchedOutlet = $businessOutlets->first(function ($o) use ($targetOutletName) {
+                        return strcasecmp(trim($o->name), $targetOutletName) === 0 ||
+                               strcasecmp(trim($o->code), $targetOutletName) === 0 ||
+                               str_contains(strtolower($o->name), strtolower($targetOutletName));
+                    });
+                }
+
                 // Sync/Initialize OutletIngredient for all business outlets
                 foreach ($businessOutlets as $bo) {
                     $outletRow = \App\Models\OutletIngredient::firstOrNew([
                         'outlet_id'     => $bo->id,
                         'ingredient_id' => $ing->id,
                     ]);
-                    if ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id) {
+                    $isTarget = $matchedOutlet
+                        ? ((int)$bo->id === (int)$matchedOutlet->id)
+                        : ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id);
+
+                    if ($isTarget) {
                         $outletRow->stok_awal = $initialStock;
                     } elseif ($outletRow->stok_awal === null) {
                         $outletRow->stok_awal = 0.0;
@@ -561,13 +575,27 @@ class IngredientController extends Controller
                     ]
                 );
 
+                $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
+                $matchedOutlet = null;
+                if (!empty($targetOutletName)) {
+                    $matchedOutlet = $businessOutlets->first(function ($o) use ($targetOutletName) {
+                        return strcasecmp(trim($o->name), $targetOutletName) === 0 ||
+                               strcasecmp(trim($o->code), $targetOutletName) === 0 ||
+                               str_contains(strtolower($o->name), strtolower($targetOutletName));
+                    });
+                }
+
                 // Sync/Initialize OutletIngredient for all business outlets
                 foreach ($businessOutlets as $bo) {
                     $outletRow = \App\Models\OutletIngredient::firstOrNew([
                         'outlet_id'     => $bo->id,
                         'ingredient_id' => $ing->id,
                     ]);
-                    if ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id) {
+                    $isTarget = $matchedOutlet
+                        ? ((int)$bo->id === (int)$matchedOutlet->id)
+                        : ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id);
+
+                    if ($isTarget) {
                         $outletRow->stok_awal = $initialStock;
                     } elseif ($outletRow->stok_awal === null) {
                         $outletRow->stok_awal = 0.0;

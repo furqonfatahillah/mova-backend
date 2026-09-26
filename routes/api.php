@@ -32,6 +32,7 @@ use App\Http\Controllers\SalesReportController;
 use App\Http\Controllers\PaymentConfigurationController;
 use App\Http\Controllers\PayableController;
 use App\Http\Controllers\BalanceSheetController;
+use App\Http\Controllers\PurchaseReportController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -230,6 +231,13 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/sales/peak-hours',            [SalesReportController::class, 'peakHours']);
     Route::get('/reports/sales/customer-receivables',  [SalesReportController::class, 'customerReceivables']);
     Route::get('/reports/sales/promos',                [SalesReportController::class, 'promos']);
+
+    // Purchase Reports (Laporan Pembelian Holding & Outlet)
+    Route::get('/reports/purchase/transactions',       [PurchaseReportController::class, 'transactions']);
+    Route::get('/reports/purchase/by-product',         [PurchaseReportController::class, 'byProduct']);
+    Route::get('/reports/purchase/by-supplier',        [PurchaseReportController::class, 'bySupplier']);
+    Route::get('/reports/purchase/payables',           [PurchaseReportController::class, 'payables']);
+    Route::get('/reports/purchase/shipments',          [PurchaseReportController::class, 'shipments']);
 
     // Rekening Bank & Payment Gateway Settings (Midtrans & Xendit)
     Route::get('/bank-accounts',                    [PaymentConfigurationController::class, 'indexBankAccounts']);

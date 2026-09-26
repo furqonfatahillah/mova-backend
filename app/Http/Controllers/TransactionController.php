@@ -47,6 +47,9 @@ class TransactionController extends Controller
         $pendingQty = $isDeficit ? round($requiredQty - $deductedQty, 3) : 0.0;
 
         // 1. If PAID and available portion > 0, immediately deduct physical stock via StockMovement
+        $costPerPakai = $ing->costPerPakaiForOutlet($outletId);
+        $totalCost = round($deductedQty * $costPerPakai, 2);
+
         if ($isPaid && $deductedQty > 0) {
             $noteText = $isDeficit
                 ? "{$orderNumber} – {$itemName} [Nota Urgent: Terpotong {$deductedQty} {$unit}, Tergantung {$pendingQty} {$unit}]"
@@ -59,6 +62,10 @@ class TransactionController extends Controller
                 'date'           => $date,
                 'type'           => 'SALE_USAGE',
                 'qty'            => $deductedQty,
+                'unit_price'     => $costPerPakai * max((float)$ing->konversi, 1),
+                'total_price'    => $totalCost,
+                'cost_before'    => $costPerPakai,
+                'cost_after'     => $costPerPakai,
                 'note'           => $noteText,
                 'transaction_id' => $trx->id,
                 'shift_id'       => $trx->shift_id,

@@ -161,6 +161,8 @@ class UrgentNoteController extends Controller
             if ($urgentNote->ingredient_id) {
                 $ing = Ingredient::findOrFail($urgentNote->ingredient_id);
                 $availableStock = $ing->stockForOutlet((int)$outletId);
+                $costPerPakai = $ing->costPerPakaiForOutlet((int)$outletId);
+                $totalCost = round($pendingQty * $costPerPakai, 2);
 
                 // Create StockMovement to deduct remaining deficit
                 $mov = StockMovement::create([
@@ -170,6 +172,10 @@ class UrgentNoteController extends Controller
                     'date'           => now()->toDateString(),
                     'type'           => 'SALE_USAGE',
                     'qty'            => $pendingQty,
+                    'unit_price'     => $costPerPakai * max((float)$ing->konversi, 1),
+                    'total_price'    => $totalCost,
+                    'cost_before'    => $costPerPakai,
+                    'cost_after'     => $costPerPakai,
                     'note'           => "{$urgentNote->order_number} – Pelunasan Nota Urgent: {$urgentNote->item_name} ({$pendingQty} {$urgentNote->unit})",
                     'transaction_id' => $urgentNote->transaction_id,
                     'user_id'        => $request->user()->id,

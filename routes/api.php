@@ -31,6 +31,7 @@ use App\Http\Controllers\CustomerController;
 use App\Http\Controllers\SalesReportController;
 use App\Http\Controllers\PaymentConfigurationController;
 use App\Http\Controllers\PayableController;
+use App\Http\Controllers\BalanceSheetController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -213,6 +214,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/variance/menus',      [ReportController::class, 'varianceMenus']);
     Route::get('/reports/profitability',       [ReportController::class, 'profitability']);
     Route::get('/reports/profit-loss',          [ReportController::class, 'profitAndLoss']);
+    Route::get('/reports/balance-sheet',        [BalanceSheetController::class, 'index']);
     Route::get('/reports/outlet-benchmark',    [ReportController::class, 'outletBenchmark']);
 
     // Sales Reports (Laporan Penjualan POS)

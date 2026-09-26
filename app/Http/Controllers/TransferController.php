@@ -338,6 +338,13 @@ class TransferController extends Controller
                     $prodUnitPrice = isset($itemData['unit_price']) && $itemData['unit_price'] !== '' ? (float)$itemData['unit_price'] : null;
                     $prodTotalPrice = isset($itemData['total_price']) && $itemData['total_price'] !== '' ? (float)$itemData['total_price'] : null;
 
+                    $isInternal = ($transfer->payment_type ?? 'INTERNAL') === 'INTERNAL';
+                    if ($isInternal || $prodUnitPrice === null) {
+                        $sourceCost = $sourceOutlet ? $menu->costPriceForOutlet($sourceOutlet->id) : (float)($menu->cost_price ?: ($menu->cost ?: $menu->price));
+                        $prodUnitPrice = $sourceCost;
+                        $prodTotalPrice = round($qty * $prodUnitPrice, 2);
+                    }
+
                     TransferItem::create([
                         'transfer_id' => $transfer->id,
                         'item_type'   => 'PRODUCT',
@@ -415,8 +422,19 @@ class TransferController extends Controller
                         $baseUnit = (string) ($ingredient->unit_pakai ?: $inputUnit);
                     }
 
+                    // Hitung harga modal/transfer real-time dari cabang asal (Moving Average)
+                    $sourcePricePerBeli = $sourceOutlet ? $ingredient->hargaForOutlet($sourceOutlet->id) : (float)$ingredient->harga;
+                    $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
+                    $itemTotalPrice = round(($baseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
+
+                    $isInternal = ($transfer->payment_type ?? 'INTERNAL') === 'INTERNAL';
                     $ingUnitPrice = isset($itemData['unit_price']) && $itemData['unit_price'] !== '' ? (float)$itemData['unit_price'] : null;
                     $ingTotalPrice = isset($itemData['total_price']) && $itemData['total_price'] !== '' ? (float)$itemData['total_price'] : null;
+
+                    if ($isInternal || $ingUnitPrice === null) {
+                        $ingUnitPrice = $isUnitBeli ? $sourcePricePerBeli : $sourcePricePerPakai;
+                        $ingTotalPrice = $itemTotalPrice;
+                    }
 
                     TransferItem::create([
                         'transfer_id'   => $transfer->id,
@@ -432,11 +450,6 @@ class TransferController extends Controller
                     ]);
 
                     $noteSuffix = $canConvert ? " ({$inputQty} {$inputUnit} ≈ " . number_format($baseQty, 0, ',', '.') . " {$baseUnit})" : "";
-
-                    // Hitung harga modal/transfer dari cabang asal
-                    $sourcePricePerBeli = $sourceOutlet ? $ingredient->hargaForOutlet($sourceOutlet->id) : (float)$ingredient->harga;
-                    $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
-                    $itemTotalPrice = round(($baseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
 
                     // 1. Mutasi TRANSFER_OUT dari outlet asal (langsung terpotong saat dikirim)
                     if ($sourceOutlet) {

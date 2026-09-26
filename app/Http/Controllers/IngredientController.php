@@ -180,23 +180,52 @@ class IngredientController extends Controller
         return response()->json($ingredient);
     }
 
+    private function cleanupIngredientRelations(array $validIds): void
+    {
+        if (empty($validIds)) {
+            return;
+        }
+
+        // 1. Tables to nullify references
+        $tablesToNullify = [
+            'payables'              => 'ingredient_id',
+            'modifier_options'      => 'ingredient_id',
+            'transaction_modifiers' => 'ingredient_id',
+            'urgent_notes'          => 'ingredient_id',
+            'menu_hpp_histories'    => 'ingredient_id',
+        ];
+
+        foreach ($tablesToNullify as $table => $column) {
+            if (\Illuminate\Support\Facades\Schema::hasTable($table) && \Illuminate\Support\Facades\Schema::hasColumn($table, $column)) {
+                \Illuminate\Support\Facades\DB::table($table)->whereIn($column, $validIds)->update([$column => null]);
+            }
+        }
+
+        // 2. Tables to delete child/dependent rows
+        $tablesToDelete = [
+            'recipe_items',
+            'prep_recipe_items',
+            'batch_preps',
+            'prep_recipes',
+            'bundle_items',
+            'waste_logs',
+            'stock_movements',
+            'opnames',
+            'outlet_ingredients',
+            'transfer_items',
+        ];
+
+        foreach ($tablesToDelete as $table) {
+            if (\Illuminate\Support\Facades\Schema::hasTable($table) && \Illuminate\Support\Facades\Schema::hasColumn($table, 'ingredient_id')) {
+                \Illuminate\Support\Facades\DB::table($table)->whereIn('ingredient_id', $validIds)->delete();
+            }
+        }
+    }
+
     public function destroy(Ingredient $ingredient)
     {
         \Illuminate\Support\Facades\DB::transaction(function () use ($ingredient) {
-            \Illuminate\Support\Facades\DB::table('recipe_items')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('prep_recipe_items')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('sub_recipe_items')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('prep_recipes')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('menu_modifiers')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('waste_logs')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('stock_movements')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('opnames')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('outlet_ingredients')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('transfer_items')->where('ingredient_id', $ingredient->id)->delete();
-            \Illuminate\Support\Facades\DB::table('transfers')->where('ingredient_id', $ingredient->id)->delete();
-            if (\Illuminate\Support\Facades\Schema::hasTable('payables')) {
-                \Illuminate\Support\Facades\DB::table('payables')->where('ingredient_id', $ingredient->id)->update(['ingredient_id' => null]);
-            }
+            $this->cleanupIngredientRelations([$ingredient->id]);
             $ingredient->delete();
         });
 
@@ -227,21 +256,7 @@ class IngredientController extends Controller
         $deletedCount = 0;
         \Illuminate\Support\Facades\DB::transaction(function () use ($ingredients, &$deletedCount) {
             $validIds = $ingredients->pluck('id')->toArray();
-
-            \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('prep_recipe_items')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('sub_recipe_items')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('prep_recipes')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('menu_modifiers')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('waste_logs')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('stock_movements')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('opnames')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('outlet_ingredients')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('transfer_items')->whereIn('ingredient_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('transfers')->whereIn('ingredient_id', $validIds)->delete();
-            if (\Illuminate\Support\Facades\Schema::hasTable('payables')) {
-                \Illuminate\Support\Facades\DB::table('payables')->whereIn('ingredient_id', $validIds)->update(['ingredient_id' => null]);
-            }
+            $this->cleanupIngredientRelations($validIds);
 
             foreach ($ingredients as $ing) {
                 $ing->delete();

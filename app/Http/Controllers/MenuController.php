@@ -210,8 +210,15 @@ class MenuController extends Controller
     {
         \Illuminate\Support\Facades\DB::transaction(function () use ($menu) {
             \Illuminate\Support\Facades\DB::table('recipe_items')->where('menu_id', $menu->id)->delete();
-            \Illuminate\Support\Facades\DB::table('menu_modifiers')->where('menu_id', $menu->id)->delete();
-            \Illuminate\Support\Facades\DB::table('menu_outlets')->where('menu_id', $menu->id)->delete();
+            if (\Illuminate\Support\Facades\Schema::hasTable('menu_modifier_groups')) {
+                \Illuminate\Support\Facades\DB::table('menu_modifier_groups')->where('menu_id', $menu->id)->delete();
+            }
+            if (\Illuminate\Support\Facades\Schema::hasTable('outlet_menus')) {
+                \Illuminate\Support\Facades\DB::table('outlet_menus')->where('menu_id', $menu->id)->delete();
+            }
+            if (\Illuminate\Support\Facades\Schema::hasTable('bundle_items')) {
+                \Illuminate\Support\Facades\DB::table('bundle_items')->where('menu_id', $menu->id)->orWhere('bundled_menu_id', $menu->id)->delete();
+            }
             $menu->delete();
         });
         return response()->json(['message' => 'Deleted']);
@@ -243,9 +250,8 @@ class MenuController extends Controller
             $validIds = $menus->pluck('id')->toArray();
 
             \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('menu_id', $validIds)->delete();
-            \Illuminate\Support\Facades\DB::table('menu_modifiers')->whereIn('menu_id', $validIds)->delete();
-            if (\Illuminate\Support\Facades\Schema::hasTable('menu_outlets')) {
-                \Illuminate\Support\Facades\DB::table('menu_outlets')->whereIn('menu_id', $validIds)->delete();
+            if (\Illuminate\Support\Facades\Schema::hasTable('menu_modifier_groups')) {
+                \Illuminate\Support\Facades\DB::table('menu_modifier_groups')->whereIn('menu_id', $validIds)->delete();
             }
             if (\Illuminate\Support\Facades\Schema::hasTable('outlet_menus')) {
                 \Illuminate\Support\Facades\DB::table('outlet_menus')->whereIn('menu_id', $validIds)->delete();

@@ -192,8 +192,11 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/expenses/summary',             [ExpenseController::class, 'summary']);
     Route::apiResource('expenses', ExpenseController::class);
 
-    // Kasbon Customer (Accounts Receivable & Pembayaran Kasbon)
+    // Kasbon Customer & AR Merchant (Accounts Receivable & Pembayaran Kasbon)
     Route::get('/receivables/customers',                                [ReceivableController::class, 'byCustomer']);
+    Route::get('/receivables/merchants',                                [ReceivableController::class, 'byMerchant']);
+    Route::post('/receivables/merchants/bulk-settle',                   [ReceivableController::class, 'bulkSettleMerchant']);
+    Route::post('/receivables/{id}/settle',                             [ReceivableController::class, 'settleMerchant']);
     Route::post('/receivables/bulk-payment',                            [ReceivableController::class, 'bulkPayment']);
     Route::post('/receivables/{receivable}/payments',                   [ReceivableController::class, 'addPayment']);
     Route::delete('/receivables/{receivable}/payments/{payment}',       [ReceivableController::class, 'deletePayment']);

@@ -882,7 +882,8 @@ class SalesReportController extends Controller
     }
 
     /**
-     * 7. Laporan Piutang Customer
+    /**
+     * 7. Laporan Buku Piutang (AR Customer & AR Merchant)
      */
     public function customerReceivables(Request $request)
     {
@@ -895,6 +896,10 @@ class SalesReportController extends Controller
         $outletId   = $this->getTargetOutletId($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId);
 
+        // Auto-sync POS transactions paid with QRIS or E-commerce channels
+        $recCtrl = new \App\Http\Controllers\ReceivableController();
+        $recCtrl->syncMerchantReceivables($businessId, $outletId);
+
         $query = Receivable::with(['customer', 'outlet'])
             ->where('business_id', $businessId)
             ->whereBetween('issue_date', [$request->from, $request->to])
@@ -904,10 +909,25 @@ class SalesReportController extends Controller
             $query->where('outlet_id', $outletId);
         }
 
+        // Filter by AR Type
+        if ($request->filled('ar_type') && $request->ar_type !== 'ALL' && $request->ar_type !== 'all') {
+            if ($request->ar_type === 'MERCHANT') {
+                $query->whereIn('ar_type', ['MERCHANT_QRIS', 'MERCHANT_ECOMMERCE']);
+            } else {
+                $query->where('ar_type', $request->ar_type);
+            }
+        }
+
+        // Filter by Settlement Status
+        if ($request->filled('settlement_status') && $request->settlement_status !== 'ALL' && $request->settlement_status !== 'all') {
+            $query->where('settlement_status', $request->settlement_status);
+        }
+
         if ($request->filled('search')) {
             $s = '%' . trim($request->search) . '%';
             $query->where(function ($q) use ($s) {
                 $q->where('customer_name', 'like', $s)
+                  ->orWhere('merchant_channel', 'like', $s)
                   ->orWhere('order_number', 'like', $s)
                   ->orWhere('receivable_no', 'like', $s);
             });
@@ -921,32 +941,57 @@ class SalesReportController extends Controller
         foreach ($receivables as $idx => $r) {
             $issueTs = strtotime($r->issue_date);
             $diffDays = max(0, (int)floor(($todayTs - $issueTs) / 86400));
+            $arType = $r->ar_type ?: 'CUSTOMER';
+            $channel = $r->merchant_channel ?: ($arType === 'CUSTOMER' ? 'Customer Kasbon' : 'QRIS');
+            $typeLabel = $arType === 'CUSTOMER' ? 'Piutang Pelanggan' : ($arType === 'MERCHANT_QRIS' ? 'AR Merchant QRIS' : 'AR Merchant E-Commerce');
 
             $items[] = [
-                'no'           => $idx + 1,
-                'customer'     => $r->customer_name ?: ($r->customer?->name ?: 'Walk-in Customer'),
-                'tanggal'      => $r->issue_date ? date('d/m/Y', strtotime($r->issue_date)) : '',
-                'jam'          => $r->created_at ? $r->created_at->format('H:i') : '00:00',
-                'no_penjualan' => $r->order_number ?: ($r->receivable_no ?: '-'),
-                'piutang'      => (float)$r->total_amount,
-                'dibayar'      => (float)$r->paid_amount,
-                'sisa_piutang' => (float)$r->remaining_amount,
-                'usia_piutang' => "{$diffDays} Hari",
-                'usia_days'    => $diffDays,
-                'jatuh_tempo'  => $r->due_date ? date('d/m/Y', strtotime($r->due_date)) : '-',
-                'status'       => $r->status,
+                'no'               => $idx + 1,
+                'customer'         => $r->customer_name ?: ($r->customer?->name ?: 'Walk-in Customer'),
+                'ar_type'          => $arType,
+                'ar_type_label'    => $typeLabel,
+                'merchant_channel' => $channel,
+                'tanggal'          => $r->issue_date ? date('d/m/Y', strtotime($r->issue_date)) : '',
+                'jam'              => $r->created_at ? $r->created_at->format('H:i') : '00:00',
+                'no_penjualan'     => $r->order_number ?: ($r->receivable_no ?: '-'),
+                'gross_amount'     => (float)$r->total_amount,
+                'mdr_fee'          => (float)($r->mdr_fee ?? 0),
+                'piutang'          => (float)$r->total_amount,
+                'dibayar'          => (float)$r->paid_amount,
+                'sisa_piutang'     => (float)$r->remaining_amount,
+                'net_amount'       => (float)($r->net_amount > 0 ? $r->net_amount : $r->total_amount),
+                'settlement_status'=> $r->settlement_status ?: (($r->status === 'PAID') ? 'SETTLED' : 'UNSETTLED'),
+                'settled_at'       => $r->settled_at ? $r->settled_at->format('d/m/Y') : null,
+                'settlement_bank'  => $r->settlement_bank,
+                'usia_piutang'     => "{$diffDays} Hari",
+                'usia_days'        => $diffDays,
+                'jatuh_tempo'      => $r->due_date ? date('d/m/Y', strtotime($r->due_date)) : '-',
+                'status'           => $r->status,
             ];
         }
 
+        $custItems = array_filter($items, fn($it) => $it['ar_type'] === 'CUSTOMER');
+        $qrisItems = array_filter($items, fn($it) => $it['ar_type'] === 'MERCHANT_QRIS');
+        $ecomItems = array_filter($items, fn($it) => $it['ar_type'] === 'MERCHANT_ECOMMERCE');
+
         $summary = [
-            'total_rows'         => count($items),
-            'total_piutang'      => array_sum(array_column($items, 'piutang')),
-            'total_dibayar'      => array_sum(array_column($items, 'dibayar')),
-            'total_sisa_piutang' => array_sum(array_column($items, 'sisa_piutang')),
+            'total_rows'               => count($items),
+            'total_piutang'            => array_sum(array_column($items, 'piutang')),
+            'total_dibayar'            => array_sum(array_column($items, 'dibayar')),
+            'total_sisa_piutang'       => array_sum(array_column($items, 'sisa_piutang')),
+            // Breakdown for Customer vs Merchant (QRIS & E-Commerce)
+            'total_customer_piutang'   => array_sum(array_column($custItems, 'piutang')),
+            'total_customer_sisa'      => array_sum(array_column($custItems, 'sisa_piutang')),
+            'total_merchant_qris'      => array_sum(array_column($qrisItems, 'piutang')),
+            'total_qris_unsettled'     => array_sum(array_column($qrisItems, 'sisa_piutang')),
+            'total_merchant_ecommerce' => array_sum(array_column($ecomItems, 'piutang')),
+            'total_ecommerce_unsettled'=> array_sum(array_column($ecomItems, 'sisa_piutang')),
+            'total_merchant_all'       => array_sum(array_column($qrisItems, 'piutang')) + array_sum(array_column($ecomItems, 'piutang')),
+            'total_merchant_unsettled' => array_sum(array_column($qrisItems, 'sisa_piutang')) + array_sum(array_column($ecomItems, 'sisa_piutang')),
         ];
 
         return response()->json([
-            'report_title'  => 'LAPORAN PIUTANG CUSTOMER',
+            'report_title'  => 'LAPORAN BUKU PIUTANG (AR CUSTOMER & AR MERCHANT)',
             'business_name' => $businessName,
             'outlet_name'   => $outletName,
             'period'        => ['from' => $request->from, 'to' => $request->to],

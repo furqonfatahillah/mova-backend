@@ -743,6 +743,48 @@ class TransactionController extends Controller
                     }
                 }
 
+                // Auto-create AR Merchant (QRIS or E-commerce) record
+                $pmUpper = strtoupper($data['payment_method'] ?? '');
+                $isQris = str_contains($pmUpper, 'QRIS');
+                $isEcommerce = in_array($pmUpper, ['GRAB', 'GRABFOOD', 'GOFOOD', 'SHOPEEFOOD', 'ECOMMERCE', 'TIKTOK', 'TOKOPEDIA', 'DELIVERY', 'ONLINE']) ||
+                               str_contains($pmUpper, 'GRAB') ||
+                               str_contains($pmUpper, 'GOFOOD') ||
+                               str_contains($pmUpper, 'SHOPEE');
+
+                if ($orderStatus === 'PAID' && ($isQris || $isEcommerce)) {
+                    $arType = $isQris ? 'MERCHANT_QRIS' : 'MERCHANT_ECOMMERCE';
+                    $channelName = $isQris ? 'QRIS' : ($pmUpper ?: 'E-COMMERCE');
+                    $mdrRate = $isQris ? 0.7 : 20.0;
+                    $mdrFee = round(($orderNetTotal * $mdrRate) / 100, 2);
+                    $netReceivable = round($orderNetTotal - $mdrFee, 2);
+
+                    \App\Models\Receivable::create([
+                        'receivable_no'     => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
+                        'business_id'       => $businessId,
+                        'outlet_id'         => $outletId,
+                        'transaction_id'    => $results[0]->id ?? null,
+                        'customer_id'       => $customerId,
+                        'ar_type'           => $arType,
+                        'merchant_channel'  => $channelName,
+                        'order_number'      => $orderNumber,
+                        'customer_name'     => "AR Merchant - {$channelName}",
+                        'customer_phone'    => null,
+                        'customer_address'  => null,
+                        'issue_date'        => $data['date'],
+                        'due_date'          => $data['date'],
+                        'total_amount'      => $orderNetTotal,
+                        'paid_amount'       => 0,
+                        'remaining_amount'  => $netReceivable,
+                        'mdr_rate'          => $mdrRate,
+                        'mdr_fee'           => $mdrFee,
+                        'net_amount'        => $netReceivable,
+                        'status'            => 'UNPAID',
+                        'settlement_status' => 'UNSETTLED',
+                        'notes'             => "AR Merchant {$channelName} POS — Order #{$orderNumber}",
+                        'created_by'        => $request->user()->id,
+                    ]);
+                }
+
                 // Deduct SaaS platform coins for completed nota
                 if ($orderStatus === 'PAID') {
                     CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
@@ -1364,6 +1406,48 @@ class TransactionController extends Controller
                         'received_by'    => $request->user()->id,
                     ]);
                 }
+            }
+
+            // Auto-create AR Merchant (QRIS or E-commerce) record
+            $pmUpper = strtoupper($data['payment_method'] ?? '');
+            $isQris = str_contains($pmUpper, 'QRIS');
+            $isEcommerce = in_array($pmUpper, ['GRAB', 'GRABFOOD', 'GOFOOD', 'SHOPEEFOOD', 'ECOMMERCE', 'TIKTOK', 'TOKOPEDIA', 'DELIVERY', 'ONLINE']) ||
+                           str_contains($pmUpper, 'GRAB') ||
+                           str_contains($pmUpper, 'GOFOOD') ||
+                           str_contains($pmUpper, 'SHOPEE');
+
+            if ($orderStatus === 'PAID' && ($isQris || $isEcommerce)) {
+                $arType = $isQris ? 'MERCHANT_QRIS' : 'MERCHANT_ECOMMERCE';
+                $channelName = $isQris ? 'QRIS' : ($pmUpper ?: 'E-COMMERCE');
+                $mdrRate = $isQris ? 0.7 : 20.0;
+                $mdrFee = round(($orderNetTotal * $mdrRate) / 100, 2);
+                $netReceivable = round($orderNetTotal - $mdrFee, 2);
+
+                \App\Models\Receivable::create([
+                    'receivable_no'     => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
+                    'business_id'       => $businessId,
+                    'outlet_id'         => $outletId,
+                    'transaction_id'    => $results[0]->id ?? null,
+                    'customer_id'       => $customerId,
+                    'ar_type'           => $arType,
+                    'merchant_channel'  => $channelName,
+                    'order_number'      => $orderNumber,
+                    'customer_name'     => "AR Merchant - {$channelName}",
+                    'customer_phone'    => null,
+                    'customer_address'  => null,
+                    'issue_date'        => $data['date'],
+                    'due_date'          => $data['date'],
+                    'total_amount'      => $orderNetTotal,
+                    'paid_amount'       => 0,
+                    'remaining_amount'  => $netReceivable,
+                    'mdr_rate'          => $mdrRate,
+                    'mdr_fee'           => $mdrFee,
+                    'net_amount'        => $netReceivable,
+                    'status'            => 'UNPAID',
+                    'settlement_status' => 'UNSETTLED',
+                    'notes'             => "AR Merchant {$channelName} POS — Order #{$orderNumber}",
+                    'created_by'        => $request->user()->id,
+                ]);
             }
 
             // Deduct SaaS platform coins for completed nota

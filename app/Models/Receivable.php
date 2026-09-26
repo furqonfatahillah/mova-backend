@@ -26,6 +26,15 @@ class Receivable extends Model
         'paid_amount',
         'remaining_amount',
         'status',
+        'ar_type',
+        'merchant_channel',
+        'mdr_rate',
+        'mdr_fee',
+        'net_amount',
+        'settlement_status',
+        'settled_at',
+        'settlement_bank',
+        'settlement_ref',
         'notes',
         'created_by',
         'updated_by',
@@ -37,6 +46,10 @@ class Receivable extends Model
         'total_amount'     => 'float',
         'paid_amount'      => 'float',
         'remaining_amount' => 'float',
+        'mdr_rate'         => 'float',
+        'mdr_fee'          => 'float',
+        'net_amount'       => 'float',
+        'settled_at'       => 'datetime',
     ];
 
     protected $appends = [

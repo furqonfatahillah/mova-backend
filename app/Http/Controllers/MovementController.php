@@ -77,8 +77,9 @@ class MovementController extends Controller
 
         $costBefore = $ingredient->costPerPakaiForOutlet($outletId);
         $costAfter  = $costBefore;
-        $unitPrice  = null;
-        $totalPrice = null;
+        $sourcePricePerBeli = $ingredient->hargaForOutlet($outletId);
+        $unitPrice  = $isUnitBeli ? $sourcePricePerBeli : $costBefore;
+        $totalPrice = round(($qtyPakai / $konversi) * $sourcePricePerBeli, 2);
 
         $isUnitBeli = ($request->unit_type === 'BELI');
         $qtyPakai = $isUnitBeli ? (float)$data['qty'] * $konversi : (float)$data['qty'];
@@ -254,8 +255,9 @@ class MovementController extends Controller
 
                 $costBefore = $ingredient->costPerPakaiForOutlet($outletId);
                 $costAfter = $costBefore;
-                $unitPrice = null;
-                $totalPrice = null;
+                $sourcePricePerBeli = $ingredient->hargaForOutlet($outletId);
+                $unitPrice = $isUnitBeli ? $sourcePricePerBeli : $costBefore;
+                $totalPrice = round(($qtyPakai / $konversi) * $sourcePricePerBeli, 2);
 
                 if ($validated['type'] === 'PURCHASE') {
                     if (isset($item['unit_price']) && (float)$item['unit_price'] > 0) {

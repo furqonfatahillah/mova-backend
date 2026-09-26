@@ -7,6 +7,8 @@ use App\Models\Transaction;
 use App\Models\StockMovement;
 use App\Models\OperatingExpense;
 use App\Models\WasteLog;
+use App\Models\Receivable;
+use App\Models\ReceivablePayment;
 use App\Http\Controllers\ReportController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -33,7 +35,9 @@ class CashFlowController extends Controller
         // 1. ARUS KAS DARI AKTIVITAS OPERASI (OPERATING CASH FLOW / OCF)
         // =========================================================================
         
-        // A. Penerimaan Kas dari Penjualan Kasir (Cash Inflows from Sales)
+        // A. Penerimaan Kas dari Penjualan Kasir Langsung (Direct Cash/Instant Sales Inflows)
+        // Hanya menghitung transaksi tunai/instan riil (CASH, QRIS, TRANSFER, DEBIT, GRAB, dll).
+        // Transaksi KASBON / PIUTANG TIDAK dihitung di sini karena belum ada uang kas yang masuk saat nota dibuat.
         $trxQuery = Transaction::where('status', 'PAID')
             ->whereBetween('date', [$from, $to]);
         if ($outletId) {
@@ -46,10 +50,17 @@ class CashFlowController extends Controller
         $transferSales = 0.0;
         $debitSales = 0.0;
         $otherSales = 0.0;
+        $newKasbonTotal = 0.0;
 
         foreach ($transactions as $t) {
             $amt = (float)$t->total_price;
-            $method = strtoupper($t->payment_method ?: 'CASH');
+            $method = strtoupper(trim($t->payment_method ?: 'CASH'));
+
+            if (in_array($method, ['KASBON', 'PIUTANG'])) {
+                // Kasbon baru belum menghasilkan kas masuk saat transaksi kasir dibuat
+                $newKasbonTotal += $amt;
+                continue;
+            }
 
             if ($method === 'CASH') {
                 $cashSales += $amt;
@@ -64,7 +75,41 @@ class CashFlowController extends Controller
             }
         }
 
-        $totalSalesReceipts = $cashSales + $qrisSales + $transferSales + $debitSales + $otherSales;
+        $totalDirectSalesReceipts = $cashSales + $qrisSales + $transferSales + $debitSales + $otherSales;
+
+        // B. Penerimaan Kas dari Pembayaran Kasbon Pelanggan (Receivable Collections)
+        // HANYA uang kas yang benar-benar dibayarkan oleh customer (ada uang kas riil masuk ke kasir/rekening)
+        $recPayQuery = ReceivablePayment::with(['receivable', 'receiver', 'outlet'])
+            ->whereBetween('payment_date', [$from, $to]);
+        if ($outletId) {
+            $recPayQuery->where('outlet_id', $outletId);
+        }
+        $receivablePayments = $recPayQuery->get();
+
+        $receivableCashIn = 0.0;
+        $recPayCash = 0.0;
+        $recPayTransfer = 0.0;
+        $recPayQris = 0.0;
+        $recPayDebit = 0.0;
+        $recPayOther = 0.0;
+
+        foreach ($receivablePayments as $rp) {
+            $rpAmt = (float)$rp->amount;
+            $receivableCashIn += $rpAmt;
+            $rpMethod = strtoupper(trim($rp->payment_method ?: 'CASH'));
+
+            if ($rpMethod === 'CASH') {
+                $recPayCash += $rpAmt;
+            } elseif ($rpMethod === 'TRANSFER') {
+                $recPayTransfer += $rpAmt;
+            } elseif ($rpMethod === 'QRIS') {
+                $recPayQris += $rpAmt;
+            } elseif ($rpMethod === 'DEBIT') {
+                $recPayDebit += $rpAmt;
+            } else {
+                $recPayOther += $rpAmt;
+            }
+        }
 
         // Penerimaan Operasional Lainnya dari buku kas manual
         $extraOpInQuery = CashTransaction::where('activity_type', 'OPERATING')
@@ -76,7 +121,7 @@ class CashFlowController extends Controller
             });
         }
         $extraOpIn = (float)$extraOpInQuery->sum('amount');
-        $totalOperatingInflows = $totalSalesReceipts + $extraOpIn;
+        $totalOperatingInflows = $totalDirectSalesReceipts + $receivableCashIn + $extraOpIn;
 
         // B. Pengeluaran Kas untuk Belanja Persediaan Bahan Baku (Cash Paid for Inventory Purchases)
         $movQuery = StockMovement::with(['ingredient'])
@@ -275,6 +320,20 @@ class CashFlowController extends Controller
                 'effect'      => 'ADD',
             ],
             [
+                'step'        => 'receivable_unpaid_deduct',
+                'title'       => '(-) Penjualan Kasbon Baru Belum Diterima Kasnya',
+                'description' => 'Omzet kasbon diakui di laba P&L, namun uang kasnya belum masuk ke kasir/bank',
+                'amount'      => -$newKasbonTotal,
+                'effect'      => 'SUBTRACT',
+            ],
+            [
+                'step'        => 'receivable_payment_add',
+                'title'       => '(+) Penerimaan Kas dari Pembayaran Kasbon Pelanggan',
+                'description' => 'Uang kas riil yang masuk dari pelunasan atau cicilan kasbon oleh customer',
+                'amount'      => $receivableCashIn,
+                'effect'      => 'ADD',
+            ],
+            [
                 'step'        => 'capex_deduct',
                 'title'       => '(-) Belanja Modal / Aset Resto (CapEx)',
                 'description' => 'Pengeluaran kas untuk beli kulkas, chiller, renovasi toko, dan mesin baru',
@@ -330,13 +389,36 @@ class CashFlowController extends Controller
             ],
             'operating' => [
                 'inflows' => [
-                    'cash_sales'      => round($cashSales, 2),
-                    'qris_sales'      => round($qrisSales, 2),
-                    'transfer_sales'  => round($transferSales, 2),
-                    'debit_sales'     => round($debitSales, 2),
-                    'other_sales'     => round($otherSales, 2),
-                    'extra_income'    => round($extraOpIn, 2),
-                    'total_inflows'   => round($totalOperatingInflows, 2),
+                    'cash_sales'             => round($cashSales, 2),
+                    'qris_sales'             => round($qrisSales, 2),
+                    'transfer_sales'         => round($transferSales, 2),
+                    'debit_sales'            => round($debitSales, 2),
+                    'other_sales'            => round($otherSales, 2),
+                    'direct_sales_total'     => round($totalDirectSalesReceipts, 2),
+                    'receivable_collections' => round($receivableCashIn, 2),
+                    'receivable_breakdown'   => [
+                        'cash'     => round($recPayCash, 2),
+                        'transfer' => round($recPayTransfer, 2),
+                        'qris'     => round($recPayQris, 2),
+                        'debit'    => round($recPayDebit, 2),
+                        'other'    => round($recPayOther, 2),
+                        'count'    => $receivablePayments->count(),
+                    ],
+                    'receivable_payments'    => $receivablePayments->map(fn($rp) => [
+                        'id'             => $rp->id,
+                        'payment_no'     => $rp->payment_no,
+                        'receivable_no'  => $rp->receivable?->receivable_no,
+                        'customer_name'  => $rp->receivable?->customer_name ?? 'Pelanggan Kasbon',
+                        'payment_date'   => $rp->payment_date ? (is_string($rp->payment_date) ? substr($rp->payment_date, 0, 10) : $rp->payment_date->format('Y-m-d')) : null,
+                        'amount'         => (float)$rp->amount,
+                        'payment_method' => strtoupper($rp->payment_method ?: 'CASH'),
+                        'notes'          => $rp->notes,
+                        'outlet_name'    => $rp->outlet?->name ?? 'Cabang',
+                        'receiver_name'  => $rp->receiver?->name ?? 'Kasir',
+                    ])->values(),
+                    'unpaid_kasbon_omzet'    => round($newKasbonTotal, 2),
+                    'extra_income'           => round($extraOpIn, 2),
+                    'total_inflows'          => round($totalOperatingInflows, 2),
                 ],
                 'outflows' => [
                     'stock_purchases' => round($totalInventoryCashOut, 2),

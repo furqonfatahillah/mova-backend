@@ -289,6 +289,10 @@ class TransactionController extends Controller
             $query->where('payment_method', $request->payment_method);
         }
 
+        if ($request->boolean('exclude_kasbon')) {
+            $query->whereNotIn(DB::raw('UPPER(payment_method)'), ['KASBON', 'PIUTANG']);
+        }
+
         if ($request->filled('search')) {
             $s = trim($request->search);
             $query->where(function ($q) use ($s) {

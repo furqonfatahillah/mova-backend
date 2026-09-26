@@ -18,7 +18,7 @@ class PaymentConfigurationController extends Controller
     public function indexBankAccounts(Request $request)
     {
         $user = $request->user();
-        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || Boolean($user->is_superadmin_platform ?? false);
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || (bool)($user->is_superadmin_platform ?? false);
 
         $query = BankAccount::with(['outlet', 'business'])
             ->orderBy('is_primary', 'desc')
@@ -52,7 +52,7 @@ class PaymentConfigurationController extends Controller
     public function storeBankAccount(Request $request)
     {
         $user = $request->user();
-        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || Boolean($user->is_superadmin_platform ?? false);
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || (bool)($user->is_superadmin_platform ?? false);
 
         $validated = $request->validate([
             'business_id'         => 'nullable|exists:businesses,id',
@@ -105,7 +105,7 @@ class PaymentConfigurationController extends Controller
     public function updateBankAccount(Request $request, $id)
     {
         $user = $request->user();
-        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || Boolean($user->is_superadmin_platform ?? false);
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || (bool)($user->is_superadmin_platform ?? false);
 
         $query = BankAccount::query();
         if (!$isPlatformAdmin) {

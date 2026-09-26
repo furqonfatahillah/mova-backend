@@ -166,6 +166,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::delete('/movements/{movement}', [MovementController::class, 'destroy']);
     Route::get('/stock-card/summary', [MovementController::class, 'stockCardSummary']);
     Route::get('/stock-card',         [MovementController::class, 'stockCard']);
+    Route::post('/stock-card/recalculate-all', [MovementController::class, 'recalculateAll']);
     Route::post('/stock-card/bulk-import-initial', [MovementController::class, 'bulkImportInitial']);
 
     // Waste & Spoilage Tracking (Bahan Terbuang & Rusak)

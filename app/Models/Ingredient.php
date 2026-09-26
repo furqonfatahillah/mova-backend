@@ -413,8 +413,17 @@ class Ingredient extends Model
      * Rekalkulasi Ulang Moving Average & Saldo Stok Berdasarkan Seluruh Mutasi Historis
      * Dipanggil saat terjadi pembatalan / penghapusan transaksi terakhir (Rollback).
      */
-    public function recomputeMovingAverageFromHistory(int $outletId): array
+    /**
+     * Hitung ulang Moving Average dari awal riwayat mutasi bahan pada suatu outlet secara kronologis.
+     * Mengalirkan (cascade) pembaruan HPP transfer keluar ke cabang tujuan penerima secara otomatis.
+     */
+    public function recomputeMovingAverageFromHistory(int $outletId, array &$visitedOutlets = []): array
     {
+        if (in_array($outletId, $visitedOutlets)) {
+            return [];
+        }
+        $visitedOutlets[] = $outletId;
+
         $konversi = max((float)$this->konversi, 1);
         $outletRow = OutletIngredient::where('outlet_id', $outletId)->where('ingredient_id', $this->id)->first();
         $initialStock = $outletRow ? (float)$outletRow->stok_awal : ($outletId === 1 ? (float)$this->stok_awal : 0.0);
@@ -434,6 +443,8 @@ class Ingredient extends Model
             ->orderBy('date', 'asc')
             ->orderBy('id', 'asc')
             ->get();
+
+        $downstreamOutlets = [];
 
         foreach ($movements as $m) {
             $qty = (float)$m->qty;
@@ -473,8 +484,48 @@ class Ingredient extends Model
 
                 $runningCostPerPakai = $costAfter;
                 $runningStock += $qty;
+            } elseif ($m->type === 'TRANSFER_OUT') {
+                // Transfer keluar: HPP dan harga transfer diperbarui sesuai moving average cabang asal saat transaksi terjadi
+                $currentPricePerBeli = round($runningCostPerPakai * $konversi, 2);
+                $currentTotalPrice = round(($qty / $konversi) * $currentPricePerBeli, 2);
+
+                $m->unit_price  = $currentPricePerBeli;
+                $m->total_price = $currentTotalPrice;
+                $m->cost_before = round($runningCostPerPakai, 4);
+                $m->cost_after  = round($runningCostPerPakai, 4);
+                $m->saveQuietly();
+
+                if ($m->transfer_id) {
+                    // 1. Update TransferItem
+                    \App\Models\TransferItem::where('transfer_id', $m->transfer_id)
+                        ->where('ingredient_id', $this->id)
+                        ->update([
+                            'unit_price'  => $currentPricePerBeli,
+                            'total_price' => $currentTotalPrice,
+                        ]);
+
+                    // 2. Update paired TRANSFER_IN di cabang penerima (tujuan)
+                    $pairedMovements = StockMovement::where('transfer_id', $m->transfer_id)
+                        ->where('ingredient_id', $this->id)
+                        ->where('type', 'TRANSFER_IN')
+                        ->where('id', '!=', $m->id)
+                        ->get();
+
+                    foreach ($pairedMovements as $pm) {
+                        $pm->unit_price  = $currentPricePerBeli;
+                        $pm->total_price = $currentTotalPrice;
+                        $pm->saveQuietly();
+
+                        $destOid = (int)$pm->outlet_id;
+                        if ($destOid && !in_array($destOid, $downstreamOutlets) && !in_array($destOid, $visitedOutlets)) {
+                            $downstreamOutlets[] = $destOid;
+                        }
+                    }
+                }
+
+                $runningStock -= $qty;
             } else {
-                // Mutasi keluar (SALE_USAGE, WASTE, ADJUSTMENT_OUT, TRANSFER_OUT, PREP_USAGE)
+                // Mutasi keluar lainnya (SALE_USAGE, WASTE, ADJUSTMENT_OUT, PREP_USAGE)
                 // Barang keluar hanya mengambil nilai rata-rata terakhir untuk digunakan
                 $m->cost_before = round($runningCostPerPakai, 4);
                 $m->cost_after = round($runningCostPerPakai, 4);
@@ -497,6 +548,11 @@ class Ingredient extends Model
             $this->harga = $newHargaBeli;
             $this->last_purchase_price = $lastPurchasePrice;
             $this->save();
+        }
+
+        // Cascade update akumulasi ulang ke seluruh cabang penerima transfer
+        foreach ($downstreamOutlets as $destOid) {
+            $this->recomputeMovingAverageFromHistory($destOid, $visitedOutlets);
         }
 
         // Sinkronisasi update riwayat HPP Menu

@@ -1123,9 +1123,10 @@ class MovementController extends Controller
                 }
             }
 
-            // 3. Akumulasi ulang Moving Average & Saldo untuk seluruh outlet yang terdampak
+            // 3. Akumulasi ulang Moving Average & Saldo untuk seluruh outlet yang terdampak (dengan auto-cascade ke cabang penerima)
+            $visitedOutlets = [];
             foreach ($affectedOutletIds as $oid) {
-                $ingredient->recomputeMovingAverageFromHistory($oid);
+                $ingredient->recomputeMovingAverageFromHistory($oid, $visitedOutlets);
             }
         });
 
@@ -1134,6 +1135,47 @@ class MovementController extends Controller
         return response()->json([
             'message'  => "Data mutasi berhasil diperbarui dan seluruh akumulasi saldo serta moving average di outlet terkait telah dihitung ulang.",
             'movement' => $movement,
+        ]);
+    }
+
+    /**
+     * Hitung ulang (recompute) seluruh Moving Average dan akumulasi transfer untuk bahan (atau semua bahan) di seluruh cabang.
+     */
+    public function recalculateAll(Request $request)
+    {
+        $user = $request->user();
+        if (!$user || (!$user->isOwnerBisnis() && !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Hanya Owner Bisnis atau Admin Platform yang berwenang melakukan rekalkulasi akumulasi.'
+            ], 403);
+        }
+
+        $outlets = Outlet::all();
+        $mainOutlet = $outlets->firstWhere('is_main', true) ?: $outlets->first();
+
+        if ($request->filled('ingredient_id')) {
+            $ingredients = Ingredient::where('id', $request->ingredient_id)->get();
+        } else {
+            $ingredients = Ingredient::all();
+        }
+
+        DB::transaction(function () use ($ingredients, $outlets, $mainOutlet) {
+            foreach ($ingredients as $ing) {
+                $visited = [];
+                if ($mainOutlet) {
+                    $ing->recomputeMovingAverageFromHistory((int)$mainOutlet->id, $visited);
+                }
+                foreach ($outlets as $out) {
+                    if (!in_array((int)$out->id, $visited)) {
+                        $ing->recomputeMovingAverageFromHistory((int)$out->id, $visited);
+                    }
+                }
+            }
+        });
+
+        return response()->json([
+            'message'           => 'Seluruh riwayat transaksi mutasi, HPP Moving Average, dan transfer antar-cabang telah berhasil dihitung ulang dan disinkronkan secara konsisten.',
+            'total_ingredients' => count($ingredients),
         ]);
     }
 
@@ -1184,7 +1226,8 @@ class MovementController extends Controller
             // Hitung ulang Moving Average dan Saldo Stok
             $ingredient = Ingredient::find($ingredientId);
             if ($ingredient && $outletId) {
-                $ingredient->recomputeMovingAverageFromHistory((int)$outletId);
+                $visitedOutlets = [];
+                $ingredient->recomputeMovingAverageFromHistory((int)$outletId, $visitedOutlets);
             }
         });
 

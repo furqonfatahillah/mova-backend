@@ -295,35 +295,68 @@ class Ingredient extends Model
     /**
      * Recalculate Weighted Moving Average Cost when new inventory is purchased or transferred
      * Formula:
-     * Current Stock * Current Cost + Incoming Qty * Incoming Price
-     * -------------------------------------------------------------
-     *                Current Stock + Incoming Qty
+     * Rata-rata Kumulatif Seluruh Barang Masuk:
+     * Total Nilai Seluruh Masuk / Total Qty Seluruh Masuk
+     * Barang keluar hanya menggunakan nilai rata-rata terakhir tanpa mengubah harga satuan.
      */
     public function recalculateMovingAverage(float $incomingQtyPakai, float $incomingPricePerPakai, ?int $outletId = null): array
     {
         $konversi = max((float)$this->konversi, 1);
         $costBefore = $this->costPerPakaiForOutlet($outletId);
 
-        // Current stock on hand for this outlet
-        $currentStock = $outletId ? $this->stockForOutlet($outletId) : $this->consolidatedStock();
-        $effectiveStock = max($currentStock, 0.0);
+        // Ambil stok awal jika ada
+        $outletRow = $outletId ? OutletIngredient::where('outlet_id', $outletId)->where('ingredient_id', $this->id)->first() : null;
+        $initialStock = $outletRow ? (float)$outletRow->stok_awal : ($outletId === 1 || !$outletId ? (float)$this->stok_awal : 0.0);
+        $initialHarga = $outletRow && $outletRow->harga !== null ? (float)$outletRow->harga : (float)$this->harga;
+        $initialCostPerPakai = $initialHarga / $konversi;
 
-        // Check if there are existing movements for this ingredient
-        $hasMovements = StockMovement::where('ingredient_id', $this->id)
+        $cumIncomingQty = $initialStock > 0 ? $initialStock : 0.0;
+        $cumIncomingValue = $initialStock > 0 ? ($initialStock * $initialCostPerPakai) : 0.0;
+
+        // Ambil seluruh mutasi masuk sebelumnya untuk bahan dan outlet ini
+        $pastIncomingMovements = StockMovement::where('ingredient_id', $this->id)
             ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
-            ->exists();
+            ->whereIn('type', ['PURCHASE', 'TRANSFER_IN', 'PREP_OUTPUT', 'INITIAL'])
+            ->get();
 
-        if ($effectiveStock > 0 && ($effectiveStock + $incomingQtyPakai > 0)) {
-            $oldValue = $effectiveStock * $costBefore;
-            $newValue = $incomingQtyPakai * $incomingPricePerPakai;
-            $costAfter = ($oldValue + $newValue) / ($effectiveStock + $incomingQtyPakai);
-        } elseif ($hasMovements && $costBefore > 0) {
-            // Ketika stok fisik sudah habis (0) tetapi sudah memiliki riwayat rata-rata berjalan sebelumnya,
-            // tetap dirata-ratakan dengan harga pembelian yang baru masuk
-            $costAfter = ($costBefore + $incomingPricePerPakai) / 2;
-        } else {
-            $costAfter = $incomingPricePerPakai;
+        foreach ($pastIncomingMovements as $pm) {
+            $mQty = (float)$pm->qty;
+            if ($mQty <= 0) continue;
+
+            if ($pm->unit_price > 0) {
+                $pmPricePerPakai = ((float)$pm->unit_price) / $konversi;
+            } elseif ($pm->total_price > 0) {
+                $pmPricePerPakai = (float)$pm->total_price / $mQty;
+            } elseif ($pm->cost_after > 0) {
+                $pmPricePerPakai = (float)$pm->cost_after;
+            } else {
+                $pmPricePerPakai = $costBefore;
+            }
+
+            $cumIncomingQty += $mQty;
+            $cumIncomingValue += ($mQty * $pmPricePerPakai);
         }
+
+        // Ambil penyesuaian masuk (ADJUSTMENT_IN / ADJUSTMENT_PLUS) jika memiliki unit_price > 0
+        $adjMovements = StockMovement::where('ingredient_id', $this->id)
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->whereIn('type', ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS'])
+            ->where('unit_price', '>', 0)
+            ->get();
+
+        foreach ($adjMovements as $am) {
+            $aQty = (float)$am->qty;
+            if ($aQty <= 0) continue;
+            $aPricePerPakai = ((float)$am->unit_price) / $konversi;
+            $cumIncomingQty += $aQty;
+            $cumIncomingValue += ($aQty * $aPricePerPakai);
+        }
+
+        // Tambahkan barang masuk baru saat ini
+        $cumIncomingQty += $incomingQtyPakai;
+        $cumIncomingValue += ($incomingQtyPakai * $incomingPricePerPakai);
+
+        $costAfter = $cumIncomingQty > 0 ? ($cumIncomingValue / $cumIncomingQty) : $incomingPricePerPakai;
 
         $newHargaBeli = round($costAfter * $konversi, 2);
         $purchasePricePerUnitBeli = round($incomingPricePerPakai * $konversi, 2);
@@ -391,8 +424,9 @@ class Ingredient extends Model
         $runningStock = max($initialStock, 0.0);
         $runningCostPerPakai = $initialCostPerPakai;
         $lastPurchasePrice = $initialHarga;
-        $hasInitialStock = $initialStock > 0;
-        $hasProcessedFirstIn = false;
+
+        $cumIncomingQty = $initialStock > 0 ? $initialStock : 0.0;
+        $cumIncomingValue = $initialStock > 0 ? ($initialStock * $initialCostPerPakai) : 0.0;
 
         // Ambil seluruh pergerakan stok untuk bahan dan outlet ini secara kronologis
         $movements = StockMovement::where('ingredient_id', $this->id)
@@ -403,26 +437,18 @@ class Ingredient extends Model
 
         foreach ($movements as $m) {
             $qty = (float)$m->qty;
-            if (in_array($m->type, ['PURCHASE', 'TRANSFER_IN', 'PREP_OUTPUT'])) {
+            if (in_array($m->type, ['PURCHASE', 'TRANSFER_IN', 'PREP_OUTPUT', 'INITIAL'])) {
                 // Mutasi masuk yang mempengaruhi moving average
                 $incomingPricePerBeli = (float)($m->unit_price ?: ($m->total_price > 0 && $qty > 0 ? $m->total_price / ($qty / $konversi) : $runningCostPerPakai * $konversi));
                 $incomingPricePerPakai = $incomingPricePerBeli / $konversi;
                 $lastPurchasePrice = $incomingPricePerBeli;
 
                 $costBefore = $runningCostPerPakai;
-                if ($runningStock > 0 && ($runningStock + $qty > 0)) {
-                    $costAfter = (($runningStock * $runningCostPerPakai) + ($qty * $incomingPricePerPakai)) / ($runningStock + $qty);
-                } elseif (!$hasInitialStock && !$hasProcessedFirstIn) {
-                    $costAfter = $incomingPricePerPakai;
-                    $costBefore = $incomingPricePerPakai;
-                } elseif ($runningCostPerPakai > 0) {
-                    // Ketika stok habis (0), tetap dirata-ratakan dengan moving average sebelumnya
-                    $costAfter = ($runningCostPerPakai + $incomingPricePerPakai) / 2;
-                } else {
-                    $costAfter = $incomingPricePerPakai;
-                }
+                $cumIncomingQty += $qty;
+                $cumIncomingValue += ($qty * $incomingPricePerPakai);
 
-                $hasProcessedFirstIn = true;
+                $costAfter = $cumIncomingQty > 0 ? ($cumIncomingValue / $cumIncomingQty) : $incomingPricePerPakai;
+
                 $m->cost_before = round($costBefore, 4);
                 $m->cost_after = round($costAfter, 4);
                 $m->saveQuietly();
@@ -432,22 +458,15 @@ class Ingredient extends Model
             } elseif (in_array($m->type, ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS'])) {
                 $costBefore = $runningCostPerPakai;
                 if ($m->unit_price > 0) {
-                    $incomingPricePerPakai = (float)$m->unit_price / $konversi;
-                    if ($runningStock > 0 && ($runningStock + $qty > 0)) {
-                        $costAfter = (($runningStock * $runningCostPerPakai) + ($qty * $incomingPricePerPakai)) / ($runningStock + $qty);
-                    } elseif (!$hasInitialStock && !$hasProcessedFirstIn) {
-                        $costAfter = $incomingPricePerPakai;
-                        $costBefore = $incomingPricePerPakai;
-                    } elseif ($runningCostPerPakai > 0) {
-                        $costAfter = ($runningCostPerPakai + $incomingPricePerPakai) / 2;
-                    } else {
-                        $costAfter = $incomingPricePerPakai;
-                    }
+                    $incomingPricePerBeli = (float)$m->unit_price;
+                    $incomingPricePerPakai = $incomingPricePerBeli / $konversi;
+                    $cumIncomingQty += $qty;
+                    $cumIncomingValue += ($qty * $incomingPricePerPakai);
+                    $costAfter = $cumIncomingQty > 0 ? ($cumIncomingValue / $cumIncomingQty) : $runningCostPerPakai;
                 } else {
                     $costAfter = $runningCostPerPakai;
                 }
 
-                $hasProcessedFirstIn = true;
                 $m->cost_before = round($costBefore, 4);
                 $m->cost_after = round($costAfter, 4);
                 $m->saveQuietly();
@@ -456,6 +475,7 @@ class Ingredient extends Model
                 $runningStock += $qty;
             } else {
                 // Mutasi keluar (SALE_USAGE, WASTE, ADJUSTMENT_OUT, TRANSFER_OUT, PREP_USAGE)
+                // Barang keluar hanya mengambil nilai rata-rata terakhir untuk digunakan
                 $m->cost_before = round($runningCostPerPakai, 4);
                 $m->cost_after = round($runningCostPerPakai, 4);
                 $m->saveQuietly();

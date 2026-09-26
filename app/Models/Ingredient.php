@@ -360,8 +360,8 @@ class Ingredient extends Model
         }
 
         return [
-            'cost_before' => round($costBefore, 4),
-            'cost_after'  => round($costAfter, 4),
+            'cost_before' => round($costBefore, 2),
+            'cost_after'  => round($costAfter, 2),
             'new_harga'   => $newHargaBeli,
             'last_price'  => $purchasePricePerUnitBeli,
         ];
@@ -418,8 +418,8 @@ class Ingredient extends Model
                     $costAfter = $newTotalQty > 0 ? (($stockBeforeVal + $incomingVal) / $newTotalQty) : $incomingPricePerPakai;
                 }
 
-                $m->cost_before = round($costBefore, 4);
-                $m->cost_after = round($costAfter, 4);
+                $m->cost_before = round($costBefore, 2);
+                $m->cost_after = round($costAfter, 2);
                 $m->saveQuietly();
 
                 $runningCostPerPakai = $costAfter;
@@ -441,8 +441,8 @@ class Ingredient extends Model
                     $costAfter = $runningCostPerPakai;
                 }
 
-                $m->cost_before = round($costBefore, 4);
-                $m->cost_after = round($costAfter, 4);
+                $m->cost_before = round($costBefore, 2);
+                $m->cost_after = round($costAfter, 2);
                 $m->saveQuietly();
 
                 $runningCostPerPakai = $costAfter;
@@ -454,8 +454,8 @@ class Ingredient extends Model
 
                 $m->unit_price  = $currentPricePerBeli;
                 $m->total_price = $currentTotalPrice;
-                $m->cost_before = round($runningCostPerPakai, 4);
-                $m->cost_after  = round($runningCostPerPakai, 4);
+                $m->cost_before = round($runningCostPerPakai, 2);
+                $m->cost_after  = round($runningCostPerPakai, 2);
                 $m->saveQuietly();
 
                 if ($m->transfer_id) {
@@ -490,8 +490,8 @@ class Ingredient extends Model
             } else {
                 // Mutasi keluar lainnya (SALE_USAGE, WASTE, ADJUSTMENT_OUT, PREP_USAGE)
                 // Barang keluar hanya mengambil nilai rata-rata terakhir untuk digunakan
-                $m->cost_before = round($runningCostPerPakai, 4);
-                $m->cost_after = round($runningCostPerPakai, 4);
+                $m->cost_before = round($runningCostPerPakai, 2);
+                $m->cost_after = round($runningCostPerPakai, 2);
                 $m->saveQuietly();
 
                 $runningStock -= $qty;
@@ -529,7 +529,7 @@ class Ingredient extends Model
         } catch (\Throwable $e) {}
 
         return [
-            'cost_per_pakai' => round($runningCostPerPakai, 4),
+            'cost_per_pakai' => round($runningCostPerPakai, 2),
             'harga_beli'     => $newHargaBeli,
             'stock'          => round($runningStock, 3),
         ];

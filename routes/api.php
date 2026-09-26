@@ -162,6 +162,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/movements',          [MovementController::class, 'index']);
     Route::post('/movements/bulk',     [MovementController::class, 'bulkStore']);
     Route::post('/movements',         [MovementController::class, 'store']);
+    Route::match(['put', 'patch'], '/movements/{movement}', [MovementController::class, 'update']);
     Route::delete('/movements/{movement}', [MovementController::class, 'destroy']);
     Route::get('/stock-card/summary', [MovementController::class, 'stockCardSummary']);
     Route::get('/stock-card',         [MovementController::class, 'stockCard']);

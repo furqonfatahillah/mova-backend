@@ -650,6 +650,8 @@ class MovementController extends Controller
                 'changed_by'      => $m->updated_by,
                 'changed_by_name' => $hasChanged ? $updaterName : null,
                 'outlet_id'       => $m->outlet_id,
+                'ingredient_id'   => $m->ingredient_id,
+                'transfer_id'     => $m->transfer_id,
                 'outlet_name'     => $m->outlet?->name ?? ($m->outlet_id ? "Outlet #{$m->outlet_id}" : '-'),
                 'type'            => $m->type,
                 'waste_reason'    => $m->waste_reason,
@@ -993,6 +995,146 @@ class MovementController extends Controller
             'name'   => $newUnit->name,
             'id'     => $newUnit->id,
         ];
+    }
+
+    /**
+     * Fitur Edit Mutasi Stok di Semua Baris & Akumulasi Ulang Moving Average Secara Otomatis
+     */
+    public function update(Request $request, StockMovement $movement)
+    {
+        $user = $request->user();
+        if (!$user || (!$user->isOwnerBisnis() && !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Hanya Owner Bisnis atau Admin Platform yang berwenang mengubah data mutasi stok.'
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'date'           => 'required|date',
+            'qty'            => 'required|numeric|min:0.0001',
+            'unit_type'      => 'nullable|in:BELI,PAKAI',
+            'unit_price'     => 'nullable|numeric|min:0',
+            'total_price'    => 'nullable|numeric|min:0',
+            'type'           => 'nullable|in:PURCHASE,WASTE,ADJUSTMENT_IN,ADJUSTMENT_OUT,TRANSFER_IN,TRANSFER_OUT,PREP_USAGE,PREP_OUTPUT',
+            'waste_reason'   => 'nullable|string|max:50',
+            'note'           => 'nullable|string|max:255',
+            'payment_type'   => 'nullable|string|max:50',
+            'supplier_name'  => 'nullable|string|max:150',
+            'purchase_no'    => 'nullable|string|max:100',
+            'due_date'       => 'nullable|date',
+            'initial_paid'   => 'nullable|numeric|min:0',
+            'payment_method' => 'nullable|string|max:50',
+        ]);
+
+        $ingredient = Ingredient::findOrFail($movement->ingredient_id);
+        $konversi = max((float)$ingredient->konversi, 1);
+
+        $isUnitBeli = ($request->unit_type === 'BELI');
+        $qtyPakai = $isUnitBeli ? (float)$validated['qty'] * $konversi : (float)$validated['qty'];
+
+        // Determine price
+        $pricePerBeli = null;
+        if ($request->filled('unit_price') && (float)$request->unit_price > 0) {
+            $inputPrice = (float)$request->unit_price;
+            $pricePerBeli = $isUnitBeli ? $inputPrice : ($inputPrice * $konversi);
+        } elseif ($request->filled('total_price') && (float)$request->total_price > 0 && $qtyPakai > 0) {
+            $pricePerBeli = ((float)$request->total_price) / ($qtyPakai / $konversi);
+        } else {
+            $pricePerBeli = (float)($movement->unit_price ?: $ingredient->hargaForOutlet($movement->outlet_id));
+        }
+
+        $totalPrice = $request->filled('total_price') && (float)$request->total_price > 0
+            ? (float)$request->total_price
+            : round(($qtyPakai / $konversi) * $pricePerBeli, 2);
+
+        $type = $validated['type'] ?? $movement->type;
+        $rawPaymentType = strtoupper(trim($validated['payment_type'] ?? $movement->payment_type ?? 'CASH'));
+        $paymentType = in_array($rawPaymentType, ['HUTANG', 'TEMPO']) ? 'HUTANG' : ($rawPaymentType === 'TRANSFER' ? 'TRANSFER' : 'CASH');
+
+        $affectedOutletIds = [(int)$movement->outlet_id];
+
+        DB::transaction(function () use ($movement, $validated, $qtyPakai, $pricePerBeli, $totalPrice, $type, $paymentType, $user, $ingredient, &$affectedOutletIds) {
+            $movement->date         = $validated['date'];
+            $movement->qty          = $qtyPakai;
+            $movement->unit_price   = $pricePerBeli;
+            $movement->total_price  = $totalPrice;
+            $movement->type         = $type;
+            $movement->payment_type = $paymentType;
+            $movement->note         = $validated['note'] ?? $movement->note;
+            $movement->waste_reason = $validated['waste_reason'] ?? $movement->waste_reason;
+            $movement->supplier_name= $validated['supplier_name'] ?? $movement->supplier_name;
+            $movement->purchase_no  = $validated['purchase_no'] ?? $movement->purchase_no;
+            $movement->updated_by   = $user->id;
+            $movement->saveQuietly();
+
+            // 1. Jika terhubung dengan Hutang (Payable)
+            if ($movement->payable_id) {
+                $payable = Payable::find($movement->payable_id);
+                if ($payable) {
+                    $initialPaid = min((float)($validated['initial_paid'] ?? $payable->paid_amount), (float)$totalPrice);
+                    $remaining = max(0, (float)$totalPrice - $initialPaid);
+                    $payable->update([
+                        'total_amount'     => $totalPrice,
+                        'paid_amount'      => $initialPaid,
+                        'remaining_amount' => $remaining,
+                        'status'           => ($remaining <= 0) ? 'PAID' : ($initialPaid > 0 ? 'PARTIAL' : 'UNPAID'),
+                        'due_date'         => $validated['due_date'] ?? $payable->due_date,
+                        'supplier_name'    => $validated['supplier_name'] ?? $payable->supplier_name,
+                        'purchase_no'      => $validated['purchase_no'] ?? $payable->purchase_no,
+                        'notes'            => "Pembelian Stok Bahan: {$ingredient->name}" . (!empty($validated['note']) ? " ({$validated['note']})" : ''),
+                    ]);
+                }
+            }
+
+            // 2. Jika mutasi merupakan bagian dari Transfer Antar Cabang
+            if ($movement->transfer_id) {
+                // Update Transfer Item
+                $transferItem = \App\Models\TransferItem::where('transfer_id', $movement->transfer_id)
+                    ->where('ingredient_id', $movement->ingredient_id)
+                    ->first();
+                if ($transferItem) {
+                    $transferItem->update([
+                        'qty'         => $qtyPakai,
+                        'input_qty'   => $validated['qty'],
+                        'unit_price'  => $pricePerBeli,
+                        'total_price' => $totalPrice,
+                        'notes'       => $validated['note'] ?? $transferItem->notes,
+                    ]);
+                }
+
+                // Update Paired Movement di cabang pasangan (lawan dari transfer ini)
+                $pairedMovements = StockMovement::where('transfer_id', $movement->transfer_id)
+                    ->where('ingredient_id', $movement->ingredient_id)
+                    ->where('id', '!=', $movement->id)
+                    ->get();
+
+                foreach ($pairedMovements as $pm) {
+                    $pm->date        = $validated['date'];
+                    $pm->qty         = $qtyPakai;
+                    $pm->unit_price  = $pricePerBeli;
+                    $pm->total_price = $totalPrice;
+                    $pm->note        = $validated['note'] ?? $pm->note;
+                    $pm->updated_by  = $user->id;
+                    $pm->saveQuietly();
+
+                    if (!in_array((int)$pm->outlet_id, $affectedOutletIds)) {
+                        $affectedOutletIds[] = (int)$pm->outlet_id;
+                    }
+                }
+            }
+
+            // 3. Akumulasi ulang Moving Average & Saldo untuk seluruh outlet yang terdampak
+            foreach ($affectedOutletIds as $oid) {
+                $ingredient->recomputeMovingAverageFromHistory($oid);
+            }
+        });
+
+        $movement->refresh()->load(['ingredient', 'user', 'creator', 'updater', 'outlet']);
+
+        return response()->json([
+            'message'  => "Data mutasi berhasil diperbarui dan seluruh akumulasi saldo serta moving average di outlet terkait telah dihitung ulang.",
+            'movement' => $movement,
+        ]);
     }
 
     /**

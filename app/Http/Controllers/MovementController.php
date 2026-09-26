@@ -571,17 +571,16 @@ class MovementController extends Controller
         $outTypes = ['SALE_USAGE', 'WASTE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT', 'PREP_USAGE'];
         $inTypes  = ['PURCHASE', 'ADJUSTMENT_IN', 'TRANSFER_IN', 'PREP_OUTPUT'];
 
-        // Movements strictly before $from
+        // ⚡ PERF: Movements strictly before $from aggregated directly in SQL
         $priorQuery = StockMovement::where('ingredient_id', $ingId)->where('date', '<', $from);
         if ($outletId) {
             $priorQuery->where('outlet_id', $outletId);
         }
-        $priorMovements = $priorQuery->get();
+        $priorNet = (float) ($priorQuery->selectRaw("
+            SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty
+        ")->value('net_qty') ?? 0.0);
 
-        $stokAwal = $stokAwalMaster;
-        foreach ($priorMovements as $m) {
-            $stokAwal += $m->signedQty();
-        }
+        $stokAwal = round($stokAwalMaster + $priorNet, 3);
 
         // Movements in the period ordered chronologically
         $movQuery = StockMovement::with([

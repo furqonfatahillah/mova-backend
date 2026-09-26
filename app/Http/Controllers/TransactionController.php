@@ -330,9 +330,9 @@ class TransactionController extends Controller
             $query->where('discount_amount', '>', 0);
         }
 
-        $limit = $request->integer('limit', 500);
+        $limit = $request->integer('limit', 50);
         if ($limit <= 0 || $limit > 2000) {
-            $limit = 500;
+            $limit = 50;
         }
 
         return response()->json($query->limit($limit)->get());

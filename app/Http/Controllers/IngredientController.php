@@ -42,6 +42,11 @@ class IngredientController extends Controller
             }
         });
 
+        // ⚡ CRITICAL PERFORMANCE: Hide bulky raw movements from JSON serialization!
+        // Movements were only preloaded for in-memory stock computation; sending them to the client
+        // inflates the JSON payload unnecessarily.
+        $ingredients->makeHidden(['movements']);
+
         return response()->json($ingredients);
     }
 

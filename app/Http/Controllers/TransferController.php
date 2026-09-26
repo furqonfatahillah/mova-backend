@@ -304,6 +304,10 @@ class TransferController extends Controller
 
             $userId = $request->user()?->id;
 
+            $rawPaymentType = strtoupper(trim($validated['payment_type'] ?? ($sourceOutlet ? 'INTERNAL' : 'CASH')));
+            $isHutang = in_array($rawPaymentType, ['HUTANG', 'TEMPO']);
+            $paymentType = $isHutang ? 'HUTANG' : $rawPaymentType;
+
             $transfer = Transfer::create([
                 'business_id'           => $businessIdToAssign,
                 'transfer_no'           => $transferNo,
@@ -316,6 +320,11 @@ class TransferController extends Controller
                 'destination_outlet_id' => $destOutlet?->id,
                 'transfer_type'         => $transferType,
                 'status'                => $initialStatus,
+                'payment_type'          => $paymentType,
+                'payment_method'        => $validated['payment_method'] ?? null,
+                'supplier_name'         => $validated['supplier_name'] ?? null,
+                'purchase_no'           => $validated['purchase_no'] ?? null,
+                'due_date'              => $validated['due_date'] ?? null,
                 'notes'                 => $validated['notes'] ?? null,
                 'driver_name'           => $validated['driver_name'] ?? null,
                 'vehicle_no'            => $validated['vehicle_no'] ?? null,
@@ -427,13 +436,14 @@ class TransferController extends Controller
                     $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
                     $itemTotalPrice = round(($baseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
 
-                    $isInternal = ($transfer->payment_type ?? 'INTERNAL') === 'INTERNAL';
                     $ingUnitPrice = isset($itemData['unit_price']) && $itemData['unit_price'] !== '' ? (float)$itemData['unit_price'] : null;
                     $ingTotalPrice = isset($itemData['total_price']) && $itemData['total_price'] !== '' ? (float)$itemData['total_price'] : null;
 
-                    if ($isInternal || $ingUnitPrice === null) {
+                    if ($ingUnitPrice === null) {
                         $ingUnitPrice = $isUnitBeli ? $sourcePricePerBeli : $sourcePricePerPakai;
                         $ingTotalPrice = $itemTotalPrice;
+                    } elseif ($ingTotalPrice === null && $ingUnitPrice !== null) {
+                        $ingTotalPrice = round($inputQty * $ingUnitPrice, 2);
                     }
 
                     TransferItem::create([

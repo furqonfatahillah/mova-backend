@@ -41,7 +41,8 @@ class CashFlowController extends Controller
         // Hanya menghitung transaksi tunai/instan riil (CASH, QRIS, TRANSFER, DEBIT, GRAB, dll).
         // Transaksi KASBON / PIUTANG TIDAK dihitung di sini karena belum ada uang kas yang masuk saat nota dibuat.
         $trxQuery = Transaction::where('status', 'PAID')
-            ->whereBetween('date', [$from, $to]);
+            ->whereBetween('date', [$from, $to])
+            ->select(['payment_method', 'total_price']);
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);
         }
@@ -81,8 +82,9 @@ class CashFlowController extends Controller
 
         // B. Penerimaan Kas dari Pembayaran Kasbon Pelanggan (Receivable Collections)
         // HANYA uang kas yang benar-benar dibayarkan oleh customer (ada uang kas riil masuk ke kasir/rekening)
-        $recPayQuery = ReceivablePayment::with(['receivable', 'receiver', 'outlet'])
-            ->whereBetween('payment_date', [$from, $to]);
+        // ⚡ PERF: Select only needed columns and avoid unused relationship hydration
+        $recPayQuery = ReceivablePayment::whereBetween('payment_date', [$from, $to])
+            ->select(['amount', 'payment_method']);
         if ($outletId) {
             $recPayQuery->where('outlet_id', $outletId);
         }
@@ -126,9 +128,13 @@ class CashFlowController extends Controller
         $totalOperatingInflows = $totalDirectSalesReceipts + $receivableCashIn + $extraOpIn;
 
         // B. Pengeluaran Kas untuk Belanja Persediaan Bahan Baku (Cash Paid for Inventory Purchases)
-        $movQuery = StockMovement::with(['ingredient'])
+        // ⚡ PERF: Load only required ingredient columns and movement columns
+        $movQuery = StockMovement::with(['ingredient' => function($q) {
+            $q->select(['id', 'name', 'unit_pakai', 'konversi', 'harga']);
+        }])
             ->where('type', 'PURCHASE')
-            ->whereBetween('date', [$from, $to]);
+            ->whereBetween('date', [$from, $to])
+            ->select(['id', 'ingredient_id', 'outlet_id', 'type', 'date', 'unit_price', 'total_price', 'qty', 'payment_type']);
         if ($outletId) {
             $movQuery->where('outlet_id', $outletId);
         }

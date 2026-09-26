@@ -105,7 +105,29 @@ class IngredientController extends Controller
             $data['unit_pakai_id'] = $unitPakaiInfo['id'];
         }
 
+        $data['last_purchase_price'] = $data['harga'] ?? null;
         $ingredient = Ingredient::create($data);
+
+        // Sync to OutletIngredient for all business outlets
+        $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
+        if ($businessOutlets->isEmpty()) {
+            $businessOutlets = \App\Models\Outlet::all();
+        }
+        foreach ($businessOutlets as $bo) {
+            \App\Models\OutletIngredient::updateOrCreate(
+                [
+                    'outlet_id'     => $bo->id,
+                    'ingredient_id' => $ingredient->id,
+                ],
+                [
+                    'stok_awal'           => ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id) ? (float)($data['stok_awal'] ?? 0) : 0,
+                    'stok_min'            => (float)($data['stok_min'] ?? 0),
+                    'harga'               => (float)($data['harga'] ?? 0),
+                    'last_purchase_price' => (float)($data['harga'] ?? 0),
+                ]
+            );
+        }
+
         $ingredient->load(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements', 'categoryModel']);
         $ingredient->append(['current_stock', 'current_stok_min', 'current_harga', 'outlet_stocks']);
         return response()->json($ingredient, 201);
@@ -283,6 +305,11 @@ class IngredientController extends Controller
         $importedCount = 0;
 
         DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+            $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
+            if ($businessOutlets->isEmpty()) {
+                $businessOutlets = \App\Models\Outlet::all();
+            }
+
             foreach ($items as $idx => $row) {
                 if (empty($row['name'])) continue;
 
@@ -340,37 +367,63 @@ class IngredientController extends Controller
                     }
                 }
 
+                $hargaBeli = (float)($row['harga'] ?? 0);
+                $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
+                $initialStock = (float)($row['initial_stock'] ?? $row['stok_awal'] ?? 0);
+
                 // Match strictly by (business_id, code) so custom codes are honored per business
-                Ingredient::updateOrCreate(
+                $ing = Ingredient::updateOrCreate(
                     [
                         'business_id' => $businessId,
                         'code'        => $code,
                     ],
                     [
-                        'name'          => $name,
-                        'category_id'   => $cat->id,
-                        'category'      => $cat->name,
-                        'type'          => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
-                        'unit_beli'     => $unitBeliInfo['symbol'],
-                        'unit_pakai'    => $unitPakaiInfo['symbol'],
-                        'unit_beli_id'  => $unitBeliInfo['id'],
-                        'unit_pakai_id' => $unitPakaiInfo['id'],
-                        'konversi'      => $konversi,
-                        'harga'         => (float)($row['harga'] ?? 0),
-                        'stok_min'      => (float)($row['minstok'] ?? 0),
-                        'stok_awal'     => (float)($row['initial_stock'] ?? 0),
-                        'notes'         => $row['notes'] ?? 'Imported from Excel',
-                        'created_by'    => $user?->id,
-                        'updated_by'    => $user?->id,
+                        'name'                => $name,
+                        'category_id'         => $cat->id,
+                        'category'            => $cat->name,
+                        'type'                => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
+                        'unit_beli'           => $unitBeliInfo['symbol'],
+                        'unit_pakai'          => $unitPakaiInfo['symbol'],
+                        'unit_beli_id'        => $unitBeliInfo['id'],
+                        'unit_pakai_id'       => $unitPakaiInfo['id'],
+                        'konversi'            => $konversi,
+                        'harga'               => $hargaBeli,
+                        'last_purchase_price' => $hargaBeli,
+                        'stok_min'            => $minStok,
+                        'stok_awal'           => $initialStock,
+                        'notes'               => $row['notes'] ?? 'Imported from Excel',
+                        'created_by'          => $user?->id,
+                        'updated_by'          => $user?->id,
                     ]
                 );
+
+                // Sync/Initialize OutletIngredient for all business outlets
+                foreach ($businessOutlets as $bo) {
+                    $outletRow = \App\Models\OutletIngredient::firstOrNew([
+                        'outlet_id'     => $bo->id,
+                        'ingredient_id' => $ing->id,
+                    ]);
+                    if ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id) {
+                        $outletRow->stok_awal = $initialStock;
+                    } elseif ($outletRow->stok_awal === null) {
+                        $outletRow->stok_awal = 0.0;
+                    }
+                    if ($minStok > 0 || $outletRow->stok_min === null) {
+                        $outletRow->stok_min = $minStok;
+                    }
+                    if ($hargaBeli > 0 || $outletRow->harga === null) {
+                        $outletRow->harga = $hargaBeli;
+                        $outletRow->last_purchase_price = $hargaBeli;
+                    }
+                    $outletRow->save();
+                }
 
                 $importedCount++;
             }
         });
 
         return response()->json([
-            'message' => "Berhasil meng-import {$importedCount} master bahan dari file Excel.",
+            'message' => "Berhasil meng-import {$importedCount} master bahan lengkap beserta saldo awal dan harga.",
             'imported_count' => $importedCount,
         ]);
     }
@@ -388,6 +441,11 @@ class IngredientController extends Controller
         $importedCount = 0;
 
         DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+            $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
+            if ($businessOutlets->isEmpty()) {
+                $businessOutlets = \App\Models\Outlet::all();
+            }
+
             foreach ($items as $idx => $row) {
                 if (empty($row['name'])) continue;
 
@@ -441,38 +499,64 @@ class IngredientController extends Controller
                     }
                 }
 
+                $hargaBeli = (float)($row['harga'] ?? 0);
+                $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
+                $initialStock = (float)($row['initial_stock'] ?? $row['stok_awal'] ?? 0);
+
                 // Match strictly by (business_id, code) so custom codes are honored per business
-                Ingredient::updateOrCreate(
+                $ing = Ingredient::updateOrCreate(
                     [
                         'business_id' => $businessId,
                         'code'        => $code,
                     ],
                     [
-                        'name'          => $name,
-                        'category_id'   => $cat->id,
-                        'category'      => $cat->name,
-                        'type'          => 'RAW',
-                        'unit_beli'     => $unitBeliInfo['symbol'],
-                        'unit_pakai'    => $unitPakaiInfo['symbol'],
-                        'unit_beli_id'  => $unitBeliInfo['id'],
-                        'unit_pakai_id' => $unitPakaiInfo['id'],
-                        'konversi'      => $konversi,
-                        'harga'         => (float)($row['harga'] ?? 0),
-                        'stok_min'      => (float)($row['minstok'] ?? 0),
-                        'stok_awal'     => (float)($row['initial_stock'] ?? 0),
-                        'tolerance'     => (float)($row['tolerance'] ?? 5),
-                        'notes'         => $row['notes'] ?? 'Imported Perlengkapan from Excel',
-                        'created_by'    => $user?->id,
-                        'updated_by'    => $user?->id,
+                        'name'                => $name,
+                        'category_id'         => $cat->id,
+                        'category'            => $cat->name,
+                        'type'                => 'RAW',
+                        'unit_beli'           => $unitBeliInfo['symbol'],
+                        'unit_pakai'          => $unitPakaiInfo['symbol'],
+                        'unit_beli_id'        => $unitBeliInfo['id'],
+                        'unit_pakai_id'       => $unitPakaiInfo['id'],
+                        'konversi'            => $konversi,
+                        'harga'               => $hargaBeli,
+                        'last_purchase_price' => $hargaBeli,
+                        'stok_min'            => $minStok,
+                        'stok_awal'           => $initialStock,
+                        'tolerance'           => (float)($row['tolerance'] ?? 5),
+                        'notes'               => $row['notes'] ?? 'Imported Perlengkapan from Excel',
+                        'created_by'          => $user?->id,
+                        'updated_by'          => $user?->id,
                     ]
                 );
+
+                // Sync/Initialize OutletIngredient for all business outlets
+                foreach ($businessOutlets as $bo) {
+                    $outletRow = \App\Models\OutletIngredient::firstOrNew([
+                        'outlet_id'     => $bo->id,
+                        'ingredient_id' => $ing->id,
+                    ]);
+                    if ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id) {
+                        $outletRow->stok_awal = $initialStock;
+                    } elseif ($outletRow->stok_awal === null) {
+                        $outletRow->stok_awal = 0.0;
+                    }
+                    if ($minStok > 0 || $outletRow->stok_min === null) {
+                        $outletRow->stok_min = $minStok;
+                    }
+                    if ($hargaBeli > 0 || $outletRow->harga === null) {
+                        $outletRow->harga = $hargaBeli;
+                        $outletRow->last_purchase_price = $hargaBeli;
+                    }
+                    $outletRow->save();
+                }
 
                 $importedCount++;
             }
         });
 
         return response()->json([
-            'message' => "Berhasil meng-import {$importedCount} data master perlengkapan dari file Excel.",
+            'message' => "Berhasil meng-import {$importedCount} data master perlengkapan lengkap beserta saldo awal dan harga.",
             'imported_count' => $importedCount,
         ]);
     }

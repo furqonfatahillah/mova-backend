@@ -780,9 +780,14 @@ class ReportController extends Controller
     private function calculatePnlData(string $from, string $to, ?int $outletId = null, string $notaType = 'ALL'): array
     {
         // 1. REVENUE (PENDAPATAN USAHA)
-        $trxQuery = Transaction::with(['menu.recipes.items'])
-            ->where('status', 'PAID')
-            ->whereBetween('date', [$from, $to]);
+        // ⚡ PERF: Select only required columns and avoid hydrating thousands of duplicate Menu/Recipe models
+        $trxQuery = Transaction::where('status', 'PAID')
+            ->whereBetween('date', [$from, $to])
+            ->select([
+                'id', 'order_number', 'menu_id', 'date', 'qty',
+                'subtotal', 'total_price', 'discount_amount',
+                'payment_method', 'is_urgent_note', 'outlet_id'
+            ]);
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);
         }
@@ -943,8 +948,14 @@ class ReportController extends Controller
         $cogsDirectMan = 0.0;
         $directItemsMap = [];
 
+        // ⚡ MEMORY OPTIMIZATION: Load distinct menus once into a key-map instead of thousands of Eloquent model instances
+        $distinctMenuIds = $transactions->pluck('menu_id')->filter()->unique()->all();
+        $menusMap = !empty($distinctMenuIds)
+            ? Menu::with('recipes')->whereIn('id', $distinctMenuIds)->get()->keyBy('id')
+            : collect();
+
         foreach ($transactions as $t) {
-            $m = $t->menu;
+            $m = $menusMap->get($t->menu_id);
             if ($m && ($m->item_type === 'DIRECT' || (!$m->activeRecipe($t->date) && $m->cost_price > 0))) {
                 $itemCost = (float)($m->cost_price * $t->qty);
                 if ($t->is_urgent_note) {

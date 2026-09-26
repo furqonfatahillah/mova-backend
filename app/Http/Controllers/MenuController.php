@@ -14,17 +14,34 @@ class MenuController extends Controller
 {
     public function index(Request $request)
     {
-        $relations = [
-            'creator',
-            'updater',
-            'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
-            'bundleItems.bundledMenu' => fn($q) => $q->with(['recipes' => fn($rq) => $rq->with('items.ingredient')->orderByDesc('version')]),
-            'bundleItems.ingredient',
-            'modifierGroups.options.ingredient',
-            'outletMenus',
-        ];
+        $isForPos = $request->boolean('for_pos') || $request->boolean('active_only') || $request->boolean('lite');
+
+        if ($isForPos) {
+            // ⚡ LIGHTWEIGHT POS MODE: Omit heavy audit relations (creator/updater), load only essential recipe and modifiers
+            $relations = [
+                'recipes' => fn($q) => $q->with('items.ingredient')->orderByDesc('version'),
+                'bundleItems.bundledMenu' => fn($q) => $q->with(['recipes' => fn($rq) => $rq->with('items.ingredient')->orderByDesc('version')]),
+                'bundleItems.ingredient',
+                'modifierGroups.options.ingredient',
+                'outletMenus',
+            ];
+        } else {
+            $relations = [
+                'creator',
+                'updater',
+                'recipes' => fn($q) => $q->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version'),
+                'bundleItems.bundledMenu' => fn($q) => $q->with(['recipes' => fn($rq) => $rq->with('items.ingredient')->orderByDesc('version')]),
+                'bundleItems.ingredient',
+                'modifierGroups.options.ingredient',
+                'outletMenus',
+            ];
+        }
 
         $query = Menu::with($relations)->orderBy('code');
+
+        if ($isForPos || $request->filled('active')) {
+            $query->where('active', true);
+        }
 
         if ($request->filled('item_type') && in_array($request->item_type, ['RECIPE', 'DIRECT', 'SERVICE', 'BUNDLE'])) {
             $query->where('item_type', $request->item_type);

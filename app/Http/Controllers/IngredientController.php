@@ -14,7 +14,7 @@ class IngredientController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Ingredient::with(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'movements', 'categoryModel'])
+        $query = Ingredient::with(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'categoryModel'])
             ->orderBy('code');
 
         if ($request->filled('type') && in_array($request->type, ['RAW', 'SEMI_FINISHED'])) {
@@ -33,6 +33,26 @@ class IngredientController extends Controller
         }
 
         $ingredients = $query->get();
+        $ingIds = $ingredients->pluck('id')->all();
+
+        // ⚡ ULTRA PERFORMANCE: Compute movement aggregates for ALL ingredients in 1 single fast SQL query!
+        // Avoids loading tens of thousands of heavy Eloquent models into PHP memory.
+        if (!empty($ingIds)) {
+            $movSummary = DB::table('stock_movements')
+                ->whereIn('ingredient_id', $ingIds)
+                ->selectRaw("ingredient_id, outlet_id, SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->groupBy('ingredient_id', 'outlet_id')
+                ->get();
+
+            $movMap = [];
+            foreach ($movSummary as $row) {
+                $movMap[$row->ingredient_id][$row->outlet_id] = (float) $row->net_qty;
+            }
+
+            foreach ($ingredients as $ing) {
+                $ing->setPrecomputedMovements($movMap[$ing->id] ?? []);
+            }
+        }
 
         // ⚡ Explicitly append stock and outlet-isolated pricing attributes
         $ingredients->each(function ($ing) {
@@ -41,11 +61,6 @@ class IngredientController extends Controller
                 $ing->harga = $ing->current_harga;
             }
         });
-
-        // ⚡ CRITICAL PERFORMANCE: Hide bulky raw movements from JSON serialization!
-        // Movements were only preloaded for in-memory stock computation; sending them to the client
-        // inflates the JSON payload unnecessarily.
-        $ingredients->makeHidden(['movements']);
 
         return response()->json($ingredients);
     }

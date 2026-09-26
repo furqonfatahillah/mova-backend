@@ -89,6 +89,14 @@ class Ingredient extends Model
         return static::$memoizedOutlets;
     }
 
+    protected ?array $precomputedMovements = null;
+
+    public function setPrecomputedMovements(array $map): self
+    {
+        $this->precomputedMovements = $map;
+        return $this;
+    }
+
     public function stockForOutlet(int $outletId): float
     {
         $outletRow = $this->relationLoaded('outletIngredients')
@@ -97,7 +105,9 @@ class Ingredient extends Model
 
         $stokAwal = $outletRow ? (float) $outletRow->stok_awal : ($outletId === 1 ? (float) $this->stok_awal : 0.0);
 
-        if ($this->relationLoaded('movements')) {
+        if ($this->precomputedMovements !== null) {
+            $movSum = (float) ($this->precomputedMovements[$outletId] ?? 0.0);
+        } elseif ($this->relationLoaded('movements')) {
             $movSum = (float) $this->movements
                 ->where('outlet_id', $outletId)
                 ->sum(fn($m) => $m->signedQty());
@@ -113,7 +123,9 @@ class Ingredient extends Model
 
     public function consolidatedStock(): float
     {
-        if ($this->relationLoaded('movements')) {
+        if ($this->precomputedMovements !== null) {
+            $movSum = (float) array_sum($this->precomputedMovements);
+        } elseif ($this->relationLoaded('movements')) {
             $movSum = (float) $this->movements->sum(fn($m) => $m->signedQty());
         } else {
             $movSum = (float) $this->movements()
@@ -186,7 +198,9 @@ class Ingredient extends Model
     public function getOutletStocksAttribute(): array
     {
         $outlets = static::getCachedOutlets();
-        if ($this->relationLoaded('movements')) {
+        if ($this->precomputedMovements !== null) {
+            $movementsGrouped = $this->precomputedMovements;
+        } elseif ($this->relationLoaded('movements')) {
             $movementsGrouped = [];
             foreach ($this->movements as $m) {
                 $oid = $m->outlet_id;

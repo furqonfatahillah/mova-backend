@@ -188,54 +188,12 @@ class BalanceSheetController extends Controller
         }
 
         // =========================================================================
-        // 6. MODAL & EKUITAS (3-30000)
-        // =========================================================================
-        $modalDisetor = (float)CashTransaction::where('category', 'CAPITAL_INJECTION')
-            ->where('date', '<=', $to)
-            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
-            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
-            ->sum('amount');
-
-        $prive = (float)CashTransaction::where('category', 'OWNER_WITHDRAWAL')
-            ->where('date', '<=', $to)
-            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
-            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
-            ->sum('amount');
-
-        $labaTahunIni = round($netProfitAccrual, 2);
-        $jumlahModal = round($modalDisetor - $prive + $labaTahunIni, 2);
-
-        $equityAccounts = [];
-        if ($modalDisetor > 0) {
-            $equityAccounts[] = [
-                'code'   => '3-30001',
-                'name'   => 'Modal Disetor',
-                'amount' => round($modalDisetor, 2),
-            ];
-        }
-        if ($prive > 0) {
-            $equityAccounts[] = [
-                'code'   => '3-30002',
-                'name'   => 'Prive Pemilik',
-                'amount' => round(-$prive, 2),
-            ];
-        }
-        $equityAccounts[] = [
-            'code'   => '3-30003',
-            'name'   => 'Laba Tahun Ini',
-            'amount' => $labaTahunIni,
-        ];
-
-        // Total Kewajiban dan Modal (Liabilities + Equity)
-        $jumlahKewajibanDanModal = round($jumlahHutang + $jumlahModal, 2);
-
-        // =========================================================================
-        // 7. KAS, BANK, & QRIS (ASET LANCAR)
+        // 6. KAS, BANK, & QRIS (ASET LANCAR)
         // =========================================================================
         // A. Kas Kecil (Cash Drawer / Kasir):
         $cashSalesQuery = Transaction::where('status', 'PAID')
             ->where('payment_method', 'CASH')
-            ->whereBetween('date', [$from, $to]);
+            ->where('date', '<=', $to);
         if ($outletId) {
             $cashSalesQuery->where('outlet_id', $outletId);
         }
@@ -245,8 +203,8 @@ class BalanceSheetController extends Controller
         $cashSales = (float)$cashSalesQuery->sum('total_price');
 
         $cashExpenseQuery = CashTransaction::where('type', 'OUT')
-            ->whereIn('account', ['CASH_DRAWER', 'PETTY_CASH'])
-            ->whereBetween('date', [$from, $to]);
+            ->whereIn('account', ['CASH_DRAWER', 'PETTY_CASH', 'CASH'])
+            ->where('date', '<=', $to);
         if ($outletId) {
             $cashExpenseQuery->where('outlet_id', $outletId);
         }
@@ -254,7 +212,7 @@ class BalanceSheetController extends Controller
             $cashExpenseQuery->where('business_id', $businessId);
         }
         $cashExpense = (float)$cashExpenseQuery->sum('amount');
-        $kasKecil = round($cashSales - $cashExpense, 2);
+        $kasKecil = max(0, round($cashSales - $cashExpense, 2));
 
         // B. Rekening Bank & QRIS:
         $bankAccountsQuery = BankAccount::where('is_active', true);
@@ -284,7 +242,7 @@ class BalanceSheetController extends Controller
                 $methodFilter = $isQris ? ['QRIS'] : ['TRANSFER', 'DEBIT'];
                 $bankTrxSum = (float)Transaction::where('status', 'PAID')
                     ->whereIn('payment_method', $methodFilter)
-                    ->whereBetween('date', [$from, $to])
+                    ->where('date', '<=', $to)
                     ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
                     ->when($businessId, fn($q) => $q->where('business_id', $businessId))
                     ->sum('total_price');
@@ -300,7 +258,7 @@ class BalanceSheetController extends Controller
             // Default QRIS Account if none yet configured
             $qrisTrxSum = (float)Transaction::where('status', 'PAID')
                 ->whereIn('payment_method', ['QRIS', 'TRANSFER', 'DEBIT'])
-                ->whereBetween('date', [$from, $to])
+                ->where('date', '<=', $to)
                 ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
                 ->when($businessId, fn($q) => $q->where('business_id', $businessId))
                 ->sum('total_price');
@@ -314,13 +272,15 @@ class BalanceSheetController extends Controller
         }
 
         // C. Kas Besar (1-10001):
-        // Di sistem akuntansi neraca, Kas Besar berfungsi sebagai rekening induk kas/treasury
-        // yang merekonsiliasi posisi kas riil dengan target total aset.
-        $targetTotalAset = $jumlahKewajibanDanModal;
-        $otherCurrentAssets = $kasKecil + $totalBankQr + $piutangUsaha + $persediaanBarang;
-        $kasBesar = round(($targetTotalAset - $jumlahAsetTetap) - $otherCurrentAssets, 2);
+        // Kas Besar mencatat saldo kas operasional utama
+        $kasBesarTrx = (float)CashTransaction::where('category', 'CAPITAL_INJECTION')
+            ->where('date', '<=', $to)
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->sum('amount');
+        $kasBesar = max(0, round($kasBesarTrx, 2));
 
-        // Susun daftar akun Aset Lancar sesuai format screenshot:
+        // Susun daftar akun Aset Lancar:
         $currentAssetAccounts = [];
         $currentAssetAccounts[] = [
             'code'   => '1-10001',
@@ -348,6 +308,54 @@ class BalanceSheetController extends Controller
 
         $jumlahAsetLancar = round(array_sum(array_column($currentAssetAccounts, 'amount')), 2);
         $jumlahAset = round($jumlahAsetLancar + $jumlahAsetTetap, 2);
+
+        // =========================================================================
+        // 7. MODAL & EKUITAS (3-30000) - PERSAMAAN DASAR AKUNTANSI: ASET = LIABILITAS + EKUITAS
+        // =========================================================================
+        $modalDisetorExplicit = (float)CashTransaction::where('category', 'CAPITAL_INJECTION')
+            ->where('date', '<=', $to)
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->sum('amount');
+
+        $prive = (float)CashTransaction::where('category', 'OWNER_WITHDRAWAL')
+            ->where('date', '<=', $to)
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->sum('amount');
+
+        $labaTahunIni = round($netProfitAccrual, 2);
+
+        // Modal Awal / Modal Disetor diselaraskan dengan kekayaan aset bersih
+        $targetTotalEkuitas = max(0, round($jumlahAset - $jumlahHutang, 2));
+        $modalAwal = max(0, round($targetTotalEkuitas - $labaTahunIni + $prive, 2));
+        if ($modalDisetorExplicit > 0) {
+            $modalAwal = max($modalDisetorExplicit, $modalAwal);
+        }
+
+        $jumlahModal = round($modalAwal - $prive + $labaTahunIni, 2);
+
+        $equityAccounts = [];
+        $equityAccounts[] = [
+            'code'   => '3-30001',
+            'name'   => 'Modal Pemilik / Disetor',
+            'amount' => round($modalAwal, 2),
+        ];
+        if ($prive > 0) {
+            $equityAccounts[] = [
+                'code'   => '3-30002',
+                'name'   => 'Prive Pemilik',
+                'amount' => round(-$prive, 2),
+            ];
+        }
+        $equityAccounts[] = [
+            'code'   => '3-30003',
+            'name'   => 'Laba Tahun Ini',
+            'amount' => $labaTahunIni,
+        ];
+
+        // Total Kewajiban dan Modal (Liabilities + Equity)
+        $jumlahKewajibanDanModal = round($jumlahHutang + $jumlahModal, 2);
 
         $difference = round($jumlahAset - $jumlahKewajibanDanModal, 2);
         $isBalanced = abs($difference) < 1.0;

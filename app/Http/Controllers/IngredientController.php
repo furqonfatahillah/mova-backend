@@ -432,6 +432,7 @@ class IngredientController extends Controller
                         'last_purchase_price' => $hargaBeli,
                         'stok_min'            => $minStok,
                         'stok_awal'           => $initialStock,
+                        'tolerance'           => (float)($row['tolerance'] ?? 5),
                         'notes'               => $row['notes'] ?? 'Imported from Excel',
                         'created_by'          => $user?->id,
                         'updated_by'          => $user?->id,

@@ -404,13 +404,15 @@ class IngredientController extends Controller
                     $row['initial_stock'] ??
                     $row['stock_awal'] ??
                     $row['stok_awal'] ??
-                    $row['saldo_awal'] ??
                     $row['initialStock'] ??
                     $row['stock'] ??
                     $row['stok'] ??
-                    $row['saldo'] ??
                     0
                 );
+                $initialBalance = (float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0);
+                if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
+                    $hargaBeli = ($initialBalance / $initialStock) * $konversi;
+                }
 
                 // Match strictly by (business_id, code) so custom codes are honored per business
                 $ing = Ingredient::updateOrCreate(
@@ -569,13 +571,15 @@ class IngredientController extends Controller
                     $row['initial_stock'] ??
                     $row['stock_awal'] ??
                     $row['stok_awal'] ??
-                    $row['saldo_awal'] ??
                     $row['initialStock'] ??
                     $row['stock'] ??
                     $row['stok'] ??
-                    $row['saldo'] ??
                     0
                 );
+                $initialBalance = (float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0);
+                if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
+                    $hargaBeli = ($initialBalance / $initialStock) * $konversi;
+                }
 
                 // Match strictly by (business_id, code) so custom codes are honored per business
                 $ing = Ingredient::updateOrCreate(

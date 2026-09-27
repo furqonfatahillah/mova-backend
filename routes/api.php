@@ -87,6 +87,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/shifts/{shift}/summary',        [ShiftController::class, 'summary']);
     Route::post('/shifts/{shift}/close',         [ShiftController::class, 'close']);
     Route::get('/shifts/{shift}/transactions',   [ShiftController::class, 'transactions']);
+    Route::get('/shifts/{shift}/receipt',        [ShiftController::class, 'receipt']);
 
     // Master Data
     Route::post('/ingredients/bulk-import',    [IngredientController::class, 'bulkImport']);

@@ -383,8 +383,6 @@ class ShiftController extends Controller
         });
 
         return response()->json($result);
-
-        return response()->json($result);
     }
 
     /**
@@ -435,6 +433,7 @@ class ShiftController extends Controller
                 'qty'             => (int)$t->qty,
                 'total_price'     => (float)$t->total_price,
                 'user_name'       => $t->user?->name ?? 'Kasir',
+                'payment_method'  => $t->payment_method ?? 'CASH',
                 'ingredient_usage'=> $ingId ? round($itemUsage, 3) : null,
                 'ingredient_unit' => $ingId ? $ingUnit : null,
             ];
@@ -448,6 +447,130 @@ class ShiftController extends Controller
             'total_transactions'         => count($rows),
             'total_sales'                => array_sum(array_column($rows, 'total_price')),
             'transactions'               => $rows,
+        ]);
+    }
+
+    /**
+     * Get receipt data for printing shift closing report.
+     * Matches the thermal receipt format: outlet header, items sold, payment breakdown, expenses, totals.
+     */
+    public function receipt(Request $request, Shift $shift)
+    {
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$shift->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Akses ditolak.'], 403);
+            }
+        }
+
+        $shift->load(['user', 'closedByUser', 'outlet']);
+
+        // Outlet & Business info for receipt header
+        $outlet = $shift->outlet;
+        $business = $outlet ? \App\Models\Business::find($outlet->business_id) : null;
+
+        // Get all PAID transactions (exclude dummy EQUAL split rows, include SPLIT_CLOSED actual items)
+        $paidTransactions = $shift->transactions()
+            ->where(function ($q) {
+                $q->where(function ($sub) {
+                    $sub->where('status', 'PAID')
+                        ->where(function ($inner) {
+                            $inner->whereNull('split_type')->orWhere('split_type', '!=', 'EQUAL');
+                        });
+                })->orWhere('status', 'SPLIT_CLOSED');
+            })
+            ->with('menu')
+            ->orderBy('created_at', 'asc')
+            ->get();
+
+        // Items sold grouped by menu
+        $itemsSold = [];
+        foreach ($paidTransactions as $t) {
+            $menuId = $t->menu_id;
+            $menuName = $t->menu?->name ?? 'Menu #' . $menuId;
+            if (!isset($itemsSold[$menuId])) {
+                $itemsSold[$menuId] = [
+                    'menu_name' => $menuName,
+                    'qty'       => 0,
+                    'total'     => 0.0,
+                ];
+            }
+            $itemsSold[$menuId]['qty'] += (int)$t->qty;
+            $itemsSold[$menuId]['total'] += (float)$t->total_price;
+        }
+
+        // Payment method breakdown
+        $allPaidTransactions = $shift->transactions()->where('status', 'PAID')->get();
+        $paymentBreakdown = [];
+        $cashTotal = 0.0;
+        $nonCashTotal = 0.0;
+
+        foreach ($allPaidTransactions as $t) {
+            $method = strtoupper($t->payment_method ?? 'CASH');
+            if (!isset($paymentBreakdown[$method])) {
+                $paymentBreakdown[$method] = 0.0;
+            }
+            $paymentBreakdown[$method] += (float)$t->total_price;
+
+            if ($method === 'CASH' || $method === 'TUNAI') {
+                $cashTotal += (float)$t->total_price;
+            } else {
+                $nonCashTotal += (float)$t->total_price;
+            }
+        }
+
+        // Operating expenses during shift period (if any)
+        $expenses = [];
+        if ($shift->opened_at) {
+            $expenseQuery = \App\Models\OperatingExpense::where('outlet_id', $shift->outlet_id)
+                ->where('business_id', $shift->business_id)
+                ->where('date', '>=', $shift->opened_at->toDateString());
+
+            if ($shift->closed_at) {
+                $expenseQuery->where('date', '<=', $shift->closed_at->toDateString());
+            }
+
+            $expenseQuery->where('created_at', '>=', $shift->opened_at);
+            if ($shift->closed_at) {
+                $expenseQuery->where('created_at', '<=', $shift->closed_at);
+            }
+
+            $expenses = $expenseQuery->get()->map(function ($e) {
+                return [
+                    'description' => $e->description,
+                    'amount'      => (float)$e->amount,
+                ];
+            })->toArray();
+        }
+
+        $totalExpenses = array_sum(array_column($expenses, 'amount'));
+        $totalSales = (float)$allPaidTransactions->sum('total_price');
+        $totalTransactions = $allPaidTransactions->count();
+
+        return response()->json([
+            'outlet_name'       => $outlet?->name ?? 'Outlet',
+            'outlet_address'    => $outlet?->address ?? '',
+            'outlet_phone'      => $outlet?->phone ?? '',
+            'business_name'     => $business?->name ?? '',
+            'shift'             => $shift,
+            'kasir_name'        => $shift->user?->name ?? 'Kasir',
+            'closed_by_name'    => $shift->closedByUser?->name ?? $shift->user?->name ?? 'Kasir',
+            'items_sold'        => array_values($itemsSold),
+            'total_transactions'=> $totalTransactions,
+            'total_sales'       => $totalSales,
+            'payment_breakdown' => $paymentBreakdown,
+            'cash_total'        => $cashTotal,
+            'non_cash_total'    => $nonCashTotal,
+            'non_cash_details'  => collect($paymentBreakdown)->filter(function ($v, $k) {
+                return !in_array($k, ['CASH', 'TUNAI']);
+            })->toArray(),
+            'expenses'          => $expenses,
+            'total_expenses'    => $totalExpenses,
+            'net_amount'        => $totalSales - $totalExpenses,
+            'initial_cash'      => (float)$shift->initial_cash,
+            'system_cash'       => $totalSales,
+            'closing_cash'      => $shift->closing_cash !== null ? (float)$shift->closing_cash : null,
+            'cash_difference'   => $shift->cash_difference !== null ? (float)$shift->cash_difference : null,
         ]);
     }
 }

@@ -246,6 +246,7 @@ class MovementController extends Controller
             $outletId = $validated['outlet_id'] ?? $user?->outlet_id ?? 1;
         }
         $targetOutlet = Outlet::find($outletId);
+        $businessId = $user?->business_id ?? $targetOutlet?->business_id;
         $isHolding = $targetOutlet ? (bool)$targetOutlet->is_main : ($outletId == 1);
 
         $rawPaymentType = strtoupper(trim($validated['payment_type'] ?? 'CASH'));

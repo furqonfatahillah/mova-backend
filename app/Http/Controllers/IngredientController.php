@@ -400,7 +400,17 @@ class IngredientController extends Controller
 
                 $hargaBeli = (float)($row['harga'] ?? 0);
                 $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
-                $initialStock = (float)($row['initial_stock'] ?? $row['stok_awal'] ?? 0);
+                $initialStock = (float)(
+                    $row['initial_stock'] ??
+                    $row['stock_awal'] ??
+                    $row['stok_awal'] ??
+                    $row['saldo_awal'] ??
+                    $row['initialStock'] ??
+                    $row['stock'] ??
+                    $row['stok'] ??
+                    $row['saldo'] ??
+                    0
+                );
 
                 // Match strictly by (business_id, code) so custom codes are honored per business
                 $ing = Ingredient::updateOrCreate(
@@ -438,15 +448,23 @@ class IngredientController extends Controller
                     });
                 }
 
+                $targetOutletId = null;
+                if ($matchedOutlet) {
+                    $targetOutletId = (int)$matchedOutlet->id;
+                } elseif ($user?->outlet_id && $businessOutlets->contains('id', $user->outlet_id)) {
+                    $targetOutletId = (int)$user->outlet_id;
+                } else {
+                    $mainOut = $businessOutlets->firstWhere('is_main', true) ?? $businessOutlets->first();
+                    $targetOutletId = $mainOut ? (int)$mainOut->id : 1;
+                }
+
                 // Sync/Initialize OutletIngredient for all business outlets
                 foreach ($businessOutlets as $bo) {
                     $outletRow = \App\Models\OutletIngredient::firstOrNew([
                         'outlet_id'     => $bo->id,
                         'ingredient_id' => $ing->id,
                     ]);
-                    $isTarget = $matchedOutlet
-                        ? ((int)$bo->id === (int)$matchedOutlet->id)
-                        : ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id);
+                    $isTarget = ((int)$bo->id === (int)$targetOutletId);
 
                     if ($isTarget) {
                         $outletRow->stok_awal = $initialStock;
@@ -546,7 +564,17 @@ class IngredientController extends Controller
 
                 $hargaBeli = (float)($row['harga'] ?? 0);
                 $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
-                $initialStock = (float)($row['initial_stock'] ?? $row['stok_awal'] ?? 0);
+                $initialStock = (float)(
+                    $row['initial_stock'] ??
+                    $row['stock_awal'] ??
+                    $row['stok_awal'] ??
+                    $row['saldo_awal'] ??
+                    $row['initialStock'] ??
+                    $row['stock'] ??
+                    $row['stok'] ??
+                    $row['saldo'] ??
+                    0
+                );
 
                 // Match strictly by (business_id, code) so custom codes are honored per business
                 $ing = Ingredient::updateOrCreate(
@@ -585,15 +613,23 @@ class IngredientController extends Controller
                     });
                 }
 
+                $targetOutletId = null;
+                if ($matchedOutlet) {
+                    $targetOutletId = (int)$matchedOutlet->id;
+                } elseif ($user?->outlet_id && $businessOutlets->contains('id', $user->outlet_id)) {
+                    $targetOutletId = (int)$user->outlet_id;
+                } else {
+                    $mainOut = $businessOutlets->firstWhere('is_main', true) ?? $businessOutlets->first();
+                    $targetOutletId = $mainOut ? (int)$mainOut->id : 1;
+                }
+
                 // Sync/Initialize OutletIngredient for all business outlets
                 foreach ($businessOutlets as $bo) {
                     $outletRow = \App\Models\OutletIngredient::firstOrNew([
                         'outlet_id'     => $bo->id,
                         'ingredient_id' => $ing->id,
                     ]);
-                    $isTarget = $matchedOutlet
-                        ? ((int)$bo->id === (int)$matchedOutlet->id)
-                        : ($bo->is_main || (int)$bo->id === 1 || $user?->outlet_id === $bo->id);
+                    $isTarget = ((int)$bo->id === (int)$targetOutletId);
 
                     if ($isTarget) {
                         $outletRow->stok_awal = $initialStock;

@@ -731,7 +731,7 @@ class MovementController extends Controller
     }
 
     /**
-     * Bulk Import Initial Stock (Saldo Awal Stok) for software transition / onboarding
+     * Bulk Import Initial Stock per Warehouse / Branch (Stock Awal Fisik Per Gudang / Cabang)
      */
     public function bulkImportInitial(Request $request)
     {
@@ -747,6 +747,9 @@ class MovementController extends Controller
         $importedCount = 0;
 
         $businessOutlets = Outlet::where('business_id', $businessId)->get();
+        if ($businessOutlets->isEmpty()) {
+            $businessOutlets = Outlet::all();
+        }
         $mainOutlet = $businessOutlets->firstWhere('is_main', true) ?? $businessOutlets->first();
 
         // If user is restricted to a specific outlet
@@ -764,6 +767,7 @@ class MovementController extends Controller
                     str_contains($lowerName, 'template import') ||
                     str_contains($lowerName, 'petunjuk') ||
                     str_contains($lowerName, 'saldo awal stok') ||
+                    str_contains($lowerName, 'stock awal fisik') ||
                     in_array($lowerName, ['kode bahan / item', 'nama bahan / item', 'nama bahan', 'nama item', 'nama bahan*', 'nama bahan / item*'])
                 ) {
                     continue;
@@ -782,10 +786,10 @@ class MovementController extends Controller
                         ->first();
                 }
 
-                $rawUnit = trim($row['unit'] ?? '');
-                $unitType = strtoupper(trim($row['unit_type'] ?? ''));
+                $rawUnit = trim($row['unit'] ?? $row['satuan'] ?? '');
+                $unitType = strtoupper(trim($row['unit_type'] ?? 'PAKAI'));
                 $initialStock = (float)($row['initial_stock'] ?? $row['stok_awal'] ?? $row['qty'] ?? 0);
-                $harga = (float)($row['harga'] ?? $row['price'] ?? $row['harga_beli'] ?? 0);
+                $harga = (float)($row['harga'] ?? $row['price'] ?? $row['harga_beli'] ?? $row['unit_price'] ?? 0);
                 $minStock = isset($row['stok_min']) && $row['stok_min'] !== '' ? (float)$row['stok_min'] : null;
 
                 // If ingredient doesn't exist yet, auto-create it with clean defaults
@@ -810,7 +814,7 @@ class MovementController extends Controller
                         }
                     }
 
-                    $catName = $isPerlengkapan ? 'Perlengkapan' : 'BAHAN_BAKU';
+                    $catName = !empty($row['category']) ? trim($row['category']) : ($isPerlengkapan ? 'Perlengkapan' : 'BAHAN_BAKU');
                     $cat = Category::firstOrCreate(
                         ['business_id' => $businessId, 'name' => $catName, 'type' => 'INGREDIENT'],
                         ['slug' => Str::slug($catName), 'color' => '#00B14F', 'icon' => 'Package']
@@ -916,7 +920,7 @@ class MovementController extends Controller
         });
 
         return response()->json([
-            'message'        => "Berhasil meng-import {$importedCount} data saldo awal stok persediaan (transisi aplikasi).",
+            'message'        => "Berhasil meng-import {$importedCount} data stock awal fisik per gudang / cabang.",
             'imported_count' => $importedCount,
         ]);
     }

@@ -93,6 +93,15 @@ class MenuController extends Controller
         $data['unit'] = $data['unit'] ?? ($data['item_type'] === 'DIRECT' ? 'pcs' : ($data['item_type'] === 'SERVICE' ? 'layanan' : ($data['item_type'] === 'BUNDLE' ? 'paket' : 'porsi')));
         $data['created_by'] = $request->user()?->id;
 
+        if (!empty($data['category'])) {
+            $cat = \App\Models\Category::firstOrCreate(
+                ['business_id' => $businessId, 'name' => trim($data['category']), 'type' => 'MENU'],
+                ['slug' => \Illuminate\Support\Str::slug(trim($data['category'])), 'color' => '#7C3AED', 'icon' => 'Utensils']
+            );
+            $data['category_id'] = $cat->id;
+            $data['category'] = $cat->name;
+        }
+
         $outletId = $data['outlet_id'] ?? null;
         $bundleItems = $data['bundle_items'] ?? null;
         unset($data['outlet_id'], $data['bundle_items']);
@@ -173,13 +182,38 @@ class MenuController extends Controller
             'bundle_items.*.unit'           => 'nullable|string',
         ]);
 
+        if (!empty($data['category'])) {
+            $cat = \App\Models\Category::firstOrCreate(
+                ['business_id' => $businessId, 'name' => trim($data['category']), 'type' => 'MENU'],
+                ['slug' => \Illuminate\Support\Str::slug(trim($data['category'])), 'color' => '#7C3AED', 'icon' => 'Utensils']
+            );
+            $data['category_id'] = $cat->id;
+            $data['category'] = $cat->name;
+        }
+
         $outletId = $data['outlet_id'] ?? null;
         $bundleItems = $data['bundle_items'] ?? null;
         unset($data['outlet_id'], $data['bundle_items']);
 
         $data['updated_by'] = $request->user()?->id;
 
+        $costBefore = (float)($menu->cost_price ?? 0);
+
         $menu->update($data);
+
+        // Record HPP change if cost_price changed on retail item
+        if (array_key_exists('cost_price', $data) && abs($costBefore - (float)$menu->cost_price) > 0.001 && $menu->item_type === 'DIRECT') {
+            try {
+                \App\Services\MenuHppService::recordForDirectRestock(
+                    $menu,
+                    $costBefore,
+                    (float)$menu->cost_price,
+                    $outletId ? (int)$outletId : null,
+                    $request->user()?->id,
+                    "Pembaruan harga modal manual pada Edit Menu"
+                );
+            } catch (\Throwable $e) {}
+        }
 
         if ($bundleItems !== null && is_array($bundleItems)) {
             $this->syncBundleItems($menu, $bundleItems);
@@ -205,6 +239,19 @@ class MenuController extends Controller
         }
         $menu->load($updateRelations);
         return response()->json($menu);
+    }
+
+    public function toggleActive(Request $request, Menu $menu)
+    {
+        $menu->active = !$menu->active;
+        $menu->updated_by = $request->user()?->id;
+        $menu->save();
+
+        return response()->json([
+            'message' => "Status produk '{$menu->name}' berhasil diubah menjadi " . ($menu->active ? 'Aktif' : 'Nonaktif'),
+            'active'  => (bool)$menu->active,
+            'menu'    => $menu
+        ]);
     }
 
     private function syncBundleItems(Menu $menu, array $items)

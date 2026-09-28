@@ -98,6 +98,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/receivables/bulk-import',    [ReceivableController::class, 'bulkImport']);
     Route::post('/outlets/bulk-import',        [OutletController::class, 'bulkImport']);
     Route::apiResource('ingredients', IngredientController::class);
+    Route::patch('/menus/{menu}/toggle-active', [MenuController::class, 'toggleActive']);
     Route::apiResource('menus', MenuController::class);
     Route::post('/menus/{menu}/recipes', [MenuController::class, 'storeRecipe']);
     Route::post('/menus/{menu}/restock', [MenuController::class, 'restock']);

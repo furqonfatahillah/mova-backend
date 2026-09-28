@@ -409,9 +409,9 @@ class IngredientController extends Controller
                     $row['stok'] ??
                     0
                 );
-                $initialBalance = (float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0);
+                $initialBalance = round((float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0));
                 if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
-                    $hargaBeli = ($initialBalance / $initialStock) * $konversi;
+                    $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
                 }
 
                 // Match strictly by (business_id, code) so custom codes are honored per business
@@ -576,9 +576,9 @@ class IngredientController extends Controller
                     $row['stok'] ??
                     0
                 );
-                $initialBalance = (float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0);
+                $initialBalance = round((float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0));
                 if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
-                    $hargaBeli = ($initialBalance / $initialStock) * $konversi;
+                    $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
                 }
 
                 // Match strictly by (business_id, code) so custom codes are honored per business

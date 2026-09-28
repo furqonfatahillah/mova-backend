@@ -45,6 +45,11 @@ class BatchPrep extends Model
         'changed_by_name',
         'user_name',
         'outlet_name',
+        'yield_variance_qty',
+        'yield_variance_pct',
+        'has_variance',
+        'variance_status',
+        'finding_summary',
     ];
 
     public function outlet()
@@ -80,5 +85,45 @@ class BatchPrep extends Model
     public function getOutletNameAttribute(): ?string
     {
         return $this->outlet?->name;
+    }
+
+    public function getYieldVarianceQtyAttribute(): float
+    {
+        return round((float)$this->actual_output_qty - (float)$this->expected_output_qty, 3);
+    }
+
+    public function getYieldVariancePctAttribute(): float
+    {
+        $expected = (float)$this->expected_output_qty;
+        if ($expected <= 0) return 0.0;
+        return round((((float)$this->actual_output_qty - $expected) / $expected) * 100, 2);
+    }
+
+    public function getHasVarianceAttribute(): bool
+    {
+        return abs((float)$this->actual_output_qty - (float)$this->expected_output_qty) > 0.001;
+    }
+
+    public function getVarianceStatusAttribute(): string
+    {
+        $diff = round((float)$this->actual_output_qty - (float)$this->expected_output_qty, 3);
+        if (abs($diff) <= 0.001) {
+            return 'NORMAL';
+        }
+        return $diff < 0 ? 'DEFICIT' : 'SURPLUS';
+    }
+
+    public function getFindingSummaryAttribute(): string
+    {
+        $diff = $this->yield_variance_qty;
+        $pct = $this->yield_variance_pct;
+        $unit = $this->output_unit;
+        if (abs($diff) <= 0.001) {
+            return "Hasil produksi presisi sesuai standar resep ({$this->actual_output_qty} {$unit}).";
+        }
+        if ($diff < 0) {
+            return "Temuan Defisit Produksi: Hasil fisik riil ({$this->actual_output_qty} {$unit}) lebih sedikit " . abs($diff) . " {$unit} (" . abs($pct) . "%) dari target resep ({$this->expected_output_qty} {$unit}).";
+        }
+        return "Temuan Surplus Produksi: Hasil fisik riil ({$this->actual_output_qty} {$unit}) lebih banyak +{$diff} {$unit} (+{$pct}%) dari target resep ({$this->expected_output_qty} {$unit}).";
     }
 }

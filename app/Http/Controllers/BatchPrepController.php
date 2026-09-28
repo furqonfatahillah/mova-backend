@@ -525,6 +525,16 @@ class BatchPrepController extends Controller
             // Update semi-finished ingredient moving average / valuation
             $semiFinishedIng->recalculateMovingAverage($actualOutputQty, $unitCost, $outletId);
 
+            // Calculate variance between actual and expected yield
+            $varianceQty = round($actualOutputQty - $expectedOutputQty, 3);
+            $variancePct = $expectedOutputQty > 0 ? round(($varianceQty / $expectedOutputQty) * 100, 1) : 0;
+            $varianceSuffix = "";
+            if (abs($varianceQty) > 0.001) {
+                $sign = $varianceQty > 0 ? "+{$varianceQty}" : "{$varianceQty}";
+                $pctSign = $variancePct > 0 ? "+{$variancePct}%" : "{$variancePct}%";
+                $varianceSuffix = " [Temuan Deviasi Hasil: {$sign} {$recipe->output_unit} ({$pctSign}) vs Target {$expectedOutputQty} {$recipe->output_unit}]";
+            }
+
             StockMovement::create([
                 'date'          => $date,
                 'ingredient_id' => $semiFinishedIng->id,
@@ -535,7 +545,7 @@ class BatchPrepController extends Controller
                 'total_price'   => $totalBatchCost,
                 'cost_before'   => (float)$semiFinishedIng->harga / $sfKonversi,
                 'cost_after'    => $unitCost,
-                'note'          => "{$batchNo} – Hasil Masak Batch ({$actualOutputQty} {$recipe->output_unit})",
+                'note'          => "{$batchNo} – Hasil Masak Batch ({$actualOutputQty} {$recipe->output_unit}){$varianceSuffix}",
                 'batch_prep_id' => $batchPrep->id,
                 'user_id'       => $request->user()?->id,
                 'created_by'    => $request->user()?->id,

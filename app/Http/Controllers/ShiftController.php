@@ -69,14 +69,30 @@ class ShiftController extends Controller
             return response()->json(null);
         }
 
-        $totalTransactions = $shift->transactions()->where('status', 'PAID')->count();
-        $totalSales = (float)$shift->transactions()->where('status', 'PAID')->sum('total_price');
+        $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
+        $totalTransactions = $paidTransactions->count();
+        $totalSales = (float)$paidTransactions->sum('total_price');
+
+        $cashSales = 0.0;
+        $nonCashSales = 0.0;
+        foreach ($paidTransactions as $t) {
+            $method = strtoupper(trim($t->payment_method ?? 'CASH'));
+            if ($method === 'CASH' || $method === 'TUNAI') {
+                $cashSales += (float)$t->total_price;
+            } else {
+                $nonCashSales += (float)$t->total_price;
+            }
+        }
+
+        $expectedCash = (float)$shift->initial_cash + $cashSales;
 
         return response()->json([
             'shift'              => $shift,
             'total_transactions' => $totalTransactions,
             'total_sales'        => $totalSales,
-            'expected_cash'      => (float)$shift->initial_cash + $totalSales,
+            'cash_sales'         => $cashSales,
+            'non_cash_sales'     => $nonCashSales,
+            'expected_cash'      => $expectedCash,
         ]);
     }
 
@@ -213,6 +229,21 @@ class ShiftController extends Controller
         $totalTransactions = $paidTransactions->count();
         $totalSales = (float)$paidTransactions->sum('total_price');
 
+        $cashSales = 0.0;
+        $nonCashSales = 0.0;
+        $paymentBreakdown = [];
+        foreach ($paidTransactions as $t) {
+            $method = strtoupper(trim($t->payment_method ?? 'CASH'));
+            $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + (float)$t->total_price;
+            if ($method === 'CASH' || $method === 'TUNAI') {
+                $cashSales += (float)$t->total_price;
+            } else {
+                $nonCashSales += (float)$t->total_price;
+            }
+        }
+
+        $expectedCash = (float)$shift->initial_cash + $cashSales;
+
         // Group actual menus sold (exclude dummy equal split installment rows, include SPLIT_CLOSED actual items)
         $actualMenuTransactions = $shift->transactions()
             ->where(function ($q) {
@@ -265,7 +296,10 @@ class ShiftController extends Controller
             'shift'              => $shift,
             'total_transactions' => $totalTransactions,
             'total_sales'        => $totalSales,
-            'expected_cash'      => (float)$shift->initial_cash + $totalSales,
+            'cash_sales'         => $cashSales,
+            'non_cash_sales'     => $nonCashSales,
+            'payment_breakdown'  => $paymentBreakdown,
+            'expected_cash'      => $expectedCash,
             'menus_sold'         => array_values($menuSummary),
             'ingredient_usages'  => $ingredientUsages,
             'open_bills_count'   => $openBillsCount,
@@ -323,9 +357,22 @@ class ShiftController extends Controller
         ]);
 
         $result = DB::transaction(function () use ($request, $shift, $data, $openBillsCount, $openBillsTotal, $allowCarryOver) {
-            $systemSales = (float)$shift->transactions()->where('status', 'PAID')->sum('total_price');
+            $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
+            $systemSales = (float)$paidTransactions->sum('total_price');
+
+            $cashSales = 0.0;
+            $nonCashSales = 0.0;
+            foreach ($paidTransactions as $t) {
+                $method = strtoupper(trim($t->payment_method ?? 'CASH'));
+                if ($method === 'CASH' || $method === 'TUNAI') {
+                    $cashSales += (float)$t->total_price;
+                } else {
+                    $nonCashSales += (float)$t->total_price;
+                }
+            }
+
             $closingCash = (float)$data['closing_cash'];
-            $expectedCash = (float)$shift->initial_cash + $systemSales;
+            $expectedCash = (float)$shift->initial_cash + $cashSales;
             $cashDiff = $closingCash - $expectedCash;
 
             // 1. Calculate aggregated theoretical ingredient usage
@@ -376,6 +423,9 @@ class ShiftController extends Controller
                 'shift'            => $shift->fresh(['user', 'closedByUser', 'creator', 'updater']),
                 'movements_count'  => count($createdMovements),
                 'total_sales'      => $systemSales,
+                'cash_sales'       => $cashSales,
+                'non_cash_sales'   => $nonCashSales,
+                'expected_cash'    => $expectedCash,
                 'cash_difference'  => $cashDiff,
                 'carry_over_count' => $openBillsCount,
                 'carry_over_total' => $openBillsTotal,

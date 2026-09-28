@@ -148,8 +148,9 @@ class ReportController extends Controller
             // Compute theoretical usage per menu for this ingredient
             $shares = [];
             foreach ($transactions as $t) {
-                $recipe = $menus->find($t->menu_id)?->recipes
-                    ->where('version', $t->recipe_version)->first();
+                $menu = $menus->find($t->menu_id);
+                if (! $menu) continue;
+                $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?? $menu->recipes->first();
                 if (! $recipe) continue;
                 $item = $recipe->items->firstWhere('ingredient_id', $ingId);
                 if (! $item) continue;
@@ -175,6 +176,31 @@ class ReportController extends Controller
                 ];
             }
         }
+
+        // Fallback for menu drilldown: If menu has recipe items but 0 sales in period, list recipe items
+        $varDataByIng = collect($varData)->keyBy(fn($iv) => $iv['ingredient']['id'] ?? 0);
+        foreach ($perMenu as $menuId => &$mRow) {
+            if (empty($mRow['items'])) {
+                $menuObj = $mRow['menu'];
+                $activeRecipe = $menuObj->recipes->first();
+                if ($activeRecipe && $activeRecipe->items) {
+                    foreach ($activeRecipe->items as $rItem) {
+                        $ingObj = $rItem->ingredient;
+                        if (!$ingObj) continue;
+                        $varObj = $varDataByIng->get($ingObj->id);
+                        $mRow['items'][] = [
+                            'ingredient'   => $ingObj,
+                            'usage'        => (float)$rItem->qty,
+                            'share'        => 0,
+                            'alloc_value'  => 0,
+                            'variance_pct' => $varObj['variance_pct'] ?? null,
+                            'status'       => $varObj['status'] ?? 'NORMAL',
+                        ];
+                    }
+                }
+            }
+        }
+        unset($mRow);
 
         return array_values(array_map(function ($row) {
             $row['variance_value'] = round($row['variance_value'], 0);

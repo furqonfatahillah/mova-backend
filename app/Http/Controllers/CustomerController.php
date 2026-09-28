@@ -35,13 +35,20 @@ class CustomerController extends Controller
         }
 
         if ($request->filled('search')) {
-            $s = '%' . trim($request->search) . '%';
-            $query->where(function ($q) use ($s) {
-                $q->where('name', 'like', $s)
-                  ->orWhere('phone', 'like', $s)
+            $rawS = trim($request->search);
+            $s = '%' . $rawS . '%';
+            $numericS = preg_replace('/[^0-9]/', '', $rawS);
+
+            $query->where(function ($q) use ($s, $numericS, $rawS) {
+                $q->where('phone', 'like', $s)
+                  ->orWhere('name', 'like', $s)
                   ->orWhere('code', 'like', $s)
                   ->orWhere('email', 'like', $s)
                   ->orWhere('notes', 'like', $s);
+
+                if (!empty($numericS) && strlen($numericS) >= 2) {
+                    $q->orWhere(DB::raw("REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''), '.', '')"), 'like', '%' . $numericS . '%');
+                }
             });
         }
 
@@ -297,12 +304,12 @@ class CustomerController extends Controller
     }
 
     /**
-     * Autocomplete search for POS cashier.
+     * Autocomplete search for POS cashier (Prioritizes Phone Number Search).
      */
     public function searchForPos(Request $request)
     {
-        $q = trim($request->get('q', $request->get('search', '')));
-        if (empty($q)) {
+        $rawQ = trim($request->get('q', $request->get('search', '')));
+        if (empty($rawQ)) {
             // Return top recent active members
             $customers = Customer::where('active', true)
                 ->orderByDesc('updated_at')
@@ -311,15 +318,58 @@ class CustomerController extends Controller
             return response()->json($customers);
         }
 
-        $s = '%' . $q . '%';
-        $customers = Customer::where('active', true)
-            ->where(function ($sq) use ($s) {
-                $sq->where('name', 'like', $s)
-                   ->orWhere('phone', 'like', $s)
+        // Clean numeric query for phone search
+        $numericQ = preg_replace('/[^0-9]/', '', $rawQ);
+        $phoneVariants = [];
+        if (!empty($numericQ)) {
+            $phoneVariants[] = $numericQ;
+            if (str_starts_with($numericQ, '62')) {
+                $phoneVariants[] = '0' . substr($numericQ, 2);
+                $phoneVariants[] = substr($numericQ, 2);
+            } elseif (str_starts_with($numericQ, '0')) {
+                $phoneVariants[] = '62' . substr($numericQ, 1);
+                $phoneVariants[] = substr($numericQ, 1);
+            }
+        }
+
+        $s = '%' . $rawQ . '%';
+        $query = Customer::where('active', true);
+
+        if (!empty($numericQ) && strlen($numericQ) >= 2) {
+            // PRIORITY 1: Phone search (including cleaned/unformatted digits)
+            $query->where(function ($sq) use ($s, $phoneVariants, $numericQ) {
+                foreach ($phoneVariants as $pv) {
+                    $sq->orWhere('phone', 'like', '%' . $pv . '%');
+                    $sq->orWhere(DB::raw("REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''), '.', '')"), 'like', '%' . $pv . '%');
+                }
+                // Fallback matching
+                $sq->orWhere('code', 'like', $s);
+                $sq->orWhere('name', 'like', $s);
+            });
+
+            // Order: Exact phone match first, then starts-with phone, then contains phone
+            $topVariant = $phoneVariants[0] ?? $numericQ;
+            $query->orderByRaw("
+                CASE 
+                    WHEN phone = ? THEN 1
+                    WHEN REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''), '.', '') = ? THEN 2
+                    WHEN phone LIKE ? THEN 3
+                    WHEN REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''), '.', '') LIKE ? THEN 4
+                    WHEN phone LIKE ? THEN 5
+                    ELSE 6
+                END ASC, name ASC",
+                [$rawQ, $topVariant, $topVariant . '%', $topVariant . '%', '%' . $topVariant . '%']
+            );
+        } else {
+            // Text search (name / code / phone)
+            $query->where(function ($sq) use ($s) {
+                $sq->where('phone', 'like', $s)
+                   ->orWhere('name', 'like', $s)
                    ->orWhere('code', 'like', $s);
-            })
-            ->orderBy('name', 'asc')
-            ->limit(20)
+            })->orderBy('name', 'asc');
+        }
+
+        $customers = $query->limit(20)
             ->get(['id', 'code', 'name', 'phone', 'email', 'total_points', 'total_visits', 'total_spent', 'joined_at']);
 
         return response()->json($customers);

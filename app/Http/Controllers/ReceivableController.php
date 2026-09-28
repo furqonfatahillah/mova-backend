@@ -770,18 +770,21 @@ class ReceivableController extends Controller
                 'total_gross'       => (float)$all->sum('total_amount'),
                 'total_mdr'         => (float)$all->sum('mdr_fee'),
                 'total_net'         => (float)$all->sum('net_amount'),
-                'total_unsettled'   => (float)$all->where('settlement_status', '!=', 'SETTLED')->sum('remaining_amount'),
-                'total_settled'     => (float)$all->where('settlement_status', 'SETTLED')->sum('paid_amount'),
-                'unsettled_count'   => $all->where('settlement_status', '!=', 'SETTLED')->count(),
-                'settled_count'     => $all->where('settlement_status', 'SETTLED')->count(),
-                'unsettled_amount'  => (float)$all->where('settlement_status', '!=', 'SETTLED')->sum('net_amount'),
-                'settled_amount'    => (float)$all->where('settlement_status', 'SETTLED')->sum('net_amount'),
+                'total_unsettled'   => (float)$all->where('ar_type', 'MERCHANT_QRIS')->where('settlement_status', '!=', 'SETTLED')->sum('remaining_amount'),
+                'total_settled'     => (float)$all->where('ar_type', 'MERCHANT_QRIS')->where('settlement_status', 'SETTLED')->sum('paid_amount'),
+                'unsettled_count'   => $all->where('ar_type', 'MERCHANT_QRIS')->where('settlement_status', '!=', 'SETTLED')->count(),
+                'settled_count'     => $all->where('ar_type', 'MERCHANT_QRIS')->where('settlement_status', 'SETTLED')->count(),
+                'unsettled_amount'  => (float)$all->where('ar_type', 'MERCHANT_QRIS')->where('settlement_status', '!=', 'SETTLED')->sum('net_amount'),
+                'settled_amount'    => (float)$all->where('ar_type', 'MERCHANT_QRIS')->where('settlement_status', 'SETTLED')->sum('net_amount'),
+                'ecom_count'        => $all->where('ar_type', 'MERCHANT_ECOMMERCE')->count(),
+                'ecom_gross'        => (float)$all->where('ar_type', 'MERCHANT_ECOMMERCE')->sum('total_amount'),
+                'ecom_net'          => (float)$all->where('ar_type', 'MERCHANT_ECOMMERCE')->sum('net_amount'),
             ]
         ]);
     }
 
     /**
-     * Settle single AR Merchant record to Bank
+     * Settle single AR Merchant record to Bank (Only for QRIS)
      */
     public function settleMerchant(Request $request, $id)
     {
@@ -793,6 +796,13 @@ class ReceivableController extends Controller
         ]);
 
         $receivable = Receivable::findOrFail($id);
+
+        if ($receivable->ar_type === 'MERCHANT_ECOMMERCE') {
+            return response()->json([
+                'message' => 'AR E-Commerce tidak memerlukan pencairan manual di POS karena pencairannya diproses otomatis langsung dari aplikasi e-commerce terkait. Buku piutang e-commerce hanya berfungsi untuk rekonsiliasi / cross-check besaran transaksi.'
+            ], 422);
+        }
+
         $settledDate = $request->settled_at ?: now()->toDateString();
         $netAmount = $request->has('net_amount') ? (float)$request->net_amount : ((float)$receivable->net_amount > 0 ? (float)$receivable->net_amount : (float)$receivable->total_amount);
 
@@ -822,13 +832,13 @@ class ReceivableController extends Controller
 
         return response()->json([
             'success' => true,
-            'message' => 'Pencairan AR Merchant berhasil dicatat ke rekening bank!',
+            'message' => 'Pencairan AR Merchant QRIS berhasil dicatat ke rekening bank!',
             'data'    => $receivable->load(['payments.receiver', 'outlet'])
         ]);
     }
 
     /**
-     * Settle multiple selected AR Merchant records to Bank (Bulk Settlement)
+     * Settle multiple selected AR Merchant records to Bank (Bulk Settlement - Only for QRIS)
      */
     public function bulkSettleMerchant(Request $request)
     {
@@ -843,7 +853,16 @@ class ReceivableController extends Controller
         $settledBank = $request->settlement_bank ?: 'Rekening Bank Utama';
         $user = $request->user();
 
-        $receivables = Receivable::whereIn('id', $request->ids)->get();
+        $receivables = Receivable::whereIn('id', $request->ids)
+            ->where('ar_type', 'MERCHANT_QRIS')
+            ->get();
+
+        if ($receivables->isEmpty()) {
+            return response()->json([
+                'message' => 'Tidak ada transaksi QRIS valid yang dapat dicairkan. Transaksi E-Commerce tidak memiliki opsi pencairan manual di POS karena diproses langsung via aplikasi e-commerce.'
+            ], 422);
+        }
+
         $count = 0;
         $totalCair = 0.0;
 
@@ -871,7 +890,7 @@ class ReceivableController extends Controller
                     'amount'         => $net,
                     'payment_method' => 'TRANSFER',
                     'reference_no'   => $request->settlement_ref ?: 'Bulk Settlement Payout',
-                    'notes'          => "Pencairan Masal Piutang {$r->merchant_channel} ke {$settledBank}",
+                    'notes'          => "Pencairan Masal Piutang QRIS {$r->merchant_channel} ke {$settledBank}",
                     'received_by'    => $user->id,
                 ]);
 
@@ -882,7 +901,7 @@ class ReceivableController extends Controller
 
         return response()->json([
             'success'     => true,
-            'message'     => "Berhasil mencairkan {$count} transaksi AR Merchant total Rp " . number_format($totalCair, 0, ',', '.') . " ke {$settledBank}!",
+            'message'     => "Berhasil mencairkan {$count} transaksi AR QRIS total Rp " . number_format($totalCair, 0, ',', '.') . " ke {$settledBank}!",
             'count'       => $count,
             'total_cair'  => $totalCair,
         ]);
@@ -952,7 +971,7 @@ class ReceivableController extends Controller
                 'ar_type'           => $arType,
                 'merchant_channel'  => $channel,
                 'order_number'      => $orderNo,
-                'customer_name'     => "AR Merchant - {$channel}",
+                'customer_name'     => $isQris ? "AR Merchant - {$channel}" : "Buku E-Commerce - {$channel}",
                 'customer_phone'    => null,
                 'customer_address'  => null,
                 'issue_date'        => $first->date ?: now()->toDateString(),
@@ -964,8 +983,8 @@ class ReceivableController extends Controller
                 'mdr_fee'           => $mdrFee,
                 'net_amount'        => $net,
                 'status'            => 'UNPAID',
-                'settlement_status' => 'UNSETTLED',
-                'notes'             => "Piutang Merchant {$channel} — Order #{$orderNo}",
+                'settlement_status' => $isQris ? 'UNSETTLED' : 'AUTO_ECOMMERCE',
+                'notes'             => $isQris ? "Piutang QRIS {$channel} — Order #{$orderNo}" : "Buku Rekonsiliasi E-Commerce {$channel} — Order #{$orderNo} (Pencairan Otomatis via Apk)",
                 'created_by'        => $first->user_id,
             ]);
         }

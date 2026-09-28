@@ -94,6 +94,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/ingredients/bulk-delete',    [IngredientController::class, 'bulkDelete']);
     Route::post('/perlengkapans/bulk-import',  [IngredientController::class, 'bulkImportPerlengkapan']);
     Route::post('/menus/bulk-import',          [MenuController::class, 'bulkImport']);
+    Route::post('/menus/bulk-import-recipes',  [MenuController::class, 'bulkImportRecipes']);
     Route::post('/menus/bulk-delete',          [MenuController::class, 'bulkDelete']);
     Route::post('/receivables/bulk-import',    [ReceivableController::class, 'bulkImport']);
     Route::post('/outlets/bulk-import',        [OutletController::class, 'bulkImport']);

@@ -542,4 +542,210 @@ class MenuController extends Controller
             'imported_count' => $importedCount,
         ]);
     }
+
+    /**
+     * Bulk Import Recipes & Grammage per Menu from Excel (Bill of Materials / BOM)
+     */
+    public function bulkImportRecipes(Request $request)
+    {
+        $request->validate([
+            'items'   => 'required|array|min:1',
+            'items.*' => 'required|array',
+        ]);
+
+        $user = $request->user();
+        $businessId = $user?->business_id;
+        $items = $request->input('items', []);
+
+        $importedMenuCount = 0;
+        $totalItemsCount = 0;
+
+        \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedMenuCount, &$totalItemsCount) {
+            // Group rows by menu identifier (menu_code or menu_name)
+            $groupedByMenu = [];
+            foreach ($items as $row) {
+                $menuName = trim($row['menu_name'] ?? $row['menu'] ?? $row['nama_menu'] ?? '');
+                $menuCode = trim($row['menu_code'] ?? $row['kode_menu'] ?? '');
+                if (empty($menuName) && empty($menuCode)) continue;
+
+                $ingredientName = trim($row['ingredient_name'] ?? $row['bahan'] ?? $row['nama_bahan'] ?? $row['item_name'] ?? $row['nama_perlengkapan'] ?? '');
+                if (empty($ingredientName)) continue;
+
+                $key = !empty($menuCode) ? "code:{$menuCode}" : "name:" . strtolower($menuName);
+                if (!isset($groupedByMenu[$key])) {
+                    $groupedByMenu[$key] = [
+                        'menu_code' => $menuCode,
+                        'menu_name' => $menuName,
+                        'recipe_items' => [],
+                    ];
+                }
+
+                $groupedByMenu[$key]['recipe_items'][] = $row;
+            }
+
+            foreach ($groupedByMenu as $group) {
+                $menuCode = $group['menu_code'];
+                $menuName = $group['menu_name'];
+                $recipeRows = $group['recipe_items'];
+
+                if (empty($recipeRows)) continue;
+
+                // 1. Find or create Menu
+                $menu = null;
+                if (!empty($menuCode)) {
+                    $menu = Menu::where('business_id', $businessId)->where('code', $menuCode)->first();
+                }
+                if (!$menu && !empty($menuName)) {
+                    $menu = Menu::where('business_id', $businessId)
+                        ->where(\Illuminate\Support\Facades\DB::raw('LOWER(name)'), strtolower($menuName))
+                        ->first();
+                }
+
+                if (!$menu) {
+                    if (empty($menuCode)) {
+                        $seq = Menu::where('business_id', $businessId)->count() + 1;
+                        do {
+                            $candidateCode = 'MNU-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                            $exists = Menu::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                            $seq++;
+                        } while ($exists);
+                        $menuCode = $candidateCode;
+                    }
+
+                    $cat = \App\Models\Category::firstOrCreate(
+                        ['business_id' => $businessId, 'name' => 'Minuman', 'type' => 'MENU'],
+                        ['slug' => 'minuman', 'color' => '#7C3AED', 'icon' => 'Utensils']
+                    );
+
+                    $menu = Menu::create([
+                        'business_id'  => $businessId,
+                        'code'         => $menuCode,
+                        'name'         => $menuName ?: "Menu {$menuCode}",
+                        'category_id'  => $cat->id,
+                        'category'     => $cat->name,
+                        'item_type'    => 'RECIPE',
+                        'price'        => 15000,
+                        'cost_price'   => 0,
+                        'is_available' => true,
+                        'created_by'   => $user?->id,
+                        'updated_by'   => $user?->id,
+                    ]);
+                } else {
+                    if ($menu->item_type === 'DIRECT') {
+                        $menu->item_type = 'RECIPE';
+                        $menu->save();
+                    }
+                }
+
+                $oldHpp = (float)$menu->calculateHpp();
+                $nextVersion = ($menu->recipes()->max('version') ?? 0) + 1;
+
+                $recipe = Recipe::create([
+                    'menu_id'    => $menu->id,
+                    'version'    => $nextVersion,
+                    'date'       => $recipeRows[0]['date'] ?? now()->toDateString(),
+                    'created_by' => $user?->id,
+                    'updated_by' => $user?->id,
+                ]);
+
+                foreach ($recipeRows as $rRow) {
+                    $ingName = trim($rRow['ingredient_name'] ?? $rRow['bahan'] ?? $rRow['nama_bahan'] ?? $rRow['item_name'] ?? $rRow['nama_perlengkapan'] ?? '');
+                    $ingCode = trim($rRow['ingredient_code'] ?? $rRow['kode_bahan'] ?? '');
+                    $qty = (float)($rRow['qty'] ?? $rRow['gramasi'] ?? $rRow['jumlah'] ?? 1);
+                    $unit = trim($rRow['unit'] ?? $rRow['satuan'] ?? 'gram');
+                    $waste = (float)($rRow['waste_std'] ?? $rRow['waste'] ?? $rRow['susut'] ?? 0);
+
+                    // Match ingredient
+                    $ingredient = null;
+                    if (!empty($ingCode)) {
+                        $ingredient = Ingredient::where('business_id', $businessId)->where('code', $ingCode)->first();
+                    }
+                    if (!$ingredient && !empty($ingName)) {
+                        $ingredient = Ingredient::where('business_id', $businessId)
+                            ->where(\Illuminate\Support\Facades\DB::raw('LOWER(name)'), strtolower($ingName))
+                            ->first();
+                    }
+
+                    // Auto create ingredient if not exists
+                    if (!$ingredient) {
+                        $isPerl = in_array(strtolower($unit), ['pcs', 'lembar', 'slop', 'pack']) ||
+                            preg_match('/(cup|sedotan|pipet|tissue|tisu|kantong|kresek|box|lid|sealer)/i', $ingName);
+
+                        if (empty($ingCode)) {
+                            $prefix = $isPerl ? 'PLK-' : 'BHN-';
+                            $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                            do {
+                                $candidateCode = $prefix . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                                $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                                $seq++;
+                            } while ($exists);
+                            $ingCode = $candidateCode;
+                        }
+
+                        $ingCatName = $isPerl ? 'Perlengkapan' : 'BAHAN_BAKU';
+                        $ingCat = \App\Models\Category::firstOrCreate(
+                            ['business_id' => $businessId, 'name' => $ingCatName, 'type' => 'INGREDIENT'],
+                            ['slug' => \Illuminate\Support\Str::slug($ingCatName), 'color' => '#00B14F', 'icon' => 'Package']
+                        );
+
+                        $unitBeli = $isPerl ? 'slop' : (in_array(strtolower($unit), ['ml', 'liter']) ? 'liter' : 'kg');
+                        $unitPakai = $unit ?: ($isPerl ? 'pcs' : (in_array(strtolower($unit), ['ml', 'liter']) ? 'ml' : 'gram'));
+
+                        $konversi = 1.0;
+                        if ($unitBeli === 'kg' && $unitPakai === 'gram') $konversi = 1000.0;
+                        elseif ($unitBeli === 'liter' && $unitPakai === 'ml') $konversi = 1000.0;
+                        elseif ($unitBeli === 'slop' && $unitPakai === 'pcs') $konversi = 50.0;
+                        elseif ($unitBeli === 'pack') $konversi = 100.0;
+
+                        $ingredient = Ingredient::create([
+                            'business_id'   => $businessId,
+                            'code'          => $ingCode,
+                            'name'          => $ingName,
+                            'category_id'   => $ingCat->id,
+                            'category'      => $ingCat->name,
+                            'type'          => 'RAW',
+                            'unit_beli'     => $unitBeli,
+                            'unit_pakai'    => $unitPakai,
+                            'konversi'      => $konversi,
+                            'harga'         => 0,
+                            'stok_min'      => 0,
+                            'stok_awal'     => 0,
+                            'created_by'    => $user?->id,
+                            'updated_by'    => $user?->id,
+                        ]);
+                    }
+
+                    RecipeItem::create([
+                        'recipe_id'     => $recipe->id,
+                        'ingredient_id' => $ingredient->id,
+                        'qty'           => $qty,
+                        'unit'          => $unit ?: $ingredient->unit_pakai,
+                        'waste_std'     => $waste,
+                    ]);
+
+                    $totalItemsCount++;
+                }
+
+                $newHpp = (float)$menu->calculateHpp();
+
+                try {
+                    \App\Services\MenuHppService::recordForRecipeUpdate(
+                        $menu,
+                        $oldHpp,
+                        $newHpp,
+                        $user?->id,
+                        "Import resep Excel ke Versi {$nextVersion}"
+                    );
+                } catch (\Throwable $e) {}
+
+                $importedMenuCount++;
+            }
+        });
+
+        return response()->json([
+            'message'             => "Berhasil meng-import resep untuk {$importedMenuCount} menu ({$totalItemsCount} rincian bahan/gramasi terpasang).",
+            'imported_menu_count' => $importedMenuCount,
+            'total_items_count'   => $totalItemsCount,
+        ]);
+    }
 }

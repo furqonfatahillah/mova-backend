@@ -21,7 +21,9 @@ class ShiftController extends Controller
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
 
         $query = Shift::with(['user', 'closedByUser', 'creator', 'updater', 'outlet', 'shiftSchedule'])
-            ->withCount('transactions')
+            ->withCount(['transactions as transactions_count' => function ($q) {
+                $q->where('status', 'PAID')->select(DB::raw('COUNT(DISTINCT COALESCE(order_number, CAST(id AS CHAR)))'));
+            }])
             ->orderByDesc('opened_at')
             ->orderByDesc('id');
 
@@ -70,7 +72,7 @@ class ShiftController extends Controller
         }
 
         $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
-        $totalTransactions = $paidTransactions->count();
+        $totalTransactions = $paidTransactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
         $totalSales = (float)$paidTransactions->sum('total_price');
 
         $cashSales = 0.0;
@@ -226,7 +228,7 @@ class ShiftController extends Controller
         $shift->load(['user', 'closedByUser']);
 
         $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
-        $totalTransactions = $paidTransactions->count();
+        $totalTransactions = $paidTransactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
         $totalSales = (float)$paidTransactions->sum('total_price');
 
         $cashSales = 0.0;
@@ -489,12 +491,15 @@ class ShiftController extends Controller
             ];
         }
 
+        $totalOrders = $transactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
+
         return response()->json([
             'shift'                      => $shift->load(['user', 'closedByUser']),
             'ingredient_id'              => $ingId,
             'total_ingredient_usage'     => round($totalUsageForIngredient, 3),
             'ingredient_unit'            => $ingUnit,
-            'total_transactions'         => count($rows),
+            'total_transactions'         => $totalOrders,
+            'total_items'                => count($rows),
             'total_sales'                => array_sum(array_column($rows, 'total_price')),
             'transactions'               => $rows,
         ]);
@@ -595,7 +600,7 @@ class ShiftController extends Controller
 
         $totalExpenses = array_sum(array_column($expenses, 'amount'));
         $totalSales = (float)$allPaidTransactions->sum('total_price');
-        $totalTransactions = $allPaidTransactions->count();
+        $totalTransactions = $allPaidTransactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
 
         return response()->json([
             'outlet_name'       => $outlet?->name ?? 'Outlet',

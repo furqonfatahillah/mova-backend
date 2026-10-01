@@ -25,6 +25,14 @@ class UrgentNote extends Model
         'unit',
         'status',
         'notes',
+        'approval_requested_by',
+        'approval_requested_at',
+        'requested_notes',
+        'approved_by',
+        'approved_at',
+        'rejected_by',
+        'rejected_at',
+        'reject_reason',
         'resolved_at',
         'resolved_by',
         'resolution_notes',
@@ -34,16 +42,22 @@ class UrgentNote extends Model
     ];
 
     protected $casts = [
-        'required_qty' => 'float',
-        'deducted_qty' => 'float',
-        'pending_qty'  => 'float',
-        'resolved_at'  => 'datetime',
+        'required_qty'          => 'float',
+        'deducted_qty'          => 'float',
+        'pending_qty'           => 'float',
+        'approval_requested_at' => 'datetime',
+        'approved_at'           => 'datetime',
+        'rejected_at'           => 'datetime',
+        'resolved_at'           => 'datetime',
     ];
 
     protected $appends = [
         'created_by_name',
         'updated_by_name',
         'resolved_by_name',
+        'approval_requested_by_name',
+        'approved_by_name',
+        'rejected_by_name',
         'outlet_name',
         'menu_name',
         'ingredient_name',
@@ -100,6 +114,36 @@ class UrgentNote extends Model
         return $this->resolvedByUser?->name;
     }
 
+    public function approvalRequestedByUser()
+    {
+        return $this->belongsTo(User::class, 'approval_requested_by');
+    }
+
+    public function getApprovalRequestedByNameAttribute()
+    {
+        return $this->approvalRequestedByUser?->name;
+    }
+
+    public function approvedByUser()
+    {
+        return $this->belongsTo(User::class, 'approved_by');
+    }
+
+    public function getApprovedByNameAttribute()
+    {
+        return $this->approvedByUser?->name;
+    }
+
+    public function rejectedByUser()
+    {
+        return $this->belongsTo(User::class, 'rejected_by');
+    }
+
+    public function getRejectedByNameAttribute()
+    {
+        return $this->rejectedByUser?->name;
+    }
+
     public function resolutionMovement()
     {
         return $this->belongsTo(StockMovement::class, 'resolution_movement_id');
@@ -128,6 +172,11 @@ class UrgentNote extends Model
     public function scopePending($query)
     {
         return $query->where('status', 'PENDING');
+    }
+
+    public function scopeWaitingApproval($query)
+    {
+        return $query->where('status', 'APPROVAL_PENDING');
     }
 
     public function scopeResolved($query)

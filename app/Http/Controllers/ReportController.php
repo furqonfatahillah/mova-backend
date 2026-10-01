@@ -115,7 +115,7 @@ class ReportController extends Controller
     private function calculateVarianceMenusData(string $from, string $to, ?int $outletId): array
     {
         $varData = $this->buildVarianceArray($from, $to, $outletId);
-        $menus   = Menu::with(['recipes.items', 'outletMenus'])->get();
+        $menus   = Menu::with(['recipes.items.ingredient', 'outletMenus'])->get();
         $trxQuery = Transaction::whereBetween('date', [$from, $to])->where('status', 'PAID');
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);
@@ -1351,8 +1351,15 @@ class ReportController extends Controller
         $ingredients = $this->cachedActiveIngredients;
 
         // Fetch movements WITHOUT heavy eager-loads (creator/user only needed for waste display)
+        // ⚡ Exclude automatic opname physical adjustments of the CURRENT period (e.g. 'Penyesuaian Opname Fisik%')
+        // so that the theoretical baseline represents pure pre-opname stock movements.
+        // For date < $from (prior movements), previous opname adjustments MUST be included in balanceBefore.
         $movQuery = StockMovement::where(function ($q) use ($from, $to) {
             $q->where('date', '<', $from)->orWhereBetween('date', [$from, $to]);
+        })->where(function ($q) use ($from) {
+            $q->where('date', '<', $from)
+              ->orWhereNull('note')
+              ->orWhere('note', 'not like', 'Penyesuaian Opname Fisik%');
         });
         if ($outletId) {
             $movQuery->where('outlet_id', $outletId);
@@ -1383,10 +1390,62 @@ class ReportController extends Controller
         }
         $opnames = $opnQuery->get()->keyBy('ingredient_id');
 
+        // Fallback: If no exact period match was found (e.g. user selected full month 1-30 Sep, but opname was recorded on 28 Sep),
+        // query the most recent opname for each ingredient within [$from, $to].
+        if ($opnames->isEmpty()) {
+            $fallbackQuery = Opname::where(function ($q) use ($from, $to) {
+                $q->whereBetween('period_to', [$from, $to])
+                  ->orWhereBetween('period_from', [$from, $to])
+                  ->orWhereBetween('opname_date', [$from, $to]);
+            });
+            if ($outletId) {
+                $fallbackQuery->where('outlet_id', $outletId);
+            }
+            $fallbackOpnames = $fallbackQuery->orderByDesc('opname_date')
+                ->orderByDesc('period_to')
+                ->orderByDesc('id')
+                ->get();
+
+            if ($fallbackOpnames->isNotEmpty()) {
+                $opnames = $fallbackOpnames->groupBy('ingredient_id')->map(fn($group) => $group->first());
+            }
+        }
+
         $isHoldingOutlet = false;
         if ($outletId) {
             $ot = \App\Models\Outlet::find($outletId);
             $isHoldingOutlet = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
+        }
+
+        // Preload transaction menu usages for recipe consumption breakdown per ingredient
+        $trxQuery = Transaction::whereBetween('date', [$from, $to])->where('status', 'PAID');
+        if ($outletId) {
+            $trxQuery->where('outlet_id', $outletId);
+        }
+        $transactions = $trxQuery->get(['id', 'menu_id', 'qty', 'recipe_version']);
+        $menus = Menu::with(['recipes.items'])->get()->keyBy('id');
+
+        $ingredientMenuUsage = [];
+        foreach ($transactions as $t) {
+            $menu = $menus->get($t->menu_id);
+            if (!$menu) continue;
+            $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?? $menu->recipes->first();
+            if (!$recipe || !$recipe->items) continue;
+            foreach ($recipe->items as $rItem) {
+                $ingId = $rItem->ingredient_id;
+                if (!isset($ingredientMenuUsage[$ingId][$menu->id])) {
+                    $ingredientMenuUsage[$ingId][$menu->id] = [
+                        'menu_id'     => $menu->id,
+                        'menu_name'   => $menu->name,
+                        'category'    => $menu->category ?? 'Menu',
+                        'qty_sold'    => 0,
+                        'portion_qty' => (float)$rItem->qty,
+                        'total_usage' => 0.0,
+                    ];
+                }
+                $ingredientMenuUsage[$ingId][$menu->id]['qty_sold'] += (int)$t->qty;
+                $ingredientMenuUsage[$ingId][$menu->id]['total_usage'] += round((float)$rItem->qty * (float)$t->qty, 4);
+            }
         }
 
         $result = [];
@@ -1409,38 +1468,83 @@ class ReportController extends Controller
                 $stokAwalMaster = $sumInit > 0 ? $sumInit : (float) $ing->stok_awal;
             }
 
-            $stokAwalPeriode = $stokAwalMaster + $agg['balanceBefore'];
-            $pembelian       = $agg['purchase'];
-            $pemakaianTeo    = $agg['saleUsage'];
-            $prepUsage       = $agg['prepUsage'] ?? 0.0;
-            $prepOutput      = $agg['prepOutput'] ?? 0.0;
-            $wasteQty        = $agg['waste'];
-            $transferIn      = $agg['transferIn'];
-            $transferOut     = $agg['transferOut'];
-            $adjustment      = $agg['adjustment'];
-
-            $stokAkhirTeo = $stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $pemakaianTeo - $prepUsage - $wasteQty - $transferOut + $adjustment;
-
             $opname    = $opnames->get($ing->id);
-            $actualQty = $opname?->actual_qty;
-            $hasActual = $actualQty !== null;
-
             $targetOid = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
-            $hargaPerPakai       = $ing->costPerPakaiForOutlet($targetOid);
-            $wasteValue          = round($wasteQty * $hargaPerPakai, 0);
+            $hargaPerPakai = (float) $ing->costPerPakaiForOutlet($targetOid);
 
-            // Pemakaian fisik lapangan (memperhitungkan transfer & batch prep)
-            $pemakaianAktual     = $hasActual ? ($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty) : null;
-            // Variance kotor terhadap total pemakaian resep (POS + Batch Prep)
-            $totalTeoritisPakai  = $pemakaianTeo + $prepUsage;
-            $varianceGrossQty    = $hasActual ? ($pemakaianAktual - $totalTeoritisPakai) : null;
-            $varianceGrossValue  = $hasActual ? round($varianceGrossQty * $hargaPerPakai, 0) : null;
-            // Unaccounted variance (setelah dikurangi waste tercatat)
-            $unaccountedQty      = $hasActual ? ($varianceGrossQty - $wasteQty) : null;
-            $unaccountedValue    = $hasActual ? round($unaccountedQty * $hargaPerPakai, 0) : null;
+            if ($opname && $opname->is_closed && $opname->period_from === $from && $opname->period_to === $to) {
+                // 🔒 LOCKED SNAPSHOT: Sisa teoritis di stok opname TIDAK AKAN BERUBAH setelah di-release!
+                // Walaupun ada transaksi pembelian/penjualan/pengeluaran baru, angka teoritis dan selisih tetap mengunci snapshot sebelum opname.
+                $stokAwalPeriode   = (float) ($opname->stok_awal_periode ?? 0);
+                $pembelian         = (float) ($opname->pembelian ?? 0);
+                $pemakaianTeo      = (float) ($opname->pemakaian_teoritis ?? 0);
+                $prepUsage         = (float) ($opname->prep_usage ?? 0);
+                $prepOutput        = (float) ($opname->prep_output ?? 0);
+                $wasteQty          = (float) ($opname->waste_qty ?? 0);
+                $wasteValue        = (float) ($opname->waste_value ?? round($wasteQty * $hargaPerPakai, 0));
+                $transferIn        = (float) ($opname->transfer_in ?? 0);
+                $transferOut       = (float) ($opname->transfer_out ?? 0);
+                $adjustment        = (float) ($opname->adjustment_qty ?? 0);
+                $stokAkhirTeo      = (float) ($opname->stok_akhir_teoritis ?? 0);
+                $costPerUnit       = (float) ($opname->cost_per_unit ?? $hargaPerPakai);
+                $nilaiTeoritis     = (float) ($opname->nilai_teoritis ?? round($stokAkhirTeo * $costPerUnit, 0));
+                $actualQty         = $opname->actual_qty !== null ? (float) $opname->actual_qty : null;
+                $hasActual         = $actualQty !== null;
+                $nilaiAktual       = $opname->nilai_aktual !== null ? (float) $opname->nilai_aktual : ($hasActual ? round($actualQty * $costPerUnit, 0) : null);
+                $varianceStockQty  = $opname->variance_qty !== null ? (float) $opname->variance_qty : ($hasActual ? round($actualQty - $stokAkhirTeo, 4) : null);
+                $varianceStockValue = $opname->variance_value !== null ? (float) $opname->variance_value : ($hasActual ? round($varianceStockQty * $costPerUnit, 0) : null);
+                $varianceStockPct  = $opname->variance_pct !== null ? (float) $opname->variance_pct : null;
+                $status            = $opname->status;
 
-            $variancePct         = ($hasActual && $totalTeoritisPakai > 0) ? ($unaccountedQty / $totalTeoritisPakai) * 100 : null;
-            $status              = $hasActual ? $this->statusOf(abs($variancePct ?? 0), $ing->tolerance) : null;
+                $pemakaianAktual   = $hasActual ? ($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty) : null;
+                $totalTeoritisPakai = $pemakaianTeo + $prepUsage;
+                $varianceGrossQty  = $hasActual ? round($pemakaianAktual - $totalTeoritisPakai, 4) : null;
+                $varianceGrossValue = $hasActual ? round($varianceGrossQty * $costPerUnit, 0) : null;
+                $unaccountedQty    = $hasActual ? round($varianceGrossQty - $wasteQty, 4) : null;
+                $unaccountedValue  = $hasActual ? round($unaccountedQty * $costPerUnit, 0) : null;
+            } else {
+                $stokAwalPeriode = $stokAwalMaster + $agg['balanceBefore'];
+                $pembelian       = $agg['purchase'];
+                $pemakaianTeo    = $agg['saleUsage'];
+                $prepUsage       = $agg['prepUsage'] ?? 0.0;
+                $prepOutput      = $agg['prepOutput'] ?? 0.0;
+                $wasteQty        = $agg['waste'];
+                $transferIn      = $agg['transferIn'];
+                $transferOut     = $agg['transferOut'];
+                $adjustment      = $agg['adjustment'];
+
+                $stokAkhirTeo = $stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $pemakaianTeo - $prepUsage - $wasteQty - $transferOut + $adjustment;
+
+                $actualQty = ($opname && $opname->actual_qty !== null) ? (float)$opname->actual_qty : null;
+                $hasActual = $actualQty !== null;
+
+                $wasteValue          = round($wasteQty * $hargaPerPakai, 0);
+                $costPerUnit         = $hargaPerPakai;
+                $nilaiTeoritis       = round($stokAkhirTeo * $hargaPerPakai, 0);
+                $nilaiAktual         = $hasActual ? round($actualQty * $hargaPerPakai, 0) : null;
+
+                // Selisih Stok Opname (Fisik - Sisa Teoritis)
+                $varianceStockQty    = $hasActual ? round($actualQty - $stokAkhirTeo, 4) : null;
+                $varianceStockValue  = $hasActual ? round($varianceStockQty * $hargaPerPakai, 0) : null;
+
+                $denomStock          = abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : ($hasActual && abs($actualQty) > 0.0001 ? abs($actualQty) : 1.0);
+                $varianceStockPct    = $hasActual ? round(($varianceStockQty / $denomStock) * 100, 2) : null;
+
+                $status              = null;
+                if ($hasActual) {
+                    $status = abs($varianceStockQty) < 0.0001 ? 'NORMAL' : $this->statusOf(abs($varianceStockPct ?? 0), $ing->tolerance);
+                }
+
+                // Pemakaian fisik lapangan (memperhitungkan transfer & batch prep)
+                $pemakaianAktual     = $hasActual ? ($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty) : null;
+                // Variance kotor terhadap total pemakaian resep (POS + Batch Prep)
+                $totalTeoritisPakai  = $pemakaianTeo + $prepUsage;
+                $varianceGrossQty    = $hasActual ? round($pemakaianAktual - $totalTeoritisPakai, 4) : null;
+                $varianceGrossValue  = $hasActual ? round($varianceGrossQty * $hargaPerPakai, 0) : null;
+                // Unaccounted variance (setelah dikurangi waste tercatat)
+                $unaccountedQty      = $hasActual ? round($varianceGrossQty - $wasteQty, 4) : null;
+                $unaccountedValue    = $hasActual ? round($unaccountedQty * $hargaPerPakai, 0) : null;
+            }
 
             // Waste records already collected during aggregation — no extra loop needed
             $wasteRecordsFmt = [];
@@ -1459,6 +1563,7 @@ class ReportController extends Controller
             $result[] = [
                 'ingredient'           => $ing,
                 'outlet_id'            => $outletId,
+                'cost_per_unit'        => $hargaPerPakai,
                 'stok_awal_periode'    => round($stokAwalPeriode, 3),
                 'pembelian'            => round($pembelian, 3),
                 'pemakaian_teoritis'   => round($pemakaianTeo, 3),
@@ -1472,17 +1577,20 @@ class ReportController extends Controller
                 'transfer_out'         => round($transferOut, 3),
                 'adjustment'           => round($adjustment, 3),
                 'stok_akhir_teoritis'  => round($stokAkhirTeo, 3),
+                'nilai_teoritis'       => $nilaiTeoritis,
                 'stok_akhir_aktual'    => $actualQty,
+                'nilai_aktual'         => $nilaiAktual,
                 'pemakaian_aktual'     => $pemakaianAktual !== null ? round($pemakaianAktual, 3) : null,
-                'variance_gross_qty'   => $varianceGrossQty !== null ? round($varianceGrossQty, 3) : null,
+                'variance_gross_qty'   => $varianceGrossQty,
                 'variance_gross_value' => $varianceGrossValue,
-                'unaccounted_qty'      => $unaccountedQty !== null ? round($unaccountedQty, 3) : null,
+                'unaccounted_qty'      => $unaccountedQty,
                 'unaccounted_value'    => $unaccountedValue,
-                'variance_qty'         => $unaccountedQty !== null ? round($unaccountedQty, 3) : null,
-                'variance_pct'         => $variancePct !== null ? round($variancePct, 2) : null,
-                'variance_value'       => $unaccountedValue,
+                'variance_qty'         => $varianceStockQty !== null ? round($varianceStockQty, 3) : null,
+                'variance_pct'         => $varianceStockPct,
+                'variance_value'       => $varianceStockValue,
                 'status'               => $status,
                 'opname'               => $opname,
+                'menu_usages'          => array_values($ingredientMenuUsage[$ing->id] ?? []),
             ];
         }
         return $result;

@@ -316,6 +316,23 @@ class BatchPrepController extends Controller
             ];
         }
 
+        $semiFinishedIng = $recipe->ingredient;
+        $sfStock = $semiFinishedIng ? $semiFinishedIng->stockForOutlet($outletId) : 0.0;
+        $negativeItems = [];
+        if ($sfStock < -0.0001) {
+            $negativeItems[] = "Bahan Olahan '{$semiFinishedIng->name}' (Stok: " . round($sfStock, 3) . " {$semiFinishedIng->unit_pakai})";
+        }
+        foreach ($recipe->items as $item) {
+            $rawIng = $item->ingredient;
+            if ($rawIng) {
+                $rawStock = $rawIng->stockForOutlet($outletId);
+                if ($rawStock < -0.0001) {
+                    $negativeItems[] = "Bahan Mentah '{$rawIng->name}' (Stok: " . round($rawStock, 3) . " {$rawIng->unit_pakai})";
+                }
+            }
+        }
+        $hasNegativeStock = !empty($negativeItems);
+
         $expectedOutputQty = round((float)$recipe->output_qty * $multiplier, 3);
         $estimatedUnitCost = $expectedOutputQty > 0 ? round($totalEstimatedCost / $expectedOutputQty, 4) : 0;
 
@@ -337,6 +354,9 @@ class BatchPrepController extends Controller
             'output_unit'          => $recipe->output_unit,
             'items'                => $itemsPreview,
             'has_shortage'         => $hasShortage,
+            'has_negative_stock'   => $hasNegativeStock,
+            'negative_items'       => $negativeItems,
+            'output_stock'         => $sfStock,
             'total_estimated_cost' => round($totalEstimatedCost, 2),
             'estimated_unit_cost'  => $estimatedUnitCost,
         ]);
@@ -422,6 +442,28 @@ class BatchPrepController extends Controller
         $date = $data['date'];
         $expectedOutputQty = round((float)$recipe->output_qty * $multiplier, 3);
         $allowShortage = (bool)($data['allow_shortage'] ?? false);
+
+        // ⚠️ VALIDASI STOK MINUS: Jika stok bahan olahan atau bahan mentah minus, harus di-adjust terlebih dahulu!
+        $negativeItems = [];
+        $semiFinishedIng = $recipe->ingredient;
+        if ($semiFinishedIng && $semiFinishedIng->stockForOutlet($outletId) < -0.0001) {
+            $sfStock = $semiFinishedIng->stockForOutlet($outletId);
+            $negativeItems[] = "Bahan Olahan '{$semiFinishedIng->name}' (Stok: " . round($sfStock, 3) . " {$semiFinishedIng->unit_pakai})";
+        }
+        foreach ($recipe->items as $item) {
+            $rawIng = $item->ingredient;
+            if ($rawIng && $rawIng->stockForOutlet($outletId) < -0.0001) {
+                $rawStock = $rawIng->stockForOutlet($outletId);
+                $negativeItems[] = "Bahan Mentah '{$rawIng->name}' (Stok: " . round($rawStock, 3) . " {$rawIng->unit_pakai})";
+            }
+        }
+        if (!empty($negativeItems)) {
+            return response()->json([
+                'message' => "Terdapat bahan dengan stok MINUS: " . implode(', ', $negativeItems) . ". Anda harus melakukan Penyesuaian Stok (Adjust Stock / Opname) terlebih dahulu untuk menormalkan saldo minus sebelum melakukan masak produksi per batch.",
+                'error_code' => 'STOCK_NEGATIVE_ADJUSTMENT_REQUIRED',
+                'negative_items' => $negativeItems,
+            ], 422);
+        }
 
         return DB::transaction(function () use (
             $data, $recipe, $outletId, $multiplier, $actualOutputQty, $date, $expectedOutputQty, $allowShortage, $request

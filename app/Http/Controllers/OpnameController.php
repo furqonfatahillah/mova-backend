@@ -125,6 +125,14 @@ class OpnameController extends Controller
 
         $isClosed = ($isOwnerOrManager && (($data['action'] ?? '') === 'RELEASE' || !empty($data['is_closed'])));
 
+        // Precompute theoretical snapshot values
+        $reportCtrl = app(ReportController::class);
+        $varianceRows = $reportCtrl->buildVarianceArray($data['period_from'], $data['period_to'], (int)$outletId);
+        $var = collect($varianceRows)->firstWhere('ingredient.id', (int)$data['ingredient_id']);
+
+        $actualQty = isset($data['actual_qty']) && $data['actual_qty'] !== null ? (float)$data['actual_qty'] : null;
+        $hasActual = $actualQty !== null;
+
         $updateData = [
             ...$data,
             'opname_no'   => $opnameNo,
@@ -133,6 +141,38 @@ class OpnameController extends Controller
             'user_id'     => $user->id,
             'is_closed'   => $isClosed,
         ];
+
+        if ($var) {
+            $costPerUnit = (float)($var['cost_per_unit'] ?? 0);
+            $stokAkhirTeo = (float)($var['stok_akhir_teoritis'] ?? 0);
+            $varQty = $hasActual ? round($actualQty - $stokAkhirTeo, 4) : null;
+            $varVal = $hasActual ? round($varQty * $costPerUnit, 0) : null;
+            $denom = abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : ($hasActual && abs($actualQty) > 0.0001 ? abs($actualQty) : 1.0);
+            $varPct = $hasActual ? round(($varQty / $denom) * 100, 2) : null;
+            $status = null;
+            if ($hasActual) {
+                $status = abs($varQty) < 0.0001 ? 'NORMAL' : (abs($varPct) <= (float)($var['ingredient']->tolerance ?? 1) ? 'NORMAL' : (abs($varPct) <= 5 ? 'WASPADA' : 'TIDAK WAJAR'));
+            }
+
+            $updateData['stok_awal_periode']   = $var['stok_awal_periode'] ?? 0;
+            $updateData['pembelian']           = $var['pembelian'] ?? 0;
+            $updateData['pemakaian_teoritis']  = $var['pemakaian_teoritis'] ?? 0;
+            $updateData['prep_usage']          = $var['prep_usage'] ?? 0;
+            $updateData['prep_output']         = $var['prep_output'] ?? 0;
+            $updateData['waste_qty']           = $var['waste'] ?? 0;
+            $updateData['waste_value']         = $var['waste_value'] ?? 0;
+            $updateData['transfer_in']         = $var['transfer_in'] ?? 0;
+            $updateData['transfer_out']        = $var['transfer_out'] ?? 0;
+            $updateData['adjustment_qty']      = $var['adjustment'] ?? 0;
+            $updateData['stok_akhir_teoritis'] = $stokAkhirTeo;
+            $updateData['cost_per_unit']       = $costPerUnit;
+            $updateData['nilai_teoritis']      = round($stokAkhirTeo * $costPerUnit, 0);
+            $updateData['nilai_aktual']        = $hasActual ? round($actualQty * $costPerUnit, 0) : null;
+            $updateData['variance_qty']        = $varQty;
+            $updateData['variance_value']      = $varVal;
+            $updateData['variance_pct']        = $varPct;
+            $updateData['status']              = $status;
+        }
 
         if ($existing) {
             $updateData['updated_by'] = $user->id;
@@ -248,6 +288,11 @@ class OpnameController extends Controller
             $opnameNo = 'OPN-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
         }
 
+        // Precompute theoretical snapshot values
+        $reportCtrl = app(ReportController::class);
+        $varianceRows = $reportCtrl->buildVarianceArray($request->period_from, $request->period_to, (int)$outletId);
+        $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
+
         $results = [];
         foreach ($request->items as $item) {
             $existing = Opname::where('period_from', $request->period_from)
@@ -256,10 +301,13 @@ class OpnameController extends Controller
                 ->where('outlet_id', $outletId)
                 ->first();
 
+            $actualQty = isset($item['actual_qty']) && $item['actual_qty'] !== null ? (float)$item['actual_qty'] : null;
+            $hasActual = $actualQty !== null;
+
             $updateData = [
                 'opname_no'   => $opnameNo,
                 'opname_date' => $opnameDate,
-                'actual_qty'  => $item['actual_qty'] ?? null,
+                'actual_qty'  => $actualQty,
                 'reason'      => $item['reason'] ?? ($request->reason ?? null),
                 'approver'    => $item['approver'] ?? ($request->approver ?? null),
                 'notes'       => $item['notes'] ?? ($request->notes ?? null),
@@ -267,6 +315,39 @@ class OpnameController extends Controller
                 'user_id'     => $user->id,
                 'is_closed'   => $isClosed,
             ];
+
+            $var = $varByIng->get($item['ingredient_id']);
+            if ($var) {
+                $costPerUnit = (float)($var['cost_per_unit'] ?? 0);
+                $stokAkhirTeo = (float)($var['stok_akhir_teoritis'] ?? 0);
+                $varQty = $hasActual ? round($actualQty - $stokAkhirTeo, 4) : null;
+                $varVal = $hasActual ? round($varQty * $costPerUnit, 0) : null;
+                $denom = abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : ($hasActual && abs($actualQty) > 0.0001 ? abs($actualQty) : 1.0);
+                $varPct = $hasActual ? round(($varQty / $denom) * 100, 2) : null;
+                $status = null;
+                if ($hasActual) {
+                    $status = abs($varQty) < 0.0001 ? 'NORMAL' : (abs($varPct) <= (float)($var['ingredient']->tolerance ?? 1) ? 'NORMAL' : (abs($varPct) <= 5 ? 'WASPADA' : 'TIDAK WAJAR'));
+                }
+
+                $updateData['stok_awal_periode']   = $var['stok_awal_periode'] ?? 0;
+                $updateData['pembelian']           = $var['pembelian'] ?? 0;
+                $updateData['pemakaian_teoritis']  = $var['pemakaian_teoritis'] ?? 0;
+                $updateData['prep_usage']          = $var['prep_usage'] ?? 0;
+                $updateData['prep_output']         = $var['prep_output'] ?? 0;
+                $updateData['waste_qty']           = $var['waste'] ?? 0;
+                $updateData['waste_value']         = $var['waste_value'] ?? 0;
+                $updateData['transfer_in']         = $var['transfer_in'] ?? 0;
+                $updateData['transfer_out']        = $var['transfer_out'] ?? 0;
+                $updateData['adjustment_qty']      = $var['adjustment'] ?? 0;
+                $updateData['stok_akhir_teoritis'] = $stokAkhirTeo;
+                $updateData['cost_per_unit']       = $costPerUnit;
+                $updateData['nilai_teoritis']      = round($stokAkhirTeo * $costPerUnit, 0);
+                $updateData['nilai_aktual']        = $hasActual ? round($actualQty * $costPerUnit, 0) : null;
+                $updateData['variance_qty']        = $varQty;
+                $updateData['variance_value']      = $varVal;
+                $updateData['variance_pct']        = $varPct;
+                $updateData['status']              = $status;
+            }
 
             if ($existing) {
                 $updateData['updated_by'] = $user->id;
@@ -338,8 +419,77 @@ class OpnameController extends Controller
         }
 
         $approverName = $request->approver ?: ($user->name ?? 'Owner Bisnis');
+        $firstOpn = $opnames->first();
+
+        // Compute theoretical snapshot baseline only if existing snapshot is missing
+        $reportCtrl = app(ReportController::class);
+        $varByIng = null;
 
         foreach ($opnames as $opn) {
+            $hasExistingSnapshot = ($opn->stok_akhir_teoritis !== null);
+
+            if (!$hasExistingSnapshot) {
+                if ($varByIng === null) {
+                    $varianceRows = $reportCtrl->buildVarianceArray($firstOpn->period_from, $firstOpn->period_to, (int)$firstOpn->outlet_id);
+                    $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
+                }
+                $var = $varByIng->get($opn->ingredient_id);
+                if ($var) {
+                    $costPerUnit = (float)($var['cost_per_unit'] ?? 0);
+                    $stokAkhirTeo = (float)($var['stok_akhir_teoritis'] ?? 0);
+                    $actualQty = $opn->actual_qty !== null ? (float)$opn->actual_qty : null;
+                    $hasActual = $actualQty !== null;
+                    $varQty = $hasActual ? round($actualQty - $stokAkhirTeo, 4) : null;
+                    $varVal = $hasActual ? round($varQty * $costPerUnit, 0) : null;
+                    $denom = abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : ($hasActual && abs($actualQty) > 0.0001 ? abs($actualQty) : 1.0);
+                    $varPct = $hasActual ? round(($varQty / $denom) * 100, 2) : null;
+                    $status = null;
+                    if ($hasActual) {
+                        $status = abs($varQty) < 0.0001 ? 'NORMAL' : (abs($varPct) <= (float)($var['ingredient']->tolerance ?? 1) ? 'NORMAL' : (abs($varPct) <= 5 ? 'WASPADA' : 'TIDAK WAJAR'));
+                    }
+
+                    $opn->stok_awal_periode   = $var['stok_awal_periode'] ?? 0;
+                    $opn->pembelian           = $var['pembelian'] ?? 0;
+                    $opn->pemakaian_teoritis  = $var['pemakaian_teoritis'] ?? 0;
+                    $opn->prep_usage          = $var['prep_usage'] ?? 0;
+                    $opn->prep_output         = $var['prep_output'] ?? 0;
+                    $opn->waste_qty           = $var['waste'] ?? 0;
+                    $opn->waste_value         = $var['waste_value'] ?? 0;
+                    $opn->transfer_in         = $var['transfer_in'] ?? 0;
+                    $opn->transfer_out        = $var['transfer_out'] ?? 0;
+                    $opn->adjustment_qty      = $var['adjustment'] ?? 0;
+                    $opn->stok_akhir_teoritis = $stokAkhirTeo;
+                    $opn->cost_per_unit       = $costPerUnit;
+                    $opn->nilai_teoritis      = round($stokAkhirTeo * $costPerUnit, 0);
+                    $opn->nilai_aktual        = $hasActual ? round($actualQty * $costPerUnit, 0) : null;
+                    $opn->variance_qty        = $varQty;
+                    $opn->variance_value      = $varVal;
+                    $opn->variance_pct        = $varPct;
+                    $opn->status              = $status;
+                }
+            } else {
+                // 🔒 Preserve the exact pre-opname theoretical stock snapshot
+                $stokAkhirTeo = (float)$opn->stok_akhir_teoritis;
+                $costPerUnit  = (float)($opn->cost_per_unit ?: ($opn->ingredient?->harga / max(1, (float)($opn->ingredient?->konversi ?: 1))));
+                $actualQty    = $opn->actual_qty !== null ? (float)$opn->actual_qty : null;
+                $hasActual    = $actualQty !== null;
+                $varQty       = $hasActual ? round($actualQty - $stokAkhirTeo, 4) : null;
+                $varVal       = $hasActual ? round($varQty * $costPerUnit, 0) : null;
+                $denom        = abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : ($hasActual && abs($actualQty) > 0.0001 ? abs($actualQty) : 1.0);
+                $varPct       = $hasActual ? round(($varQty / $denom) * 100, 2) : null;
+                $status       = null;
+                if ($hasActual) {
+                    $status   = abs($varQty) < 0.0001 ? 'NORMAL' : (abs($varPct) <= (float)($opn->ingredient?->tolerance ?? 1) ? 'NORMAL' : (abs($varPct) <= 5 ? 'WASPADA' : 'TIDAK WAJAR'));
+                }
+
+                $opn->nilai_teoritis = round($stokAkhirTeo * $costPerUnit, 0);
+                $opn->nilai_aktual   = $hasActual ? round($actualQty * $costPerUnit, 0) : null;
+                $opn->variance_qty   = $varQty;
+                $opn->variance_value = $varVal;
+                $opn->variance_pct   = $varPct;
+                $opn->status         = $status;
+            }
+
             $opn->is_closed  = true;
             $opn->approver   = $approverName;
             if ($request->filled('notes')) {
@@ -349,7 +499,6 @@ class OpnameController extends Controller
             $opn->save();
         }
 
-        $firstOpn = $opnames->first();
         if ($firstOpn) {
             $this->syncOpnameStockMovements(
                 $opnameNo,
@@ -380,12 +529,8 @@ class OpnameController extends Controller
             ->where('note', 'like', "%{$opnameNo}%")
             ->delete();
 
-        // 2. Compute theoretical variance up to the opname period
-        $reportCtrl = app(ReportController::class);
-        $varianceRows = $reportCtrl->buildVarianceArray($periodFrom, $periodTo, $outletId);
-        $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
-
-        $opnames = Opname::where('opname_no', $opnameNo)
+        $opnames = Opname::with('ingredient')
+            ->where('opname_no', $opnameNo)
             ->where('outlet_id', $outletId)
             ->get();
 
@@ -394,11 +539,7 @@ class OpnameController extends Controller
         foreach ($opnames as $opn) {
             if ($opn->actual_qty === null) continue;
 
-            $var = $varByIng->get($opn->ingredient_id);
-            if (!$var) continue;
-
-            $ingredient = $var['ingredient'];
-            $stokTeoritis = (float)($var['stok_akhir_teoritis'] ?? 0);
+            $stokTeoritis = (float)($opn->stok_akhir_teoritis ?? 0);
             $actualQty    = (float)$opn->actual_qty;
             $diff         = round($actualQty - $stokTeoritis, 4);
 
@@ -406,8 +547,11 @@ class OpnameController extends Controller
                 continue; // Exact match, no adjustment needed
             }
 
-            $konversi = max((float)$ingredient->konversi, 1);
-            $hargaPerPakai = (float)$ingredient->harga / $konversi;
+            $ingredient = $opn->ingredient ?: Ingredient::find($opn->ingredient_id);
+            if (!$ingredient) continue;
+
+            $targetOid = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
+            $hargaPerPakai = (float) $ingredient->costPerPakaiForOutlet($targetOid);
 
             if ($diff > 0) {
                 // Surplus: ADJUSTMENT_IN (+)
@@ -473,49 +617,97 @@ class OpnameController extends Controller
             $from = $first->period_from;
             $to = $first->period_to;
 
-            $varianceRows = $reportCtrl->buildVarianceArray($from, $to, $outId);
-            $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
-
             $totalItems = $items->count();
             $itemsCounted = $items->filter(fn($i) => $i->actual_qty !== null)->count();
             $surplusCount = 0;
             $deficitCount = 0;
             $matchCount = 0;
             $netVarianceValue = 0;
+            $totalTheoreticalValue = 0;
+            $totalActualValue = 0;
+            $totalDeficitValue = 0;
+            $totalSurplusValue = 0;
 
-            foreach ($items as $it) {
-                $var = $varByIng->get($it->ingredient_id);
-                if ($var && $var['variance_value'] !== null) {
-                    $netVarianceValue += $var['variance_value'];
-                    if ($var['variance_qty'] > 0) {
-                        $surplusCount++;
-                    } elseif ($var['variance_qty'] < 0) {
-                        $deficitCount++;
-                    } else {
-                        $matchCount++;
+            if ($first->is_closed) {
+                // 🔒 LOCKED SNAPSHOT: Immutable frozen figures from database
+                foreach ($items as $it) {
+                    $teoVal = (float)($it->nilai_teoritis ?? round(((float)($it->stok_akhir_teoritis ?? 0)) * ((float)($it->cost_per_unit ?? 0)), 0));
+                    $totalTheoreticalValue += $teoVal;
+
+                    if ($it->actual_qty !== null) {
+                        $actVal = (float)($it->nilai_aktual ?? round(((float)$it->actual_qty) * ((float)($it->cost_per_unit ?? 0)), 0));
+                        $totalActualValue += $actVal;
+                    }
+
+                    if ($it->variance_value !== null) {
+                        $varVal = (float)$it->variance_value;
+                        $varQty = (float)$it->variance_qty;
+                        $netVarianceValue += $varVal;
+                        if ($varQty > 0.0001) {
+                            $surplusCount++;
+                            $totalSurplusValue += $varVal;
+                        } elseif ($varQty < -0.0001) {
+                            $deficitCount++;
+                            $totalDeficitValue += abs($varVal);
+                        } else {
+                            $matchCount++;
+                        }
+                    }
+                }
+            } else {
+                $varianceRows = $reportCtrl->buildVarianceArray($from, $to, $outId);
+                $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
+
+                foreach ($items as $it) {
+                    $var = $varByIng->get($it->ingredient_id);
+                    if ($var) {
+                        $teoVal = $var['nilai_teoritis'] ?? round(($var['stok_akhir_teoritis'] ?? 0) * ($var['cost_per_unit'] ?? 0), 0);
+                        $totalTheoreticalValue += $teoVal;
+
+                        if ($it->actual_qty !== null) {
+                            $actVal = $var['nilai_aktual'] ?? round(((float)$it->actual_qty) * ($var['cost_per_unit'] ?? 0), 0);
+                            $totalActualValue += $actVal;
+                        }
+
+                        if ($var['variance_value'] !== null) {
+                            $netVarianceValue += $var['variance_value'];
+                            if ($var['variance_qty'] > 0.0001) {
+                                $surplusCount++;
+                                $totalSurplusValue += $var['variance_value'];
+                            } elseif ($var['variance_qty'] < -0.0001) {
+                                $deficitCount++;
+                                $totalDeficitValue += abs($var['variance_value']);
+                            } else {
+                                $matchCount++;
+                            }
+                        }
                     }
                 }
             }
 
             $sessions[] = [
-                'opname_no'          => $opnameNo,
-                'opname_date'        => $first->opname_date ?: $first->period_to,
-                'period_from'        => $from,
-                'period_to'          => $to,
-                'outlet_id'          => $outId,
-                'outlet_name'        => $first->outlet?->name ?? "Outlet #{$outId}",
-                'created_by_name'    => $first->creator?->name ?? ($first->user?->name ?? 'Staff Gudang'),
-                'approver'           => $first->approver,
-                'notes'              => $first->notes,
-                'total_items'        => $totalItems,
-                'items_counted'      => $itemsCounted,
-                'surplus_count'      => $surplusCount,
-                'deficit_count'      => $deficitCount,
-                'match_count'        => $matchCount,
-                'net_variance_value' => round($netVarianceValue, 0),
-                'is_closed'          => (bool) $first->is_closed,
-                'status'             => $first->is_closed ? 'RELEASED' : 'DRAFT',
-                'created_at'         => $first->created_at?->format('Y-m-d H:i:s'),
+                'opname_no'               => $opnameNo,
+                'opname_date'             => $first->opname_date ?: $first->period_to,
+                'period_from'             => $from,
+                'period_to'               => $to,
+                'outlet_id'               => $outId,
+                'outlet_name'             => $first->outlet?->name ?? "Outlet #{$outId}",
+                'created_by_name'         => $first->creator?->name ?? ($first->user?->name ?? 'Staff Gudang'),
+                'approver'                => $first->approver,
+                'notes'                   => $first->notes,
+                'total_items'             => $totalItems,
+                'items_counted'           => $itemsCounted,
+                'surplus_count'           => $surplusCount,
+                'deficit_count'           => $deficitCount,
+                'match_count'             => $matchCount,
+                'total_theoretical_value' => round($totalTheoreticalValue, 0),
+                'total_actual_value'      => round($totalActualValue, 0),
+                'total_surplus_value'     => round($totalSurplusValue, 0),
+                'total_deficit_value'     => round($totalDeficitValue, 0),
+                'net_variance_value'      => round($netVarianceValue, 0),
+                'is_closed'               => (bool) $first->is_closed,
+                'status'                  => $first->is_closed ? 'RELEASED' : 'DRAFT',
+                'created_at'              => $first->created_at?->format('Y-m-d H:i:s'),
             ];
         }
 
@@ -548,62 +740,153 @@ class OpnameController extends Controller
         $from = $first->period_from;
         $to = $first->period_to;
 
-        $reportCtrl = app(ReportController::class);
-        $varianceRows = $reportCtrl->buildVarianceArray($from, $to, $outId);
-
-        $opnamesByIng = $opnames->keyBy('ingredient_id');
-
         $detailedItems = [];
         $totalSurplusValue = 0;
         $totalDeficitValue = 0;
         $totalWasteValue = 0;
         $totalVarianceValue = 0;
+        $totalTheoreticalValue = 0;
+        $totalActualValue = 0;
         $statusCounts = ['NORMAL' => 0, 'WASPADA' => 0, 'TIDAK WAJAR' => 0];
 
-        foreach ($varianceRows as $vr) {
-            $ingId = $vr['ingredient']->id;
-            $opnRecord = $opnamesByIng->get($ingId);
+        if ($first->is_closed) {
+            // 🔒 LOCKED SNAPSHOT: Read directly from frozen opname records
+            foreach ($opnames as $opn) {
+                $ing = $opn->ingredient;
+                $costPerUnit = (float) ($opn->cost_per_unit ?? ($ing ? $ing->harga / max(1, (float)$ing->konversi) : 0));
+                $stokTeo = (float) ($opn->stok_akhir_teoritis ?? 0);
+                $teoVal = (float) ($opn->nilai_teoritis ?? round($stokTeo * $costPerUnit, 0));
+                $totalTheoreticalValue += $teoVal;
 
-            $varVal = $vr['variance_value'] ?? 0;
-            $totalVarianceValue += $varVal;
-            if ($varVal > 0) $totalSurplusValue += $varVal;
-            if ($varVal < 0) $totalDeficitValue += abs($varVal);
-            if (isset($vr['waste_value'])) $totalWasteValue += $vr['waste_value'];
-            if ($vr['status'] && isset($statusCounts[$vr['status']])) {
-                $statusCounts[$vr['status']]++;
+                $actQty = $opn->actual_qty !== null ? (float)$opn->actual_qty : null;
+                $actVal = null;
+                if ($actQty !== null) {
+                    $actVal = $opn->nilai_aktual !== null ? (float)$opn->nilai_aktual : round($actQty * $costPerUnit, 0);
+                    $totalActualValue += $actVal;
+                }
+
+                $varQty = $opn->variance_qty !== null ? (float)$opn->variance_qty : ($actQty !== null ? round($actQty - $stokTeo, 4) : null);
+                $varVal = $opn->variance_value !== null ? (float)$opn->variance_value : ($varQty !== null ? round($varQty * $costPerUnit, 0) : null);
+
+                if ($varVal !== null) {
+                    $totalVarianceValue += $varVal;
+                    if ($varVal > 0) $totalSurplusValue += $varVal;
+                    if ($varVal < 0) $totalDeficitValue += abs($varVal);
+                }
+
+                $wasteVal = (float) ($opn->waste_value ?? 0);
+                $totalWasteValue += $wasteVal;
+
+                $status = $opn->status ?? ($actQty !== null ? (abs($varQty ?? 0) < 0.0001 ? 'NORMAL' : 'NORMAL') : null);
+                if ($status && isset($statusCounts[$status])) {
+                    $statusCounts[$status]++;
+                }
+
+                $detailedItems[] = [
+                    'ingredient_id'        => $opn->ingredient_id,
+                    'code'                 => $ing?->code ?? '-',
+                    'name'                 => $ing?->name ?? "Bahan #{$opn->ingredient_id}",
+                    'category'             => $ing?->category ?? 'Umum',
+                    'unit_pakai'           => $ing?->unit_pakai ?? 'satuan',
+                    'unit_beli'            => $ing?->unit_beli ?? 'satuan',
+                    'konversi'             => $ing?->konversi ?? 1,
+                    'cost_per_unit'        => $costPerUnit,
+                    'harga'                => $ing?->harga ?? 0,
+                    'stok_awal_periode'    => (float) ($opn->stok_awal_periode ?? 0),
+                    'pembelian'            => (float) ($opn->pembelian ?? 0),
+                    'pemakaian_teoritis'   => (float) ($opn->pemakaian_teoritis ?? 0),
+                    'prep_usage'           => (float) ($opn->prep_usage ?? 0),
+                    'prep_output'          => (float) ($opn->prep_output ?? 0),
+                    'waste'                => (float) ($opn->waste_qty ?? 0),
+                    'waste_value'          => $wasteVal,
+                    'transfer_in'          => (float) ($opn->transfer_in ?? 0),
+                    'transfer_out'         => (float) ($opn->transfer_out ?? 0),
+                    'stok_akhir_teoritis'  => $stokTeo,
+                    'nilai_teoritis'       => $teoVal,
+                    'stok_akhir_aktual'    => $actQty,
+                    'nilai_aktual'         => $actVal,
+                    'variance_qty'         => $varQty,
+                    'variance_pct'         => $opn->variance_pct !== null ? (float)$opn->variance_pct : null,
+                    'variance_value'       => $varVal,
+                    'status'               => $status,
+                    'reason'               => $opn->reason ?: $opn->notes,
+                    'approver'             => $opn->approver,
+                    'audit'                => [
+                        'created_at'      => $opn->created_at?->format('Y-m-d H:i:s'),
+                        'created_by_name' => $opn->creator?->name ?? ($opn->user?->name ?? 'Staff'),
+                        'updated_at'      => $opn->updated_at?->format('Y-m-d H:i:s'),
+                        'updated_by_name' => $opn->updater?->name ?? ($opn->user?->name ?? 'Staff'),
+                    ],
+                ];
             }
+        } else {
+            $reportCtrl = app(ReportController::class);
+            $varianceRows = $reportCtrl->buildVarianceArray($from, $to, $outId);
+            $opnamesByIng = $opnames->keyBy('ingredient_id');
 
-            $detailedItems[] = [
-                'ingredient_id'        => $ingId,
-                'code'                 => $vr['ingredient']->code,
-                'name'                 => $vr['ingredient']->name,
-                'category'             => $vr['ingredient']->category,
-                'unit_pakai'           => $vr['ingredient']->unit_pakai,
-                'unit_beli'            => $vr['ingredient']->unit_beli,
-                'konversi'             => $vr['ingredient']->konversi,
-                'harga'                => $vr['ingredient']->harga,
-                'stok_awal_periode'    => $vr['stok_awal_periode'],
-                'pembelian'            => $vr['pembelian'],
-                'pemakaian_teoritis'   => $vr['pemakaian_teoritis'],
-                'waste'                => $vr['waste'],
-                'waste_value'          => $vr['waste_value'] ?? 0,
-                'transfer_in'          => $vr['transfer_in'],
-                'transfer_out'         => $vr['transfer_out'],
-                'stok_akhir_teoritis'  => $vr['stok_akhir_teoritis'],
-                'stok_akhir_aktual'    => $vr['stok_akhir_aktual'],
-                'variance_qty'         => $vr['variance_qty'],
-                'variance_pct'         => $vr['variance_pct'],
-                'variance_value'       => $vr['variance_value'],
-                'status'               => $vr['status'],
-                'reason'               => $opnRecord?->reason ?: $opnRecord?->notes,
-                'approver'             => $opnRecord?->approver,
-                'audit'                => [
-                    'created_at'      => $opnRecord?->created_at?->format('Y-m-d H:i:s'),
-                    'created_by_name' => $opnRecord?->created_by_name ?? ($opnRecord?->user?->name ?? 'Staff'),
-                    'updated_at'      => $opnRecord?->changed_at,
-                    'updated_by_name' => $opnRecord?->changed_by_name,
-                ],
-            ];
+            foreach ($varianceRows as $vr) {
+                $ingId = $vr['ingredient']->id;
+                $opnRecord = $opnamesByIng->get($ingId);
+
+                $varVal = $vr['variance_value'] ?? 0;
+                $costPerUnit = $vr['cost_per_unit'] ?? ($vr['ingredient']->harga / max(1, (float)$vr['ingredient']->konversi));
+                $teoVal = $vr['nilai_teoritis'] ?? round(($vr['stok_akhir_teoritis'] ?? 0) * $costPerUnit, 0);
+                $totalTheoreticalValue += $teoVal;
+
+                $actQty = $vr['stok_akhir_aktual'];
+                $actVal = null;
+                if ($actQty !== null) {
+                    $actVal = $vr['nilai_aktual'] ?? round($actQty * $costPerUnit, 0);
+                    $totalActualValue += $actVal;
+                }
+
+                if ($vr['variance_value'] !== null) {
+                    $totalVarianceValue += $varVal;
+                    if ($varVal > 0) $totalSurplusValue += $varVal;
+                    if ($varVal < 0) $totalDeficitValue += abs($varVal);
+                }
+                if (isset($vr['waste_value'])) $totalWasteValue += $vr['waste_value'];
+                if ($vr['status'] && isset($statusCounts[$vr['status']])) {
+                    $statusCounts[$vr['status']]++;
+                }
+
+                $detailedItems[] = [
+                    'ingredient_id'        => $ingId,
+                    'code'                 => $vr['ingredient']->code,
+                    'name'                 => $vr['ingredient']->name,
+                    'category'             => $vr['ingredient']->category,
+                    'unit_pakai'           => $vr['ingredient']->unit_pakai,
+                    'unit_beli'            => $vr['ingredient']->unit_beli,
+                    'konversi'             => $vr['ingredient']->konversi,
+                    'cost_per_unit'        => $costPerUnit,
+                    'harga'                => $vr['ingredient']->harga,
+                    'stok_awal_periode'    => $vr['stok_awal_periode'],
+                    'pembelian'            => $vr['pembelian'],
+                    'pemakaian_teoritis'   => $vr['pemakaian_teoritis'],
+                    'prep_usage'           => $vr['prep_usage'] ?? 0,
+                    'prep_output'          => $vr['prep_output'] ?? 0,
+                    'waste'                => $vr['waste'],
+                    'waste_value'          => $vr['waste_value'] ?? 0,
+                    'transfer_in'          => $vr['transfer_in'],
+                    'transfer_out'         => $vr['transfer_out'],
+                    'stok_akhir_teoritis'  => $vr['stok_akhir_teoritis'],
+                    'nilai_teoritis'       => $teoVal,
+                    'stok_akhir_aktual'    => $actQty,
+                    'nilai_aktual'         => $actVal,
+                    'variance_qty'         => $vr['variance_qty'],
+                    'variance_pct'         => $vr['variance_pct'],
+                    'variance_value'       => $vr['variance_value'],
+                    'status'               => $vr['status'],
+                    'reason'               => $opnRecord?->reason ?: $opnRecord?->notes,
+                    'approver'             => $opnRecord?->approver,
+                    'audit'                => [
+                        'created_at'      => $opnRecord?->created_at?->format('Y-m-d H:i:s'),
+                        'created_by_name' => $opnRecord?->created_by_name ?? ($opnRecord?->user?->name ?? 'Staff'),
+                        'updated_at'      => $opnRecord?->changed_at,
+                        'updated_by_name' => $opnRecord?->changed_by_name,
+                    ],
+                ];
+            }
         }
 
         return response()->json([
@@ -622,13 +905,15 @@ class OpnameController extends Controller
                 'created_at'      => $first->created_at?->format('Y-m-d H:i:s'),
             ],
             'summary' => [
-                'total_items'          => count($detailedItems),
-                'items_counted'        => collect($detailedItems)->filter(fn($i) => $i['stok_akhir_aktual'] !== null)->count(),
-                'total_variance_value' => round($totalVarianceValue, 0),
-                'total_surplus_value'  => round($totalSurplusValue, 0),
-                'total_deficit_value'  => round($totalDeficitValue, 0),
-                'total_waste_value'    => round($totalWasteValue, 0),
-                'status_counts'        => $statusCounts,
+                'total_items'             => count($detailedItems),
+                'items_counted'           => collect($detailedItems)->filter(fn($i) => $i['stok_akhir_aktual'] !== null)->count(),
+                'total_theoretical_value' => round($totalTheoreticalValue, 0),
+                'total_actual_value'      => round($totalActualValue, 0),
+                'total_variance_value'    => round($totalVarianceValue, 0),
+                'total_surplus_value'     => round($totalSurplusValue, 0),
+                'total_deficit_value'     => round($totalDeficitValue, 0),
+                'total_waste_value'       => round($totalWasteValue, 0),
+                'status_counts'           => $statusCounts,
             ],
             'items' => $detailedItems,
         ]);

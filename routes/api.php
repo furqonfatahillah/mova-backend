@@ -33,6 +33,7 @@ use App\Http\Controllers\PaymentConfigurationController;
 use App\Http\Controllers\PayableController;
 use App\Http\Controllers\BalanceSheetController;
 use App\Http\Controllers\PurchaseReportController;
+use App\Http\Controllers\DataResetController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -83,6 +84,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::apiResource('shift-schedules',         ShiftScheduleController::class);
     Route::get('/shifts',                        [ShiftController::class, 'index']);
     Route::get('/shifts/active',                 [ShiftController::class, 'active']);
+    Route::get('/shifts/last-closed',            [ShiftController::class, 'lastClosed']);
     Route::post('/shifts/open',                  [ShiftController::class, 'open']);
     Route::get('/shifts/{shift}/summary',        [ShiftController::class, 'summary']);
     Route::post('/shifts/{shift}/close',         [ShiftController::class, 'close']);
@@ -148,19 +150,30 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/transactions/open-bills/{orderNumber}/split-evenly',   [TransactionController::class, 'paySplitEvenly']);
     Route::post('/transactions/{orderNumber}/pay',                        [TransactionController::class, 'payOpenBill']);
     Route::post('/transactions/{orderNumber}/add-items',                 [TransactionController::class, 'addItemsToOpenBill']);
-    Route::post('/transactions/{orderNumber}/cancel',                    [TransactionController::class, 'cancelOpenBill']);
+    Route::get('/transactions/supervisors',                              [TransactionController::class, 'getSupervisors']);
+    Route::post('/transactions/{orderNumber}/void',                      [TransactionController::class, 'voidTransaction']);
+    Route::post('/transactions/void',                                    [TransactionController::class, 'voidTransaction']);
+    Route::get('/transactions/void-requests',                           [TransactionController::class, 'voidRequests']);
+    Route::post('/transactions/{orderNumber}/void-approve',              [TransactionController::class, 'approveVoidTransaction']);
+    Route::post('/transactions/{orderNumber}/void-reject',               [TransactionController::class, 'rejectVoidTransaction']);
     Route::post('/transactions/{orderNumber}/split-by-item',             [TransactionController::class, 'paySplitByItem']);
     Route::post('/transactions/{orderNumber}/split-evenly',              [TransactionController::class, 'paySplitEvenly']);
     Route::get('/transactions',                                          [TransactionController::class, 'index']);
     Route::post('/transactions',                                         [TransactionController::class, 'store']);
     Route::delete('/transactions/{transaction}',                    [TransactionController::class, 'destroy']);
 
-    // Nota Urgent & Bahan Tergantung (Pending Stock Shortfall Management)
-    Route::get('/urgent-notes/summary',                 [UrgentNoteController::class, 'summary']);
-    Route::get('/urgent-notes',                         [UrgentNoteController::class, 'index']);
-    Route::post('/urgent-notes/{urgentNote}/resolve',   [UrgentNoteController::class, 'resolve']);
-    Route::post('/urgent-notes/{urgentNote}/cancel',    [UrgentNoteController::class, 'cancel']);
-    Route::post('/urgent-notes/batch-resolve',          [UrgentNoteController::class, 'batchResolve']);
+    // Nota Urgent & Bahan Tergantung (Pending Stock Shortfall Management & Approval Workflow)
+    Route::get('/urgent-notes/summary',                          [UrgentNoteController::class, 'summary']);
+    Route::get('/urgent-notes',                                  [UrgentNoteController::class, 'index']);
+    Route::post('/urgent-notes/{urgentNote}/request-resolution', [UrgentNoteController::class, 'requestResolution']);
+    Route::post('/urgent-notes/batch-request-resolution',        [UrgentNoteController::class, 'batchRequestResolution']);
+    Route::post('/urgent-notes/{urgentNote}/approve-resolution', [UrgentNoteController::class, 'approveResolution']);
+    Route::post('/urgent-notes/batch-approve-resolution',        [UrgentNoteController::class, 'batchApproveResolution']);
+    Route::post('/urgent-notes/{urgentNote}/reject-resolution',  [UrgentNoteController::class, 'rejectResolution']);
+    Route::post('/urgent-notes/batch-reject-resolution',         [UrgentNoteController::class, 'batchRejectResolution']);
+    Route::post('/urgent-notes/{urgentNote}/resolve',            [UrgentNoteController::class, 'resolve']);
+    Route::post('/urgent-notes/{urgentNote}/cancel',             [UrgentNoteController::class, 'cancel']);
+    Route::post('/urgent-notes/batch-resolve',                   [UrgentNoteController::class, 'batchResolve']);
 
     // Stock & Kartu Stok
     Route::get('/movements',          [MovementController::class, 'index']);
@@ -198,6 +211,9 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     // Kasbon Customer & AR Merchant (Accounts Receivable & Pembayaran Kasbon)
     Route::get('/receivables/customers',                                [ReceivableController::class, 'byCustomer']);
     Route::get('/receivables/merchants',                                [ReceivableController::class, 'byMerchant']);
+    Route::get('/receivables/ecommerce-grouped',                        [ReceivableController::class, 'ecommerceGrouped']);
+    Route::post('/receivables/shift-net-amount',                         [ReceivableController::class, 'updateShiftNetAmount']);
+    Route::post('/receivables/{id}/net-amount',                         [ReceivableController::class, 'updateNetAmount']);
     Route::post('/receivables/merchants/bulk-settle',                   [ReceivableController::class, 'bulkSettleMerchant']);
     Route::post('/receivables/{id}/settle',                             [ReceivableController::class, 'settleMerchant']);
     Route::post('/receivables/bulk-payment',                            [ReceivableController::class, 'bulkPayment']);
@@ -258,4 +274,8 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/payment-gateways/test-connection',[PaymentConfigurationController::class, 'testGatewayConnection']);
     Route::post('/payment-gateways/midtrans/charge-qris',   [PaymentConfigurationController::class, 'chargeMidtransQris']);
     Route::get('/payment-gateways/midtrans/status/{orderId}',[PaymentConfigurationController::class, 'checkMidtransStatus']);
+
+    // Reset Data Testing (Temporary Dev Utility)
+    Route::get('/system/reset-preview', [DataResetController::class, 'preview']);
+    Route::post('/system/reset-data',   [DataResetController::class, 'resetData']);
 });

@@ -11,6 +11,7 @@ use App\Models\Unit;
 use App\Models\Payable;
 use App\Models\PayablePayment;
 use App\Models\Supplier;
+use App\Models\UrgentNote;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -38,6 +39,66 @@ class MovementController extends Controller
 
         if ($request->from)          $query->where('date', '>=', $request->from);
         if ($request->to)            $query->where('date', '<=', $request->to);
+
+        // Shift filtering
+        if ($request->filled('shift_id') && strtoupper($request->shift_id) !== 'ALL') {
+            $shiftInput = $request->shift_id;
+            if (is_array($shiftInput)) {
+                $shiftIds = array_values(array_filter(array_map('intval', $shiftInput)));
+                if (count($shiftIds) > 0) {
+                    $query->whereIn('shift_id', $shiftIds);
+                }
+            } else {
+                $shiftIds = array_values(array_filter(array_map('intval', explode(',', $shiftInput))));
+                if (count($shiftIds) > 0) {
+                    $query->whereIn('shift_id', $shiftIds);
+                }
+            }
+        }
+
+        if ($request->filled('payment_type') && strtoupper($request->payment_type) !== 'ALL') {
+            $rawPt = $request->payment_type;
+            $ptList = is_array($rawPt) ? $rawPt : explode(',', $rawPt);
+            $ptList = array_map(fn($v) => strtoupper(trim($v)), array_filter($ptList));
+
+            if (count($ptList) > 0 && !in_array('ALL', $ptList)) {
+                $query->where(function($q) use ($ptList) {
+                    foreach ($ptList as $idx => $pt) {
+                        $clause = function($subQ) use ($pt) {
+                            if ($pt === 'CASH_ALL' || $pt === 'CASH_AND_PETTY' || $pt === 'CASH' || $pt === 'TUNAI' || $pt === 'PETTY_CASH') {
+                                $subQ->where(function($inner) {
+                                    $inner->whereIn('payment_type', ['CASH', 'TUNAI', 'PETTY_CASH'])
+                                          ->orWhereNull('payment_type')
+                                          ->orWhere('payment_type', 'like', '%TUNAI%')
+                                          ->orWhere('payment_type', 'like', '%CASH%')
+                                          ->orWhere('payment_type', 'like', '%PETTY%');
+                                });
+                            } elseif ($pt === 'NON_CASH' || $pt === 'ALL_NON_CASH') {
+                                $subQ->where(function($inner) {
+                                    $inner->where('payment_type', 'like', '%TRANSFER%')
+                                          ->orWhere('payment_type', 'like', '%QRIS%')
+                                          ->orWhere('payment_type', 'like', '%DEBIT%');
+                                });
+                            } elseif ($pt === 'TRANSFER') {
+                                $subQ->where('payment_type', 'like', '%TRANSFER%');
+                            } elseif ($pt === 'PETTY_CASH') {
+                                $subQ->where('payment_type', 'PETTY_CASH');
+                            } elseif ($pt === 'QRIS') {
+                                $subQ->where('payment_type', 'like', '%QRIS%');
+                            } else {
+                                $subQ->where('payment_type', $pt);
+                            }
+                        };
+
+                        if ($idx === 0) {
+                            $q->where($clause);
+                        } else {
+                            $q->orWhere($clause);
+                        }
+                    }
+                });
+            }
+        }
 
         return response()->json($query->limit(300)->get());
     }
@@ -100,6 +161,18 @@ class MovementController extends Controller
         $payableId = null;
 
         if ($data['type'] === 'PURCHASE') {
+            $currentStock = $ingredient->stockForOutlet($outletId);
+            if ($currentStock < -0.0001) {
+                return response()->json([
+                    'message' => "Stok bahan baku '{$ingredient->name}' di cabang ini saat ini berstatus MINUS (" . round($currentStock, 3) . " {$ingredient->unit_pakai}). Anda harus melakukan Penyesuaian Stok (Adjust Stock / Opname) terlebih dahulu untuk menormalkan saldo minus sebelum mencatat transaksi pembelian baru.",
+                    'error_code' => 'STOCK_NEGATIVE_ADJUSTMENT_REQUIRED',
+                    'ingredient_id' => $ingredient->id,
+                    'ingredient_name' => $ingredient->name,
+                    'current_stock' => $currentStock,
+                    'unit' => $ingredient->unit_pakai,
+                ], 422);
+            }
+
             // Determine price per unit pakai and per unit beli
             if ($request->filled('unit_price') && (float)$request->unit_price > 0) {
                 $inputPrice = (float)$request->unit_price;
@@ -258,6 +331,26 @@ class MovementController extends Controller
             // Holding: Hutang, Kas, dan Bank
             $isHutang = in_array($rawPaymentType, ['HUTANG', 'TEMPO']);
             $paymentType = $isHutang ? 'HUTANG' : (in_array($rawPaymentType, ['BANK', 'TRANSFER', 'QRIS']) ? $rawPaymentType : 'CASH');
+        }
+
+        if ($validated['type'] === 'PURCHASE') {
+            $negativeItems = [];
+            foreach ($validated['items'] as $item) {
+                $ing = Ingredient::find($item['ingredient_id']);
+                if ($ing) {
+                    $cStock = $ing->stockForOutlet($outletId);
+                    if ($cStock < -0.0001) {
+                        $negativeItems[] = "{$ing->name} (Stok: " . round($cStock, 3) . " {$ing->unit_pakai})";
+                    }
+                }
+            }
+            if (!empty($negativeItems)) {
+                return response()->json([
+                    'message' => "Terdapat bahan baku dengan stok MINUS: " . implode(', ', $negativeItems) . ". Anda harus melakukan Penyesuaian Stok (Adjust Stock / Opname) terlebih dahulu kepada bahan tersebut sebelum mencatat transaksi pembelian baru.",
+                    'error_code' => 'STOCK_NEGATIVE_ADJUSTMENT_REQUIRED',
+                    'negative_items' => $negativeItems,
+                ], 422);
+            }
         }
 
         $result = DB::transaction(function () use ($validated, $user, $outletId, $businessId, $isHutang, $paymentType) {
@@ -469,7 +562,7 @@ class MovementController extends Controller
             ->whereBetween('date', [$from, $to])
             ->selectRaw("
                 ingredient_id,
-                SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','PREP_OUTPUT') THEN qty ELSE 0 END) as total_masuk,
+                SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE 0 END) as total_masuk,
                 SUM(CASE WHEN type IN ('SALE_USAGE','WASTE','TRANSFER_OUT','ADJUSTMENT_OUT','PREP_USAGE') THEN qty ELSE 0 END) as total_keluar,
                 SUM(CASE WHEN type = 'SALE_USAGE' THEN qty ELSE 0 END) as total_penjualan,
                 SUM(CASE WHEN type = 'WASTE' THEN qty ELSE 0 END) as total_waste,
@@ -479,19 +572,50 @@ class MovementController extends Controller
             ->get()
             ->keyBy('ingredient_id');
 
+        // Check which ingredients have INITIAL StockMovement record
+        $initialMovIngIds = StockMovement::whereIn('ingredient_id', $ingIds)
+            ->where('outlet_id', $outletId)
+            ->where('type', 'INITIAL')
+            ->pluck('ingredient_id')
+            ->unique()
+            ->all();
+
+        // Fetch urgent note summaries for this outlet to detect pending and resolved stock deficits
+        $urgentQuery = UrgentNote::where('business_id', $outlet->business_id ?: 1);
+        if ($outletId) {
+            $urgentQuery->where('outlet_id', $outletId);
+        }
+        $allUrgentNotes = $urgentQuery->get();
+        $urgentIngIds = $allUrgentNotes->whereNotNull('ingredient_id')->pluck('ingredient_id')->unique()->all();
+        $pendingUrgentMap = $allUrgentNotes->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+            ->groupBy('ingredient_id')
+            ->map(fn($group) => $group->sum('pending_qty'))
+            ->all();
+        $resolvedUrgentMap = $allUrgentNotes->where('status', 'RESOLVED')
+            ->groupBy('ingredient_id')
+            ->map(fn($group) => $group->sum('pending_qty'))
+            ->all();
+
         $items = [];
-        $grandTotalNilai = 0;
+        $grandTotalSafeValuation = 0.0;
+        $grandTotalDeficitValuation = 0.0;
+        $totalSafeStock = 0;
+        $totalNegativeStock = 0;
+        $totalEmptyStock = 0;
         $totalLowStock = 0;
 
         $isHoldingOutlet = (bool)$outlet->is_main || ((int)$outletId === 1);
 
         foreach ($ingredients as $ing) {
             $outletRow = $ing->outletIngredients->first();
+            $hasInitialMov = in_array($ing->id, $initialMovIngIds);
             $stokAwalMaster = 0.0;
-            if ($outletRow && (float)$outletRow->stok_awal > 0) {
-                $stokAwalMaster = (float)$outletRow->stok_awal;
-            } elseif ($isHoldingOutlet) {
-                $stokAwalMaster = (float)$ing->stok_awal;
+            if (!$hasInitialMov) {
+                if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                    $stokAwalMaster = (float)$outletRow->stok_awal;
+                } elseif ($isHoldingOutlet) {
+                    $stokAwalMaster = (float)$ing->stok_awal;
+                }
             }
             $stokMinOutlet  = $outletRow && $outletRow->stok_min !== null ? (float) $outletRow->stok_min : (float) $ing->stok_min;
 
@@ -508,34 +632,60 @@ class MovementController extends Controller
             $stokAkhir = round($stokAwalPeriod + $totalMasuk - $totalKeluar, 3);
             $hargaBeliOutlet = $ing->hargaForOutlet($outletId);
             $hargaPerPakai = $hargaBeliOutlet / max($ing->konversi, 1);
-            $nilaiStok = round(max($stokAkhir, 0) * $hargaPerPakai, 2);
+            $nilaiStok = round($stokAkhir * $hargaPerPakai, 2);
 
-            $isLow = $stokAkhir <= $stokMinOutlet;
-            if ($isLow) $totalLowStock++;
-            $grandTotalNilai += $nilaiStok;
+            $saldoAmanRp = $stokAkhir > 0 ? $nilaiStok : 0.0;
+            $saldoMinusRp = $stokAkhir < 0 ? $nilaiStok : 0.0; // Negative Rupiah value
+
+            $isNegative = $stokAkhir < 0;
+            $isSafe = $stokAkhir > 0;
+            $isEmpty = ($stokAkhir == 0);
+            $isLow = ($stokAkhir <= $stokMinOutlet && $stokAkhir >= 0);
+
+            if ($isNegative) {
+                $totalNegativeStock++;
+                $grandTotalDeficitValuation += $saldoMinusRp; // negative accumulation
+            } elseif ($isSafe) {
+                $totalSafeStock++;
+                $grandTotalSafeValuation += $saldoAmanRp;
+            } else {
+                $totalEmptyStock++;
+            }
+
+            if ($isLow) {
+                $totalLowStock++;
+            }
 
             $items[] = [
-                'id'              => $ing->id,
-                'code'            => $ing->code,
-                'name'            => $ing->name,
-                'category'        => $ing->category,
-                'type'            => $ing->type ?? 'RAW',
-                'unit_pakai'      => $ing->unit_pakai,
-                'unit_beli'       => $ing->unit_beli,
-                'konversi'        => $ing->konversi,
-                'harga_beli'      => (float)$hargaBeliOutlet,
-                'harga_satuan'    => round($hargaPerPakai, 2),
-                'stok_min'        => $stokMinOutlet,
-                'stok_awal'       => $stokAwalPeriod,
-                'total_masuk'     => $totalMasuk,
-                'total_keluar'    => $totalKeluar,
-                'total_penjualan' => $totalPenjualan,
-                'total_waste'     => $totalWaste,
-                'total_pembelian' => $totalPembelian,
-                'stok_akhir'      => $stokAkhir,
-                'is_low'          => $isLow,
-                'is_empty'        => $stokAkhir <= 0,
-                'nilai_stok'      => $nilaiStok,
+                'id'                     => $ing->id,
+                'code'                   => $ing->code,
+                'name'                   => $ing->name,
+                'category'               => $ing->category,
+                'type'                   => $ing->type ?? 'RAW',
+                'unit_pakai'             => $ing->unit_pakai,
+                'unit_beli'              => $ing->unit_beli,
+                'konversi'               => $ing->konversi,
+                'harga_beli'             => (float)$hargaBeliOutlet,
+                'harga_satuan'           => round($hargaPerPakai, 2),
+                'stok_min'               => $stokMinOutlet,
+                'stok_awal'              => $stokAwalPeriod,
+                'total_masuk'            => $totalMasuk,
+                'total_keluar'           => $totalKeluar,
+                'total_penjualan'        => $totalPenjualan,
+                'total_waste'            => $totalWaste,
+                'total_pembelian'        => $totalPembelian,
+                'stok_akhir'             => $stokAkhir,
+                'is_low'                 => $isLow,
+                'is_empty'               => $isEmpty,
+                'is_negative'            => $isNegative,
+                'is_safe'                => $isSafe,
+                'nilai_stok'             => $nilaiStok, // Negative value when stock is minus
+                'saldo_aman_rp'          => $saldoAmanRp,
+                'saldo_minus_rp'         => $saldoMinusRp,
+                'has_urgent_note'        => in_array($ing->id, $urgentIngIds),
+                'pending_urgent_qty'     => (float)($pendingUrgentMap[$ing->id] ?? 0),
+                'pending_urgent_nominal' => round((float)($pendingUrgentMap[$ing->id] ?? 0) * $hargaPerPakai, 2),
+                'resolved_urgent_qty'    => (float)($resolvedUrgentMap[$ing->id] ?? 0),
             ];
         }
 
@@ -550,9 +700,15 @@ class MovementController extends Controller
                 'to'   => $to,
             ],
             'summary' => [
-                'total_items'     => count($items),
-                'total_low_stock' => $totalLowStock,
-                'total_nilai'     => $grandTotalNilai,
+                'total_items'             => count($items),
+                'total_safe_items'        => $totalSafeStock,
+                'total_negative_items'    => $totalNegativeStock,
+                'total_empty_items'       => $totalEmptyStock,
+                'total_low_stock'         => $totalLowStock,
+                'total_safe_valuation'    => round($grandTotalSafeValuation, 2),
+                'total_deficit_valuation' => round($grandTotalDeficitValuation, 2),
+                'net_total_valuation'     => round($grandTotalSafeValuation + $grandTotalDeficitValuation, 2),
+                'total_nilai'             => round($grandTotalSafeValuation, 2),
             ],
             'items' => $items,
         ]);
@@ -601,19 +757,61 @@ class MovementController extends Controller
             $stokMinOutlet  = (float) $ingredient->stok_min;
         }
 
-        $outTypes = ['SALE_USAGE', 'WASTE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT', 'PREP_USAGE'];
-        $inTypes  = ['PURCHASE', 'ADJUSTMENT_IN', 'TRANSFER_IN', 'PREP_OUTPUT'];
+        // If an INITIAL StockMovement exists, reset $stokAwalMaster to 0 to prevent double-counting
+        $hasInitialMov = StockMovement::where('ingredient_id', $ingId)
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->where('type', 'INITIAL')
+            ->exists();
 
-        // ⚡ PERF: Movements strictly before $from aggregated directly in SQL
-        $priorQuery = StockMovement::where('ingredient_id', $ingId)->where('date', '<', $from);
-        if ($outletId) {
-            $priorQuery->where('outlet_id', $outletId);
+        if ($hasInitialMov) {
+            $stokAwalMaster = 0.0;
         }
-        $priorNet = (float) ($priorQuery->selectRaw("
-            SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty
-        ")->value('net_qty') ?? 0.0);
 
-        $stokAwal = round($stokAwalMaster + $priorNet, 3);
+        $konversi = max((float)$ingredient->konversi, 1);
+        $initialHarga = $outletRow && $outletRow->harga !== null ? (float)$outletRow->harga : (float)$ingredient->harga;
+        $initialCostPerPakai = $initialHarga / $konversi;
+
+        $outTypes = ['SALE_USAGE', 'WASTE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT', 'PREP_USAGE'];
+        $inTypes  = ['PURCHASE', 'ADJUSTMENT_IN', 'TRANSFER_IN', 'PREP_OUTPUT', 'INITIAL', 'ADJUSTMENT_PLUS'];
+
+        // 1. Calculate historical opening stock & nominal balance strictly before $from (SUM dari saldo awal & mutasi sebelumnya)
+        $runningStock = $stokAwalMaster;
+        $runningNominal = round($stokAwalMaster * $initialCostPerPakai, 2);
+        $currentCostPerPakai = $initialCostPerPakai;
+
+        $priorMovements = StockMovement::where('ingredient_id', $ingId)
+            ->where('date', '<', $from)
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->orderBy('date', 'asc')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        foreach ($priorMovements as $m) {
+            $qty = (float)$m->qty;
+            if (in_array($m->type, $inTypes)) {
+                if ($m->total_price > 0 && $qty > 0) {
+                    $inVal = (float)$m->total_price;
+                } elseif ($m->unit_price > 0) {
+                    $inVal = $qty * ((float)$m->unit_price / $konversi);
+                } else {
+                    $inVal = $qty * $currentCostPerPakai;
+                }
+                $runningStock += $qty;
+                $runningNominal += $inVal;
+                if ($runningStock > 0) {
+                    $currentCostPerPakai = $runningNominal / $runningStock;
+                }
+            } else {
+                $unitCost = $currentCostPerPakai;
+                $outVal = ($m->type === 'TRANSFER_OUT' && $m->total_price > 0) ? (float)$m->total_price : ($qty * $unitCost);
+                $runningStock -= $qty;
+                $runningNominal -= $outVal;
+            }
+        }
+
+        $stokAwal = round($runningStock, 3);
+        $nilaiSaldoAwal = round($runningNominal, 2);
+        $costAwalPerPakai = $stokAwal != 0 ? round($nilaiSaldoAwal / $stokAwal, 2) : round($currentCostPerPakai, 2);
 
         // Movements in the period ordered chronologically
         $movQuery = StockMovement::with([
@@ -633,6 +831,8 @@ class MovementController extends Controller
             ->get();
 
         $running = $stokAwal;
+        $runningNominal = $nilaiSaldoAwal;
+        $currentCostPerPakai = $costAwalPerPakai;
         $totalMasuk = 0;
         $totalKeluar = 0;
         $totalPenjualan = 0;
@@ -642,18 +842,38 @@ class MovementController extends Controller
         $rows = [];
         foreach ($movements as $m) {
             $isOut = in_array($m->type, $outTypes);
-            $qtyIn = $isOut ? 0 : (float) $m->qty;
-            $qtyOut = $isOut ? (float) $m->qty : 0;
+            $qty = (float)$m->qty;
+            $qtyIn = $isOut ? 0 : $qty;
+            $qtyOut = $isOut ? $qty : 0;
+            $costBeforeRow = $currentCostPerPakai;
 
             if ($isOut) {
                 $totalKeluar += $qtyOut;
                 $running -= $qtyOut;
                 if ($m->type === 'SALE_USAGE') $totalPenjualan += $qtyOut;
                 if ($m->type === 'WASTE')      $totalWaste += $qtyOut;
+
+                $unitCost = $currentCostPerPakai;
+                $outVal = ($m->type === 'TRANSFER_OUT' && $m->total_price > 0) ? (float)$m->total_price : ($qtyOut * $unitCost);
+                $runningNominal -= $outVal;
+                $costAfterRow = $currentCostPerPakai;
+                $inVal = 0.0;
             } else {
                 $totalMasuk += $qtyIn;
                 $running += $qtyIn;
                 if ($m->type === 'PURCHASE')   $totalPembelian += $qtyIn;
+
+                if ($m->total_price > 0 && $qtyIn > 0) {
+                    $inVal = (float)$m->total_price;
+                } elseif ($m->unit_price > 0) {
+                    $inVal = $qtyIn * ((float)$m->unit_price / $konversi);
+                } else {
+                    $inVal = $qtyIn * $currentCostPerPakai;
+                }
+                $runningNominal += $inVal;
+                $costAfterRow = $running > 0 ? ($runningNominal / $running) : $currentCostPerPakai;
+                $currentCostPerPakai = $costAfterRow;
+                $outVal = 0.0;
             }
 
             $ref = "MVT-{$m->id}";
@@ -671,62 +891,83 @@ class MovementController extends Controller
             $updaterName = $m->updater?->name ?? ($m->shift?->closedByUser?->name ?? null);
             $hasChanged = ($m->updated_at && $m->created_at && $m->updated_at->ne($m->created_at)) || !empty($updaterName);
 
+            $isUrgentResolution = str_contains($m->note ?? '', 'Pelunasan Nota Urgent')
+                || str_contains($m->note ?? '', 'Pelunasan Bahan Tergantung')
+                || str_contains($m->note ?? '', 'Nota Urgent');
+
+            $balanceNominal = round($runningNominal, 2);
+
             $rows[] = [
-                'id'              => $m->id,
-                'date'            => $m->date,
-                'created_at'      => $m->created_at?->format('Y-m-d H:i:s'),
-                'created_time'    => $m->created_at?->format('H:i:s'),
-                'created_by'      => $m->created_by,
-                'created_by_name' => $creatorName,
-                'changed_at'      => $hasChanged ? $m->updated_at?->format('Y-m-d H:i:s') : null,
-                'changed_by'      => $m->updated_by,
-                'changed_by_name' => $hasChanged ? $updaterName : null,
-                'outlet_id'       => $m->outlet_id,
-                'ingredient_id'   => $m->ingredient_id,
-                'transfer_id'     => $m->transfer_id,
-                'outlet_name'     => $m->outlet?->name ?? ($m->outlet_id ? "Outlet #{$m->outlet_id}" : '-'),
-                'type'            => $m->type,
-                'waste_reason'    => $m->waste_reason,
-                'note'            => $m->note,
-                'ref'             => $ref,
-                'shift_id'        => $m->shift_id,
-                'shift_name'      => $m->shift?->shift_name,
-                'transaction_id'  => $m->transaction_id,
-                'qty_in'          => $qtyIn,
-                'qty_out'         => $qtyOut,
-                'unit_price'      => $m->unit_price,
-                'total_price'     => $m->total_price,
-                'cost_before'     => $m->cost_before,
-                'cost_after'      => $m->cost_after,
-                'balance'         => round($running, 3),
-                'user'            => $creatorName,
-                'payment_type'    => $m->payment_type ?? 'CASH',
-                'supplier_name'   => $m->supplier_name,
-                'purchase_no'     => $m->purchase_no,
-                'payable_id'      => $m->payable_id,
+                'id'                   => $m->id,
+                'date'                 => $m->date,
+                'created_at'           => $m->created_at?->format('Y-m-d H:i:s'),
+                'created_time'         => $m->created_at?->format('H:i:s'),
+                'created_by'           => $m->created_by,
+                'created_by_name'      => $creatorName,
+                'changed_at'           => $hasChanged ? $m->updated_at?->format('Y-m-d H:i:s') : null,
+                'changed_by'           => $m->updated_by,
+                'changed_by_name'      => $hasChanged ? $updaterName : null,
+                'outlet_id'            => $m->outlet_id,
+                'ingredient_id'        => $m->ingredient_id,
+                'transfer_id'          => $m->transfer_id,
+                'outlet_name'          => $m->outlet?->name ?? ($m->outlet_id ? "Outlet #{$m->outlet_id}" : '-'),
+                'type'                 => $m->type,
+                'waste_reason'         => $m->waste_reason,
+                'note'                 => $m->note,
+                'ref'                  => $ref,
+                'shift_id'             => $m->shift_id,
+                'shift_name'           => $m->shift?->shift_name,
+                'transaction_id'       => $m->transaction_id,
+                'qty_in'               => $qtyIn,
+                'qty_out'              => $qtyOut,
+                'unit_price'           => $m->unit_price,
+                'total_price'          => $m->total_price,
+                'in_nominal'           => round($inVal, 2),
+                'out_nominal'          => round($outVal, 2),
+                'cost_before'          => round($costBeforeRow, 2),
+                'cost_after'           => round($costAfterRow, 2),
+                'cost_per_pakai'       => round($costAfterRow, 2),
+                'balance'              => round($running, 3),
+                'balance_nominal'      => $balanceNominal,
+                'is_negative'          => $running < 0,
+                'is_urgent_resolution' => $isUrgentResolution,
+                'user'                 => $creatorName,
+                'payment_type'         => $m->payment_type ?? 'CASH',
+                'supplier_name'        => $m->supplier_name,
+                'purchase_no'          => $m->purchase_no,
+                'payable_id'           => $m->payable_id,
             ];
         }
 
-        $hargaPerPakai = $ingredient->costPerPakaiForOutlet($outletId);
         $stokAkhir = round($running, 3);
         $outletObj = $outletId ? \App\Models\Outlet::find($outletId) : null;
+        $isNegative = $stokAkhir < 0;
+        $nilaiStokAkhir = round($runningNominal, 2);
+        $saldoAmanRp = $stokAkhir > 0 ? $nilaiStokAkhir : 0.0;
+        $saldoMinusRp = $stokAkhir < 0 ? $nilaiStokAkhir : 0.0;
 
         return response()->json([
-            'ingredient'       => $ingredient,
-            'period'           => ['from' => $from, 'to' => $to],
-            'outlet_id'        => $outletId,
-            'outlet_name'      => $outletObj ? $outletObj->name : 'Semua Cabang (Konsolidasi)',
-            'stok_awal'        => round($stokAwal, 3),
-            'total_masuk'      => round($totalMasuk, 3),
-            'total_keluar'     => round($totalKeluar, 3),
-            'total_pembelian'  => round($totalPembelian, 3),
-            'total_penjualan'  => round($totalPenjualan, 3),
-            'total_waste'      => round($totalWaste, 3),
-            'stok_akhir'       => $stokAkhir,
-            'stok_min'         => $stokMinOutlet,
-            'is_below_min'     => $stokAkhir < $stokMinOutlet,
-            'nilai_stok_akhir' => round($stokAkhir * $hargaPerPakai, 2),
-            'rows'             => $rows,
+            'ingredient'           => $ingredient,
+            'period'               => ['from' => $from, 'to' => $to],
+            'outlet_id'            => $outletId,
+            'outlet_name'          => $outletObj ? $outletObj->name : 'Semua Cabang (Konsolidasi)',
+            'stok_awal'            => round($stokAwal, 3),
+            'nilai_saldo_awal'     => $nilaiSaldoAwal,
+            'cost_awal_per_pakai'  => $costAwalPerPakai,
+            'total_masuk'          => round($totalMasuk, 3),
+            'total_keluar'         => round($totalKeluar, 3),
+            'total_pembelian'      => round($totalPembelian, 3),
+            'total_penjualan'      => round($totalPenjualan, 3),
+            'total_waste'          => round($totalWaste, 3),
+            'stok_akhir'           => $stokAkhir,
+            'stok_min'             => $stokMinOutlet,
+            'is_below_min'         => $stokAkhir < $stokMinOutlet,
+            'is_negative'          => $isNegative,
+            'nilai_stok_akhir'     => $nilaiStokAkhir,
+            'saldo_aman_rp'        => $saldoAmanRp,
+            'saldo_minus_rp'       => $saldoMinusRp,
+            'has_urgent_movements' => $movements->contains(fn($m) => str_contains($m->note ?? '', 'Nota Urgent')),
+            'rows'                 => $rows,
         ]);
     }
 
@@ -885,6 +1126,25 @@ class MovementController extends Controller
 
                 $qtyPakai = $isUnitBeli ? $initialStock * $konversi : $initialStock;
                 $hargaBeli = $harga > 0 ? $harga : (float)$ingredient->hargaForOutlet($targetOutlet->id);
+                $pricePerPakai = $hargaBeli / $konversi;
+                $totalPriceVal = round(($qtyPakai / $konversi) * $hargaBeli, 2);
+
+                // Parse Effective Date
+                $rawDate = $row['date'] ?? $row['tanggal'] ?? $row['tanggal_efektif'] ?? $row['effective_date'] ?? null;
+                $effectiveDate = Carbon::today()->toDateString();
+                if (!empty($rawDate)) {
+                    try {
+                        if (is_numeric($rawDate) && (float)$rawDate > 20000 && (float)$rawDate < 80000) {
+                            $effectiveDate = Carbon::createFromTimestampUTC(((float)$rawDate - 25569) * 86400)->toDateString();
+                        } else {
+                            $effectiveDate = Carbon::parse($rawDate)->toDateString();
+                        }
+                    } catch (\Throwable $e) {
+                        $effectiveDate = Carbon::today()->toDateString();
+                    }
+                }
+
+                $notes = !empty($row['notes']) ? trim($row['notes']) : (!empty($row['catatan']) ? trim($row['catatan']) : (!empty($row['keterangan']) ? trim($row['keterangan']) : null));
 
                 // Update OutletIngredient (isolated per branch)
                 $outletRow = OutletIngredient::firstOrNew([
@@ -914,6 +1174,27 @@ class MovementController extends Controller
                     }
                     $ingredient->save();
                 }
+
+                // Create or update StockMovement record of type 'INITIAL' on the effective date
+                StockMovement::updateOrCreate(
+                    [
+                        'ingredient_id' => $ingredient->id,
+                        'outlet_id'     => $targetOutlet->id,
+                        'type'          => 'INITIAL',
+                    ],
+                    [
+                        'business_id'   => $businessId,
+                        'date'          => $effectiveDate,
+                        'qty'           => $qtyPakai,
+                        'unit_price'    => $hargaBeli,
+                        'total_price'   => $totalPriceVal,
+                        'cost_before'   => $pricePerPakai,
+                        'cost_after'    => $pricePerPakai,
+                        'note'          => $notes ?: "Saldo Awal Fisik Efektif {$effectiveDate}",
+                        'user_id'       => $user?->id,
+                        'created_by'    => $user?->id,
+                    ]
+                );
 
                 $importedCount++;
             }

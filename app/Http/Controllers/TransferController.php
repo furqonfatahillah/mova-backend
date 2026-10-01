@@ -47,6 +47,13 @@ class TransferController extends Controller
             });
         }
 
+        if ($request->outlet_id) {
+            $query->where(function($q) use ($request) {
+                $q->where('source_outlet_id', $request->outlet_id)
+                  ->orWhere('destination_outlet_id', $request->outlet_id);
+            });
+        }
+
         if ($request->source_outlet_id) {
             $query->where('source_outlet_id', $request->source_outlet_id);
         }

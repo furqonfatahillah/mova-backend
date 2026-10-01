@@ -555,6 +555,9 @@ class MenuController extends Controller
 
         $user = $request->user();
         $businessId = $user?->business_id;
+        if ($user?->isSuperadminPlatform()) {
+            $businessId = $request->header('X-Business-Id') ?? $request->query('business_id') ?? $request->input('business_id') ?? $businessId;
+        }
         $items = $request->input('items', []);
 
         $importedMenuCount = 0;
@@ -569,7 +572,16 @@ class MenuController extends Controller
                 if (empty($menuName) && empty($menuCode)) continue;
 
                 $ingredientName = trim($row['ingredient_name'] ?? $row['bahan'] ?? $row['nama_bahan'] ?? $row['item_name'] ?? $row['nama_perlengkapan'] ?? '');
-                if (empty($ingredientName)) continue;
+                $ingredientCode = trim($row['ingredient_code'] ?? $row['kode_bahan'] ?? $row['kode_perlengkapan'] ?? '');
+                if (empty($ingredientName) && empty($ingredientCode)) continue;
+
+                // If ingredient name is missing but code is present, attempt to resolve from existing master
+                if (empty($ingredientName) && !empty($ingredientCode)) {
+                    $existIng = Ingredient::where('business_id', $businessId)->where('code', $ingredientCode)->first();
+                    if ($existIng) {
+                        $ingredientName = $existIng->name;
+                    }
+                }
 
                 $key = !empty($menuCode) ? "code:{$menuCode}" : "name:" . strtolower($menuName);
                 if (!isset($groupedByMenu[$key])) {
@@ -700,7 +712,7 @@ class MenuController extends Controller
                         $ingredient = Ingredient::create([
                             'business_id'   => $businessId,
                             'code'          => $ingCode,
-                            'name'          => $ingName,
+                            'name'          => $ingName ?: "Bahan {$ingCode}",
                             'category_id'   => $ingCat->id,
                             'category'      => $ingCat->name,
                             'type'          => 'RAW',
@@ -715,11 +727,18 @@ class MenuController extends Controller
                         ]);
                     }
 
+                    // Kunci otomatis ke Satuan Pakai Master Bahan (Auto-bind to Master unit_pakai)
+                    $finalUnit = $ingredient->unit_pakai ?: ($unit ?: 'gram');
+                    if (!empty($unit) && strtolower($unit) === strtolower($ingredient->unit_beli) && strtolower($ingredient->unit_beli) !== strtolower($ingredient->unit_pakai) && (float)$ingredient->konversi > 1) {
+                        $qty = $qty * (float)$ingredient->konversi;
+                        $finalUnit = $ingredient->unit_pakai;
+                    }
+
                     RecipeItem::create([
                         'recipe_id'     => $recipe->id,
                         'ingredient_id' => $ingredient->id,
                         'qty'           => $qty,
-                        'unit'          => $unit ?: $ingredient->unit_pakai,
+                        'unit'          => $finalUnit,
                         'waste_std'     => $waste,
                     ]);
 
@@ -727,6 +746,8 @@ class MenuController extends Controller
                 }
 
                 $newHpp = (float)$menu->calculateHpp();
+                $menu->cost_price = $newHpp;
+                $menu->save();
 
                 try {
                     \App\Services\MenuHppService::recordForRecipeUpdate(
@@ -744,6 +765,7 @@ class MenuController extends Controller
 
         return response()->json([
             'message'             => "Berhasil meng-import resep untuk {$importedMenuCount} menu ({$totalItemsCount} rincian bahan/gramasi terpasang).",
+            'imported_count'      => $importedMenuCount,
             'imported_menu_count' => $importedMenuCount,
             'total_items_count'   => $totalItemsCount,
         ]);

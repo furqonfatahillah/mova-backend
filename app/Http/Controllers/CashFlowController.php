@@ -33,23 +33,188 @@ class CashFlowController extends Controller
             $outletId = (int)$request->outlet_id;
         }
 
+        // Payment method parsing (supports preset combinations, comma-separated lists, and individual methods)
+        $rawPm = $request->input('payment_method', 'ALL');
+        $pmList = [];
+        if (is_array($rawPm)) {
+            $pmList = array_map(fn($v) => strtoupper(trim($v)), $rawPm);
+        } elseif (is_string($rawPm) && !empty($rawPm) && strtoupper($rawPm) !== 'ALL') {
+            $pmList = array_map(fn($v) => strtoupper(trim($v)), explode(',', $rawPm));
+        }
+        $isPmFiltered = count($pmList) > 0 && !in_array('ALL', $pmList);
+        $pmFilter = $isPmFiltered ? implode(',', $pmList) : 'ALL';
+
+        // Shift filter parsing (supports 'ALL', single ID, array of IDs, comma-separated IDs, or shift names)
+        $rawShift = $request->input('shift_id', $request->input('shift_ids', 'ALL'));
+        $shiftFilterIds = [];
+        $isShiftFiltered = false;
+
+        if (is_array($rawShift)) {
+            $shiftFilterIds = array_values(array_filter(array_map('intval', $rawShift)));
+            $isShiftFiltered = count($shiftFilterIds) > 0;
+        } elseif (is_string($rawShift) && !empty($rawShift) && strtoupper($rawShift) !== 'ALL') {
+            $parts = explode(',', $rawShift);
+            $numericIds = [];
+            $nameFilters = [];
+            foreach ($parts as $p) {
+                $p = trim($p);
+                if (is_numeric($p)) {
+                    $numericIds[] = (int)$p;
+                } elseif (!empty($p)) {
+                    $nameFilters[] = $p;
+                }
+            }
+
+            if (!empty($nameFilters)) {
+                $matchedShiftIds = \App\Models\Shift::where(function($q) use ($nameFilters) {
+                    foreach ($nameFilters as $nf) {
+                        $q->orWhere('shift_name', 'like', "%{$nf}%");
+                    }
+                })
+                ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+                ->whereBetween('opened_at', ["{$from} 00:00:00", "{$to} 23:59:59"])
+                ->pluck('id')
+                ->all();
+                $numericIds = array_unique(array_merge($numericIds, $matchedShiftIds));
+            }
+
+            $shiftFilterIds = array_values(array_unique($numericIds));
+            $isShiftFiltered = count($shiftFilterIds) > 0;
+        }
+
+        // Available shifts in this period & outlet for frontend filter selection
+        $availableShiftsQuery = \App\Models\Shift::with('user')
+            ->where(function($q) use ($from, $to) {
+                $q->whereBetween('opened_at', ["{$from} 00:00:00", "{$to} 23:59:59"])
+                  ->orWhere(function($sub) use ($from, $to) {
+                      $sub->whereDate('opened_at', '>=', $from)
+                          ->whereDate('opened_at', '<=', $to);
+                  });
+            })
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->orderBy('opened_at', 'desc');
+
+        $availableShifts = $availableShiftsQuery->get()->map(function($s) {
+            return [
+                'id'           => $s->id,
+                'shift_name'   => $s->shift_name,
+                'opened_at'    => $s->opened_at,
+                'closed_at'    => $s->closed_at,
+                'status'       => $s->status,
+                'cashier_name' => $s->user?->name ?: 'Kasir',
+                'initial_cash' => (float)$s->initial_cash,
+                'closing_cash' => (float)$s->closing_cash,
+                'system_cash'  => (float)$s->system_cash,
+                'date'         => $s->opened_at ? substr($s->opened_at, 0, 10) : null,
+            ];
+        })->values();
+
+        // Helper closures for payment method matching (including combined presets)
+        $applyPmFilter = function($query, $column = 'payment_method') use ($pmList, $isPmFiltered) {
+            if (!$isPmFiltered) return;
+
+            $query->where(function($q) use ($column, $pmList) {
+                foreach ($pmList as $idx => $pm) {
+                    $clause = function($subQ) use ($column, $pm) {
+                        if ($pm === 'NON_CASH' || $pm === 'ALL_NON_CASH') {
+                            $subQ->where(function($inner) use ($column) {
+                                $inner->where($column, 'like', '%QRIS%')
+                                      ->orWhere($column, 'like', '%GRAB%')
+                                      ->orWhere($column, 'like', '%GOFOOD%')
+                                      ->orWhere($column, 'like', '%SHOPEE%')
+                                      ->orWhere($column, 'like', '%TIKTOK%')
+                                      ->orWhere($column, 'like', '%TRANSFER%')
+                                      ->orWhere($column, 'like', '%DEBIT%')
+                                      ->orWhere($column, 'like', '%EDC%')
+                                      ->orWhere($column, 'like', '%CREDIT%')
+                                      ->orWhere($column, 'like', '%KARTU%')
+                                      ->orWhere($column, 'like', '%DIGITAL%')
+                                      ->orWhere($column, 'like', '%ECOMMERCE%');
+                            });
+                        } elseif ($pm === 'CASH_ALL' || $pm === 'CASH_AND_PETTY') {
+                            $subQ->where(function($inner) use ($column) {
+                                $inner->whereIn($column, ['CASH', 'TUNAI', 'PETTY_CASH'])
+                                      ->orWhere($column, 'like', '%TUNAI%')
+                                      ->orWhere($column, 'like', '%CASH%')
+                                      ->orWhere($column, 'like', '%PETTY%');
+                            });
+                        } elseif ($pm === 'CASH' || $pm === 'TUNAI') {
+                            $subQ->where(function($inner) use ($column) {
+                                $inner->whereIn($column, ['CASH', 'TUNAI'])
+                                      ->orWhere($column, 'like', '%TUNAI%')
+                                      ->orWhere($column, 'like', '%CASH%');
+                            });
+                        } elseif ($pm === 'QRIS') {
+                            $subQ->where($column, 'like', '%QRIS%');
+                        } elseif ($pm === 'GRAB' || $pm === 'ECOMMERCE' || $pm === 'ECOMMERCE_ALL') {
+                            $subQ->where(function($inner) use ($column) {
+                                $inner->where($column, 'like', '%GRAB%')
+                                      ->orWhere($column, 'like', '%GOFOOD%')
+                                      ->orWhere($column, 'like', '%SHOPEE%')
+                                      ->orWhere($column, 'like', '%TIKTOK%')
+                                      ->orWhere($column, 'like', '%ECOMMERCE%')
+                                      ->orWhere($column, 'like', '%DELIVERY%')
+                                      ->orWhere($column, 'like', '%ONLINE%');
+                            });
+                        } elseif ($pm === 'TRANSFER') {
+                            $subQ->where(function($inner) use ($column) {
+                                $inner->where($column, 'like', '%TRANSFER%')
+                                      ->orWhere($column, 'like', '%BANK%')
+                                      ->orWhere($column, 'like', '%BCA%')
+                                      ->orWhere($column, 'like', '%BRI%')
+                                      ->orWhere($column, 'like', '%MANDIRI%');
+                            });
+                        } elseif ($pm === 'DEBIT' || $pm === 'EDC') {
+                            $subQ->where(function($inner) use ($column) {
+                                $inner->where($column, 'like', '%DEBIT%')
+                                      ->orWhere($column, 'like', '%EDC%')
+                                      ->orWhere($column, 'like', '%CREDIT%')
+                                      ->orWhere($column, 'like', '%KARTU%');
+                            });
+                        } elseif ($pm === 'PETTY_CASH') {
+                            $subQ->where(function($inner) use ($column) {
+                                $inner->where($column, 'PETTY_CASH')
+                                      ->orWhere($column, 'like', '%PETTY%')
+                                      ->orWhere($column, 'like', '%KECIL%');
+                            });
+                        } else {
+                            $subQ->where($column, $pm);
+                        }
+                    };
+
+                    if ($idx === 0) {
+                        $q->where($clause);
+                    } else {
+                        $q->orWhere($clause);
+                    }
+                }
+            });
+        };
+
+        // Helper closures for shift filtering
+        $applyShiftFilter = function($query, $column = 'shift_id') use ($shiftFilterIds, $isShiftFiltered) {
+            if (!$isShiftFiltered) return;
+            $query->whereIn($column, $shiftFilterIds);
+        };
+
         // =========================================================================
         // 1. ARUS KAS DARI AKTIVITAS OPERASI (OPERATING CASH FLOW / OCF)
         // =========================================================================
         
         // A. Penerimaan Kas dari Penjualan Kasir Langsung (Direct Cash/Instant Sales Inflows)
-        // Hanya menghitung transaksi tunai/instan riil (CASH, QRIS, TRANSFER, DEBIT, GRAB, dll).
-        // Transaksi KASBON / PIUTANG TIDAK dihitung di sini karena belum ada uang kas yang masuk saat nota dibuat.
         $trxQuery = Transaction::where('status', 'PAID')
             ->whereBetween('date', [$from, $to])
-            ->select(['payment_method', 'total_price']);
+            ->select(['payment_method', 'total_price', 'shift_id']);
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);
         }
+        $applyPmFilter($trxQuery, 'payment_method');
+        $applyShiftFilter($trxQuery, 'shift_id');
         $transactions = $trxQuery->get();
 
         $cashSales = 0.0;
         $qrisSales = 0.0;
+        $grabSales = 0.0;
         $transferSales = 0.0;
         $debitSales = 0.0;
         $otherSales = 0.0;
@@ -60,34 +225,34 @@ class CashFlowController extends Controller
             $method = strtoupper(trim($t->payment_method ?: 'CASH'));
 
             if (in_array($method, ['KASBON', 'PIUTANG'])) {
-                // Kasbon baru belum menghasilkan kas masuk saat transaksi kasir dibuat
                 $newKasbonTotal += $amt;
                 continue;
             }
 
-            if ($method === 'CASH') {
+            if ($method === 'CASH' || $method === 'TUNAI') {
                 $cashSales += $amt;
-            } elseif ($method === 'QRIS') {
+            } elseif (str_contains($method, 'QRIS')) {
                 $qrisSales += $amt;
-            } elseif ($method === 'TRANSFER') {
+            } elseif (str_contains($method, 'GRAB') || str_contains($method, 'GOFOOD') || str_contains($method, 'SHOPEE') || str_contains($method, 'TIKTOK')) {
+                $grabSales += $amt;
+            } elseif (str_contains($method, 'TRANSFER')) {
                 $transferSales += $amt;
-            } elseif ($method === 'DEBIT') {
+            } elseif (str_contains($method, 'DEBIT') || str_contains($method, 'EDC') || str_contains($method, 'CREDIT')) {
                 $debitSales += $amt;
             } else {
                 $otherSales += $amt;
             }
         }
 
-        $totalDirectSalesReceipts = $cashSales + $qrisSales + $transferSales + $debitSales + $otherSales;
+        $totalDirectSalesReceipts = $cashSales + $qrisSales + $grabSales + $transferSales + $debitSales + $otherSales;
 
         // B. Penerimaan Kas dari Pembayaran Kasbon Pelanggan (Receivable Collections)
-        // HANYA uang kas yang benar-benar dibayarkan oleh customer (ada uang kas riil masuk ke kasir/rekening)
-        // ⚡ PERF: Select only needed columns and avoid unused relationship hydration
         $recPayQuery = ReceivablePayment::whereBetween('payment_date', [$from, $to])
-            ->select(['amount', 'payment_method']);
+            ->select(['amount', 'payment_method', 'id', 'payment_no', 'receivable_id', 'notes', 'outlet_id', 'receiver_id']);
         if ($outletId) {
             $recPayQuery->where('outlet_id', $outletId);
         }
+        $applyPmFilter($recPayQuery, 'payment_method');
         $receivablePayments = $recPayQuery->get();
 
         $receivableCashIn = 0.0;
@@ -102,13 +267,13 @@ class CashFlowController extends Controller
             $receivableCashIn += $rpAmt;
             $rpMethod = strtoupper(trim($rp->payment_method ?: 'CASH'));
 
-            if ($rpMethod === 'CASH') {
+            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
                 $recPayCash += $rpAmt;
-            } elseif ($rpMethod === 'TRANSFER') {
+            } elseif (str_contains($rpMethod, 'TRANSFER')) {
                 $recPayTransfer += $rpAmt;
-            } elseif ($rpMethod === 'QRIS') {
+            } elseif (str_contains($rpMethod, 'QRIS')) {
                 $recPayQris += $rpAmt;
-            } elseif ($rpMethod === 'DEBIT') {
+            } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC')) {
                 $recPayDebit += $rpAmt;
             } else {
                 $recPayOther += $rpAmt;
@@ -124,11 +289,11 @@ class CashFlowController extends Controller
                 $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
             });
         }
+        $applyPmFilter($extraOpInQuery, 'payment_method');
         $extraOpIn = (float)$extraOpInQuery->sum('amount');
         $totalOperatingInflows = $totalDirectSalesReceipts + $receivableCashIn + $extraOpIn;
 
         // B. Pengeluaran Kas untuk Belanja Persediaan Bahan Baku (Cash Paid for Inventory Purchases)
-        // ⚡ PERF: Load only required ingredient columns and movement columns
         $movQuery = StockMovement::with(['ingredient' => function($q) {
             $q->select(['id', 'name', 'unit_pakai', 'konversi', 'harga']);
         }])
@@ -137,6 +302,19 @@ class CashFlowController extends Controller
             ->select(['id', 'ingredient_id', 'outlet_id', 'type', 'date', 'unit_price', 'total_price', 'qty', 'payment_type']);
         if ($outletId) {
             $movQuery->where('outlet_id', $outletId);
+        }
+        if ($isPmFiltered) {
+            if ($pmFilter === 'CASH' || $pmFilter === 'TUNAI') {
+                $movQuery->where(fn($q) => $q->whereIn('payment_type', ['CASH', 'TUNAI'])->orWhereNull('payment_type'));
+            } elseif ($pmFilter === 'TRANSFER') {
+                $movQuery->where('payment_type', 'like', '%TRANSFER%');
+            } elseif ($pmFilter === 'PETTY_CASH') {
+                $movQuery->where('payment_type', 'PETTY_CASH');
+            } elseif ($pmFilter === 'QRIS') {
+                $movQuery->where('payment_type', 'like', '%QRIS%');
+            } else {
+                $movQuery->whereRaw('0 = 1');
+            }
         }
         $purchaseMovements = $movQuery->get();
 
@@ -180,6 +358,7 @@ class CashFlowController extends Controller
                 $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
             });
         }
+        $applyPmFilter($payablePaymentQuery, 'payment_method');
         $supplierDebtCashOut = (float)$payablePaymentQuery->sum('amount');
 
         // Tambahan pembelian bahan langsung dari buku kas jika ada
@@ -191,6 +370,7 @@ class CashFlowController extends Controller
                 $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
             });
         }
+        $applyPmFilter($extraSuppQuery, 'payment_method');
         $extraSupplierCash = (float)$extraSuppQuery->sum('amount');
 
         // Total arus kas keluar untuk persediaan: Belanja Tunai + Pembayaran Hutang Supplier + Kas Keluar Supplier Langsung
@@ -203,6 +383,7 @@ class CashFlowController extends Controller
                 $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
             });
         }
+        $applyPmFilter($opexQuery, 'payment_method');
         $opexRecords = $opexQuery->get();
         $totalOpexCashOut = (float)$opexRecords->sum('amount');
 
@@ -215,6 +396,7 @@ class CashFlowController extends Controller
                 $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
             });
         }
+        $applyPmFilter($extraOpExQuery, 'payment_method');
         $extraOpExCash = (float)$extraOpExQuery->sum('amount');
         $totalOperatingExpensesCashOut = $totalOpexCashOut + $extraOpExCash;
 
@@ -231,6 +413,7 @@ class CashFlowController extends Controller
                 $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
             });
         }
+        $applyPmFilter($invQuery, 'payment_method');
         $investingTransactions = $invQuery->get();
 
         $investingInflows = (float)$investingTransactions->where('type', 'IN')->sum('amount');
@@ -265,6 +448,7 @@ class CashFlowController extends Controller
                 $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
             });
         }
+        $applyPmFilter($finQuery, 'payment_method');
         $financingTransactions = $finQuery->get();
 
         $financingInflows = (float)$financingTransactions->where('type', 'IN')->sum('amount');
@@ -396,13 +580,30 @@ class CashFlowController extends Controller
             ],
         ];
 
+        $selectedShifts = $isShiftFiltered 
+            ? $availableShifts->whereIn('id', $shiftFilterIds)->values()
+            : $availableShifts->values();
+        $selectedShiftsInitialCashTotal = (float)$selectedShifts->sum('initial_cash');
+        $selectedShiftsClosingCashTotal = (float)$selectedShifts->sum('closing_cash');
+
         return response()->json([
             'period' => [
-                'from'      => $from,
-                'to'        => $to,
-                'outlet_id' => $outletId,
+                'from'                   => $from,
+                'to'                     => $to,
+                'outlet_id'              => $outletId,
+                'selected_payment_method'=> $pmFilter,
+                'selected_shift_ids'     => $shiftFilterIds,
+                'is_shift_filtered'      => $isShiftFiltered,
+                'is_pm_filtered'         => $isPmFiltered,
+                'initial_cash_total'     => $selectedShiftsInitialCashTotal,
+                'closing_cash_total'     => $selectedShiftsClosingCashTotal,
+                'selected_shifts_count'  => $selectedShifts->count(),
             ],
+            'available_shifts' => $availableShifts,
             'summary' => [
+                'initial_cash_total'      => $selectedShiftsInitialCashTotal,
+                'closing_cash_total'      => $selectedShiftsClosingCashTotal,
+                'selected_shifts_count'   => $selectedShifts->count(),
                 'net_operating_cash_flow' => $netOperatingCashFlow,
                 'net_investing_cash_flow' => $netInvestingCashFlow,
                 'net_financing_cash_flow' => $netFinancingCashFlow,
@@ -417,6 +618,7 @@ class CashFlowController extends Controller
                 'inflows' => [
                     'cash_sales'             => round($cashSales, 2),
                     'qris_sales'             => round($qrisSales, 2),
+                    'grab_sales'             => round($grabSales, 2),
                     'transfer_sales'         => round($transferSales, 2),
                     'debit_sales'            => round($debitSales, 2),
                     'other_sales'            => round($otherSales, 2),
@@ -512,6 +714,68 @@ class CashFlowController extends Controller
 
         if ($request->filled('category') && $request->category !== 'ALL') {
             $query->where('category', $request->category);
+        }
+
+        if ($request->filled('payment_method') && strtoupper($request->payment_method) !== 'ALL') {
+            $rawPm = $request->payment_method;
+            $pmList = is_array($rawPm) ? $rawPm : explode(',', $rawPm);
+            $pmList = array_map(fn($v) => strtoupper(trim($v)), array_filter($pmList));
+
+            if (count($pmList) > 0 && !in_array('ALL', $pmList)) {
+                $query->where(function($q) use ($pmList) {
+                    foreach ($pmList as $idx => $pm) {
+                        $clause = function($subQ) use ($pm) {
+                            if ($pm === 'NON_CASH' || $pm === 'ALL_NON_CASH') {
+                                $subQ->where(function($inner) {
+                                    $inner->where('payment_method', 'like', '%QRIS%')
+                                          ->orWhere('payment_method', 'like', '%GRAB%')
+                                          ->orWhere('payment_method', 'like', '%GOFOOD%')
+                                          ->orWhere('payment_method', 'like', '%SHOPEE%')
+                                          ->orWhere('payment_method', 'like', '%TIKTOK%')
+                                          ->orWhere('payment_method', 'like', '%TRANSFER%')
+                                          ->orWhere('payment_method', 'like', '%DEBIT%')
+                                          ->orWhere('payment_method', 'like', '%EDC%')
+                                          ->orWhere('payment_method', 'like', '%CREDIT%');
+                                });
+                            } elseif ($pm === 'CASH_ALL' || $pm === 'CASH_AND_PETTY' || $pm === 'CASH' || $pm === 'TUNAI' || $pm === 'PETTY_CASH') {
+                                $subQ->where(function($inner) {
+                                    $inner->whereIn('payment_method', ['CASH', 'TUNAI', 'PETTY_CASH'])
+                                          ->orWhere('payment_method', 'like', '%TUNAI%')
+                                          ->orWhere('payment_method', 'like', '%CASH%')
+                                          ->orWhere('payment_method', 'like', '%PETTY%');
+                                });
+                            } elseif ($pm === 'QRIS') {
+                                $subQ->where('payment_method', 'like', '%QRIS%');
+                            } elseif ($pm === 'GRAB' || $pm === 'ECOMMERCE' || $pm === 'ECOMMERCE_ALL') {
+                                $subQ->where(function($inner) {
+                                    $inner->where('payment_method', 'like', '%GRAB%')
+                                          ->orWhere('payment_method', 'like', '%GOFOOD%')
+                                          ->orWhere('payment_method', 'like', '%SHOPEE%')
+                                          ->orWhere('payment_method', 'like', '%TIKTOK%');
+                                });
+                            } elseif ($pm === 'TRANSFER') {
+                                $subQ->where('payment_method', 'like', '%TRANSFER%');
+                            } elseif ($pm === 'DEBIT' || $pm === 'EDC') {
+                                $subQ->where(function($inner) {
+                                    $inner->where('payment_method', 'like', '%DEBIT%')
+                                          ->orWhere('payment_method', 'like', '%EDC%')
+                                          ->orWhere('payment_method', 'like', '%CREDIT%');
+                                });
+                            } elseif ($pm === 'PETTY_CASH') {
+                                $subQ->where('payment_method', 'PETTY_CASH');
+                            } else {
+                                $subQ->where('payment_method', $pm);
+                            }
+                        };
+
+                        if ($idx === 0) {
+                            $q->where($clause);
+                        } else {
+                            $q->orWhere($clause);
+                        }
+                    }
+                });
+            }
         }
 
         if ($request->filled('search')) {

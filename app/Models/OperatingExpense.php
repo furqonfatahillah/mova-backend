@@ -61,10 +61,10 @@ class OperatingExpense extends Model
     public static function paymentMethods(): array
     {
         return [
-            'CASH'       => 'Kas Operasional / Tunai',
+            'CASH'       => 'Kas Operasional / Kas Kecil (Tunai)',
             'TRANSFER'   => 'Transfer Bank',
-            'PETTY_CASH' => 'Kas Kecil (Petty Cash)',
-            'DEBIT'      => 'Debit / Kartu',
+            'PETTY_CASH' => 'Kas Operasional / Kas Kecil (Tunai)',
+            'DEBIT'      => 'Debit / Kartu EDC',
         ];
     }
 

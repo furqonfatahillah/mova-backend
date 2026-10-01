@@ -99,18 +99,25 @@ class Ingredient extends Model
 
     public function stockForOutlet(int $outletId): float
     {
-        $outletRow = $this->relationLoaded('outletIngredients')
-            ? $this->outletIngredients->firstWhere('outlet_id', $outletId)
-            : $this->outletIngredients()->where('outlet_id', $outletId)->first();
+        $hasInitialMov = StockMovement::where('ingredient_id', $this->id)
+            ->where('outlet_id', $outletId)
+            ->where('type', 'INITIAL')
+            ->exists();
 
         $stokAwal = 0.0;
-        if ($outletRow && (float)$outletRow->stok_awal > 0) {
-            $stokAwal = (float)$outletRow->stok_awal;
-        } else {
-            $ot = $outletRow?->outlet ?? \App\Models\Outlet::find($outletId);
-            $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
-            if ($isHolding) {
-                $stokAwal = (float)$this->stok_awal;
+        if (!$hasInitialMov) {
+            $outletRow = $this->relationLoaded('outletIngredients')
+                ? $this->outletIngredients->firstWhere('outlet_id', $outletId)
+                : $this->outletIngredients()->where('outlet_id', $outletId)->first();
+
+            if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                $stokAwal = (float)$outletRow->stok_awal;
+            } else {
+                $ot = $outletRow?->outlet ?? \App\Models\Outlet::find($outletId);
+                $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
+                if ($isHolding) {
+                    $stokAwal = (float)$this->stok_awal;
+                }
             }
         }
 
@@ -132,6 +139,10 @@ class Ingredient extends Model
 
     public function consolidatedStock(): float
     {
+        $hasInitialMov = StockMovement::where('ingredient_id', $this->id)
+            ->where('type', 'INITIAL')
+            ->exists();
+
         if ($this->precomputedMovements !== null) {
             $movSum = (float) array_sum($this->precomputedMovements);
         } elseif ($this->relationLoaded('movements')) {
@@ -142,12 +153,15 @@ class Ingredient extends Model
                 ->value('net_qty') ?? 0.0;
         }
 
-        $initialSum = $this->relationLoaded('outletIngredients')
-            ? (float) $this->outletIngredients->sum('stok_awal')
-            : (float) $this->outletIngredients()->sum('stok_awal');
+        $initialSum = 0.0;
+        if (!$hasInitialMov) {
+            $initialSum = $this->relationLoaded('outletIngredients')
+                ? (float) $this->outletIngredients->sum('stok_awal')
+                : (float) $this->outletIngredients()->sum('stok_awal');
 
-        if ($initialSum <= 0) {
-            $initialSum = (float) $this->stok_awal;
+            if ($initialSum <= 0) {
+                $initialSum = (float) $this->stok_awal;
+            }
         }
         return round($initialSum + $movSum, 3);
     }
@@ -228,13 +242,21 @@ class Ingredient extends Model
             ? $this->outletIngredients->keyBy('outlet_id')
             : $this->outletIngredients()->get()->keyBy('outlet_id');
 
+        $initialMovOids = StockMovement::where('ingredient_id', $this->id)
+            ->where('type', 'INITIAL')
+            ->pluck('outlet_id')
+            ->all();
+
         foreach ($outlets as $outlet) {
             $outletRow = $outletIngs[$outlet->id] ?? null;
+            $hasInitMov = in_array($outlet->id, $initialMovOids);
             $initial = 0.0;
-            if ($outletRow && (float)$outletRow->stok_awal > 0) {
-                $initial = (float)$outletRow->stok_awal;
-            } elseif ($outlet->is_main || (int)$outlet->id === 1) {
-                $initial = (float)$this->stok_awal;
+            if (!$hasInitMov) {
+                if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                    $initial = (float)$outletRow->stok_awal;
+                } elseif ($outlet->is_main || (int)$outlet->id === 1) {
+                    $initial = (float)$this->stok_awal;
+                }
             }
 
             $netMov = isset($movementsGrouped[$outlet->id]) ? (float) $movementsGrouped[$outlet->id] : 0.0;
@@ -409,16 +431,25 @@ class Ingredient extends Model
         $outletRow = OutletIngredient::where('outlet_id', $outletId)->where('ingredient_id', $this->id)->first();
         $ot = \App\Models\Outlet::find($outletId);
         $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
+
+        $hasInitialMov = StockMovement::where('ingredient_id', $this->id)
+            ->where('outlet_id', $outletId)
+            ->where('type', 'INITIAL')
+            ->exists();
+
         $initialStock = 0.0;
-        if ($outletRow && (float)$outletRow->stok_awal > 0) {
-            $initialStock = (float)$outletRow->stok_awal;
-        } elseif ($isHolding) {
-            $initialStock = (float)$this->stok_awal;
+        if (!$hasInitialMov) {
+            if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                $initialStock = (float)$outletRow->stok_awal;
+            } elseif ($isHolding) {
+                $initialStock = (float)$this->stok_awal;
+            }
         }
         $initialHarga = $outletRow && $outletRow->harga !== null ? (float)$outletRow->harga : (float)$this->harga;
         $initialCostPerPakai = $initialHarga / $konversi;
 
         $runningStock = max($initialStock, 0.0);
+        $runningNominal = round($runningStock * $initialCostPerPakai, 2);
         $runningCostPerPakai = $initialCostPerPakai;
         $lastPurchasePrice = $initialHarga;
 
@@ -441,46 +472,40 @@ class Ingredient extends Model
 
                 $costBefore = $runningCostPerPakai;
 
-                // ⚡ PERPETUAL WEIGHTED MOVING AVERAGE:
-                // Mengambil nilai sisa saldo stok terakhir sebelum mutasi masuk ini
-                if ($runningStock <= 0) {
-                    $costAfter = $incomingPricePerPakai;
+                if ($m->total_price > 0 && $qty > 0) {
+                    $inVal = (float)$m->total_price;
                 } else {
-                    $stockBeforeVal = $runningStock * $costBefore;
-                    $incomingVal = $qty * $incomingPricePerPakai;
-                    $newTotalQty = $runningStock + $qty;
-                    $costAfter = $newTotalQty > 0 ? (($stockBeforeVal + $incomingVal) / $newTotalQty) : $incomingPricePerPakai;
+                    $inVal = $qty * $incomingPricePerPakai;
                 }
+
+                $runningStock += $qty;
+                $runningNominal += $inVal;
+                $costAfter = $runningStock > 0 ? ($runningNominal / $runningStock) : $incomingPricePerPakai;
 
                 $m->cost_before = round($costBefore, 2);
                 $m->cost_after = round($costAfter, 2);
                 $m->saveQuietly();
 
                 $runningCostPerPakai = $costAfter;
-                $runningStock += $qty;
             } elseif (in_array($m->type, ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS'])) {
                 $costBefore = $runningCostPerPakai;
                 if ($m->unit_price > 0) {
                     $incomingPricePerBeli = (float)$m->unit_price;
                     $incomingPricePerPakai = $incomingPricePerBeli / $konversi;
-                    if ($runningStock <= 0) {
-                        $costAfter = $incomingPricePerPakai;
-                    } else {
-                        $stockBeforeVal = $runningStock * $costBefore;
-                        $incomingVal = $qty * $incomingPricePerPakai;
-                        $newTotalQty = $runningStock + $qty;
-                        $costAfter = $newTotalQty > 0 ? (($stockBeforeVal + $incomingVal) / $newTotalQty) : $runningCostPerPakai;
-                    }
+                    $inVal = $qty * $incomingPricePerPakai;
                 } else {
-                    $costAfter = $runningCostPerPakai;
+                    $inVal = $qty * $runningCostPerPakai;
                 }
+
+                $runningStock += $qty;
+                $runningNominal += $inVal;
+                $costAfter = $runningStock > 0 ? ($runningNominal / $runningStock) : $runningCostPerPakai;
 
                 $m->cost_before = round($costBefore, 2);
                 $m->cost_after = round($costAfter, 2);
                 $m->saveQuietly();
 
                 $runningCostPerPakai = $costAfter;
-                $runningStock += $qty;
             } elseif ($m->type === 'TRANSFER_OUT') {
                 // Transfer keluar: HPP dan harga transfer diperbarui sesuai moving average cabang asal saat transaksi terjadi
                 $currentPricePerBeli = round($runningCostPerPakai * $konversi, 2);
@@ -521,14 +546,16 @@ class Ingredient extends Model
                 }
 
                 $runningStock -= $qty;
+                $runningNominal -= $currentTotalPrice;
             } else {
                 // Mutasi keluar lainnya (SALE_USAGE, WASTE, ADJUSTMENT_OUT, PREP_USAGE)
-                // Barang keluar hanya mengambil nilai rata-rata terakhir untuk digunakan
+                $outVal = $qty * $runningCostPerPakai;
                 $m->cost_before = round($runningCostPerPakai, 2);
                 $m->cost_after = round($runningCostPerPakai, 2);
                 $m->saveQuietly();
 
                 $runningStock -= $qty;
+                $runningNominal -= $outVal;
             }
         }
 

@@ -389,6 +389,12 @@ class ReceivableController extends Controller
 
     public function addPayment(Request $request, Receivable $receivable)
     {
+        if ($receivable->ar_type === 'MERCHANT_ECOMMERCE') {
+            return response()->json([
+                'message' => 'AR E-Commerce tidak dapat dibayar atau dicairkan secara manual di POS karena pencairannya diproses langsung dari aplikasi e-commerce terkait. Buku piutang e-commerce hanya berfungsi untuk rekonsiliasi / cross-check besaran transaksi.'
+            ], 422);
+        }
+
         $data = $request->validate([
             'amount'         => 'required|numeric|min:1',
             'payment_date'   => 'required|date',
@@ -464,9 +470,10 @@ class ReceivableController extends Controller
         $user = $request->user();
         $paymentAmount = (float)$data['amount'];
 
-        // Find candidate unpaid receivables
+        // Find candidate unpaid receivables (exclude E-Commerce since it settles automatically via e-commerce apps)
         $query = Receivable::where('status', '!=', 'PAID')
             ->where('status', '!=', 'CANCELLED')
+            ->where('ar_type', '!=', 'MERCHANT_ECOMMERCE')
             ->where('remaining_amount', '>', 0);
 
         if (!empty($data['receivable_ids'])) {
@@ -685,6 +692,8 @@ class ReceivableController extends Controller
 
     /**
      * Merchant Settlement Summary view: grouped by merchant channel (QRIS, GrabFood, GoFood, etc.)
+    /**
+     * Merchant Settlement Summary view: grouped by merchant channel (QRIS, GrabFood, GoFood, etc.)
      */
     public function byMerchant(Request $request)
     {
@@ -694,10 +703,11 @@ class ReceivableController extends Controller
 
         $this->syncMerchantReceivables($user?->business_id, $outletId);
 
-        $query = Receivable::with(['outlet', 'payments.receiver'])
+        $query = Receivable::with(['outlet', 'payments.receiver', 'shift.user', 'transaction.shift.user', 'transaction.user'])
             ->whereIn('ar_type', ['MERCHANT_QRIS', 'MERCHANT_ECOMMERCE'])
             ->where('status', '!=', 'CANCELLED')
-            ->orderBy('issue_date', 'desc');
+            ->orderBy('issue_date', 'desc')
+            ->orderBy('id', 'desc');
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
@@ -720,6 +730,7 @@ class ReceivableController extends Controller
             $query->where(function ($sub) use ($q) {
                 $sub->where('merchant_channel', 'like', "%{$q}%")
                     ->orWhere('order_number', 'like', "%{$q}%")
+                    ->orWhere('customer_name', 'like', "%{$q}%")
                     ->orWhere('notes', 'like', "%{$q}%");
             });
         }
@@ -780,6 +791,272 @@ class ReceivableController extends Controller
                 'ecom_gross'        => (float)$all->where('ar_type', 'MERCHANT_ECOMMERCE')->sum('total_amount'),
                 'ecom_net'          => (float)$all->where('ar_type', 'MERCHANT_ECOMMERCE')->sum('net_amount'),
             ]
+        ]);
+    }
+
+    /**
+     * Hierarchical E-Commerce Reconciliation view:
+     * Level 1: Tanggal (Date) -> Level 2: Shift -> Level 3: Individual Orders
+     */
+    public function ecommerceGrouped(Request $request)
+    {
+        $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+
+        $this->syncMerchantReceivables($user?->business_id, $outletId);
+
+        $query = Receivable::with([
+            'outlet',
+            'shift.user',
+            'transaction.shift.user',
+            'transaction.user',
+            'payments.receiver'
+        ])
+            ->where('ar_type', 'MERCHANT_ECOMMERCE')
+            ->where('status', '!=', 'CANCELLED')
+            ->orderBy('issue_date', 'desc')
+            ->orderBy('id', 'desc');
+
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $query->where('outlet_id', $outletId);
+        }
+
+        if ($request->filled('channel') && $request->channel !== 'ALL' && $request->channel !== 'all') {
+            $query->where('merchant_channel', $request->channel);
+        }
+
+        if ($request->filled('from')) {
+            $query->where('issue_date', '>=', $request->from);
+        }
+        if ($request->filled('to')) {
+            $query->where('issue_date', '<=', $request->to);
+        }
+
+        if ($request->filled('q')) {
+            $q = trim($request->q);
+            $query->where(function ($sub) use ($q) {
+                $sub->where('merchant_channel', 'like', "%{$q}%")
+                    ->orWhere('order_number', 'like', "%{$q}%")
+                    ->orWhere('customer_name', 'like', "%{$q}%")
+                    ->orWhere('notes', 'like', "%{$q}%");
+            });
+        }
+
+        $allRows = $query->get();
+
+        // Level 1: Group by issue_date (Date)
+        $dateGrouped = $allRows->groupBy(function ($item) {
+            return is_string($item->issue_date) ? substr($item->issue_date, 0, 10) : ($item->issue_date?->toDateString() ?: 'NO_DATE');
+        });
+
+        $tree = [];
+        foreach ($dateGrouped as $dateKey => $dateItems) {
+            $dateGross = (float)$dateItems->sum('total_amount');
+            $dateMdr = (float)$dateItems->sum('mdr_fee');
+            $dateNet = (float)$dateItems->sum('net_amount');
+
+            // Level 2: Group by shift
+            $shiftGrouped = $dateItems->groupBy(function ($item) {
+                $shiftId = $item->shift_id ?: ($item->transaction?->shift_id);
+                return $shiftId ? (string)$shiftId : 'NO_SHIFT';
+            });
+
+            $shiftList = [];
+            foreach ($shiftGrouped as $shiftKey => $shiftItems) {
+                $first = $shiftItems->first();
+                $shiftModel = $first->shift ?: $first->transaction?->shift;
+                $cashierName = $shiftModel?->user?->name ?: $first->transaction?->user?->name ?: $first->creator?->name ?: 'Kasir';
+
+                $shiftGross = (float)$shiftItems->sum('total_amount');
+                $shiftMdr = (float)$shiftItems->sum('mdr_fee');
+                $shiftNet = (float)$shiftItems->sum('net_amount');
+                $shiftMdrPct = $shiftGross > 0 ? round(($shiftMdr / $shiftGross) * 100, 1) : 0;
+
+                $shiftName = $shiftModel ? ($shiftModel->name ?: "Shift #{$shiftModel->id}") : ($shiftKey === 'NO_SHIFT' ? 'Transaksi Tanpa Sesi Shift' : "Shift #{$shiftKey}");
+
+                $shiftList[] = [
+                    'shift_key'      => $shiftKey,
+                    'shift_id'       => $shiftModel?->id ?: ($shiftKey === 'NO_SHIFT' ? null : (int)$shiftKey),
+                    'shift_name'     => $shiftName,
+                    'shift_status'   => $shiftModel?->status ?: 'CLOSED',
+                    'cashier_name'   => $cashierName,
+                    'opened_at'      => $shiftModel?->opened_at,
+                    'closed_at'      => $shiftModel?->closed_at,
+                    'initial_cash'   => $shiftModel ? (float)$shiftModel->initial_cash : 0,
+                    'total_orders'   => $shiftItems->count(),
+                    'total_gross'    => $shiftGross,
+                    'total_mdr'      => $shiftMdr,
+                    'total_net'      => $shiftNet,
+                    'mdr_pct'        => $shiftMdrPct,
+                    'channels'       => $shiftItems->pluck('merchant_channel')->unique()->values()->all(),
+                    'orders'         => $shiftItems->values(),
+                ];
+            }
+
+            // Sort shifts (newest shift ID first)
+            usort($shiftList, function ($a, $b) {
+                return ($b['shift_id'] ?? 0) <=> ($a['shift_id'] ?? 0);
+            });
+
+            $tree[] = [
+                'date'           => $dateKey,
+                'total_orders'   => $dateItems->count(),
+                'total_gross'    => $dateGross,
+                'total_mdr'      => $dateMdr,
+                'total_net'      => $dateNet,
+                'mdr_pct'        => $dateGross > 0 ? round(($dateMdr / $dateGross) * 100, 1) : 0,
+                'shifts_count'   => count($shiftList),
+                'channels'       => $dateItems->pluck('merchant_channel')->unique()->values()->all(),
+                'shifts'         => $shiftList,
+            ];
+        }
+
+        // Channels list for dropdown filters
+        $availableChannels = $allRows->pluck('merchant_channel')->filter()->unique()->values()->all();
+
+        return response()->json([
+            'data'     => $tree,
+            'all_rows' => $allRows,
+            'summary'  => [
+                'total_dates'     => count($tree),
+                'total_orders'    => $allRows->count(),
+                'total_gross'     => (float)$allRows->sum('total_amount'),
+                'total_mdr'       => (float)$allRows->sum('mdr_fee'),
+                'total_net'       => (float)$allRows->sum('net_amount'),
+                'overall_mdr_pct' => (float)$allRows->sum('total_amount') > 0
+                    ? round(((float)$allRows->sum('mdr_fee') / (float)$allRows->sum('total_amount')) * 100, 1)
+                    : 0,
+                'channels'        => $availableChannels,
+            ]
+        ]);
+    }
+
+    /**
+     * Update Net Amount for a single E-Commerce / Merchant Receivable (Auto-calculates Fee & Rate)
+     */
+    public function updateNetAmount(Request $request, $id)
+    {
+        $request->validate([
+            'net_amount' => 'required|numeric|min:0',
+            'notes'      => 'nullable|string',
+        ]);
+
+        $receivable = Receivable::findOrFail($id);
+        $user = $request->user();
+
+        $gross = (float)$receivable->total_amount;
+        $net = (float)$request->net_amount;
+        $fee = max(0, round($gross - $net, 2));
+        $rate = $gross > 0 ? round(($fee / $gross) * 100, 2) : 0;
+
+        $receivable->update([
+            'net_amount'       => $net,
+            'mdr_fee'          => $fee,
+            'mdr_rate'         => $rate,
+            'remaining_amount' => $net,
+            'notes'            => $request->notes ?? $receivable->notes,
+            'updated_by'       => $user?->id,
+        ]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Net amount dan potongan fee berhasil diperbarui!',
+            'data'    => $receivable->fresh(['outlet', 'shift.user', 'transaction.shift.user', 'transaction.user']),
+        ]);
+    }
+
+    /**
+     * Batch update Total Net Amount at Shift Level / Date Level (Auto-distributes across orders & calculates Fee)
+     */
+    public function updateShiftNetAmount(Request $request)
+    {
+        $request->validate([
+            'total_net_amount' => 'required|numeric|min:0',
+            'shift_id'         => 'nullable',
+            'date'             => 'nullable|date',
+            'receivable_ids'   => 'nullable|array',
+            'receivable_ids.*' => 'integer|exists:receivables,id',
+            'merchant_channel' => 'nullable|string',
+        ]);
+
+        $user = $request->user();
+        $targetNet = (float)$request->total_net_amount;
+
+        $query = Receivable::where('ar_type', 'MERCHANT_ECOMMERCE');
+
+        if (!empty($request->receivable_ids)) {
+            $query->whereIn('id', $request->receivable_ids);
+        } else {
+            if ($request->filled('shift_id')) {
+                if ($request->shift_id === 'NO_SHIFT' || $request->shift_id === 0 || $request->shift_id === '0') {
+                    $query->whereNull('shift_id');
+                } else {
+                    $query->where('shift_id', $request->shift_id);
+                }
+            }
+            if ($request->filled('date')) {
+                $query->where('issue_date', $request->date);
+            }
+            if ($request->filled('merchant_channel') && $request->merchant_channel !== 'ALL') {
+                $query->where('merchant_channel', $request->merchant_channel);
+            }
+        }
+
+        $items = $query->get();
+
+        if ($items->isEmpty()) {
+            return response()->json([
+                'message' => 'Tidak ditemukan transaksi E-Commerce untuk sesi shift / filter ini.'
+            ], 404);
+        }
+
+        $totalGross = (float)$items->sum('total_amount');
+        $totalFee = max(0, round($totalGross - $targetNet, 2));
+        $overallRate = $totalGross > 0 ? round(($totalFee / $totalGross) * 100, 2) : 0;
+
+        $updatedItems = [];
+
+        DB::transaction(function () use ($items, $targetNet, $totalGross, $user, &$updatedItems) {
+            $allocatedNetSum = 0.0;
+            $count = count($items);
+
+            foreach ($items as $idx => $item) {
+                if ($totalGross > 0) {
+                    if ($idx === ($count - 1)) {
+                        // Last item gets the remainder to eliminate rounding variance
+                        $itemNet = round(max(0, $targetNet - $allocatedNetSum), 2);
+                    } else {
+                        $itemNet = round(($item->total_amount / $totalGross) * $targetNet, 2);
+                        $allocatedNetSum += $itemNet;
+                    }
+                } else {
+                    $itemNet = round($targetNet / $count, 2);
+                }
+
+                $itemFee = max(0, round($item->total_amount - $itemNet, 2));
+                $itemRate = $item->total_amount > 0 ? round(($itemFee / $item->total_amount) * 100, 2) : 0;
+
+                $item->update([
+                    'net_amount'       => $itemNet,
+                    'mdr_fee'          => $itemFee,
+                    'mdr_rate'         => $itemRate,
+                    'remaining_amount' => $itemNet,
+                    'updated_by'       => $user?->id,
+                ]);
+
+                $updatedItems[] = $item->fresh(['outlet', 'shift.user', 'transaction.shift.user', 'transaction.user']);
+            }
+        });
+
+        return response()->json([
+            'success'          => true,
+            'message'          => "Berhasil memperbarui Net Amount Total Shift menjadi Rp " . number_format($targetNet, 0, ',', '.') . " (Fee: Rp " . number_format($totalFee, 0, ',', '.') . " / {$overallRate}%) pada " . count($updatedItems) . " pesanan!",
+            'total_net_amount' => $targetNet,
+            'total_mdr_fee'    => $totalFee,
+            'overall_rate'     => $overallRate,
+            'updated_count'    => count($updatedItems),
+            'data'             => $updatedItems,
         ]);
     }
 
@@ -914,6 +1191,16 @@ class ReceivableController extends Controller
     {
         if (!$businessId) return;
 
+        // Perform fast backfill for missing shift_id if any
+        try {
+            DB::statement("
+                UPDATE receivables r
+                INNER JOIN transactions t ON r.transaction_id = t.id
+                SET r.shift_id = t.shift_id
+                WHERE r.business_id = {$businessId} AND r.shift_id IS NULL AND t.shift_id IS NOT NULL
+            ");
+        } catch (\Throwable $e) {}
+
         $query = \App\Models\Transaction::where('business_id', $businessId)
             ->where('status', 'PAID')
             ->whereNotNull('order_number')
@@ -967,6 +1254,7 @@ class ReceivableController extends Controller
                 'business_id'       => $businessId,
                 'outlet_id'         => $first->outlet_id,
                 'transaction_id'    => $first->id,
+                'shift_id'          => $first->shift_id,
                 'customer_id'       => $first->customer_id,
                 'ar_type'           => $arType,
                 'merchant_channel'  => $channel,
@@ -990,4 +1278,5 @@ class ReceivableController extends Controller
         }
     }
 }
+
 

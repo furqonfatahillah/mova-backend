@@ -40,8 +40,51 @@ class ExpenseController extends Controller
             $query->where('category', $request->category);
         }
 
-        if ($request->filled('payment_method') && $request->payment_method !== 'ALL') {
-            $query->where('payment_method', $request->payment_method);
+        if ($request->filled('payment_method') && strtoupper($request->payment_method) !== 'ALL') {
+            $rawPm = $request->payment_method;
+            $pmList = is_array($rawPm) ? $rawPm : explode(',', $rawPm);
+            $pmList = array_map(fn($v) => strtoupper(trim($v)), array_filter($pmList));
+
+            if (count($pmList) > 0 && !in_array('ALL', $pmList)) {
+                $query->where(function($q) use ($pmList) {
+                    foreach ($pmList as $idx => $pm) {
+                        $clause = function($subQ) use ($pm) {
+                            if ($pm === 'NON_CASH' || $pm === 'ALL_NON_CASH') {
+                                $subQ->where(function($inner) {
+                                    $inner->where('payment_method', 'like', '%QRIS%')
+                                          ->orWhere('payment_method', 'like', '%TRANSFER%')
+                                          ->orWhere('payment_method', 'like', '%DEBIT%')
+                                          ->orWhere('payment_method', 'like', '%EDC%');
+                                });
+                            } elseif ($pm === 'CASH_ALL' || $pm === 'CASH_AND_PETTY' || $pm === 'CASH' || $pm === 'TUNAI' || $pm === 'PETTY_CASH') {
+                                $subQ->where(function($inner) {
+                                    $inner->whereIn('payment_method', ['CASH', 'TUNAI', 'PETTY_CASH'])
+                                          ->orWhere('payment_method', 'like', '%TUNAI%')
+                                          ->orWhere('payment_method', 'like', '%CASH%')
+                                          ->orWhere('payment_method', 'like', '%PETTY%');
+                                });
+                            } elseif ($pm === 'TRANSFER') {
+                                $subQ->where('payment_method', 'like', '%TRANSFER%');
+                            } elseif ($pm === 'QRIS') {
+                                $subQ->where('payment_method', 'like', '%QRIS%');
+                            } elseif ($pm === 'DEBIT') {
+                                $subQ->where(function($inner) {
+                                    $inner->where('payment_method', 'like', '%DEBIT%')
+                                          ->orWhere('payment_method', 'like', '%EDC%');
+                                });
+                            } else {
+                                $subQ->where('payment_method', $pm);
+                            }
+                        };
+
+                        if ($idx === 0) {
+                            $q->where($clause);
+                        } else {
+                            $q->orWhere($clause);
+                        }
+                    }
+                });
+            }
         }
 
         if ($request->filled('search')) {

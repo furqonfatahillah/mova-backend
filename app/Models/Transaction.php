@@ -37,9 +37,22 @@ class Transaction extends Model
         'table_number',
         'payment_method',
         'payment_method_id',
+        'dp_payment_method',
+        'dp_reference_no',
         'is_urgent_note',
         'urgent_status',
         'notes',
+        'cancellation_reason',
+        'void_type',
+        'cancelled_at',
+        'cancelled_by',
+        'void_requested_by',
+        'void_requested_at',
+        'void_approved_by',
+        'void_approved_at',
+        'void_rejected_by',
+        'void_rejected_at',
+        'void_reject_reason',
         'user_id',
         'shift_id',
         'outlet_id',
@@ -62,12 +75,61 @@ class Transaction extends Model
         return $query->where('status', 'CANCELLED');
     }
 
+    public function scopeVoidPending($query)
+    {
+        return $query->where('status', 'VOID_PENDING');
+    }
+
     protected $appends = [
         'created_by_name',
         'updated_by_name',
+        'cancelled_by_name',
+        'void_requested_by_name',
+        'void_approved_by_name',
+        'void_rejected_by_name',
         'changed_at',
         'changed_by_name',
     ];
+
+    public function cancelledByUser()
+    {
+        return $this->belongsTo(User::class, 'cancelled_by');
+    }
+
+    public function getCancelledByNameAttribute(): ?string
+    {
+        return $this->cancelledByUser?->name;
+    }
+
+    public function voidRequestedByUser()
+    {
+        return $this->belongsTo(User::class, 'void_requested_by');
+    }
+
+    public function getVoidRequestedByNameAttribute(): ?string
+    {
+        return $this->voidRequestedByUser?->name;
+    }
+
+    public function voidApprovedByUser()
+    {
+        return $this->belongsTo(User::class, 'void_approved_by');
+    }
+
+    public function getVoidApprovedByNameAttribute(): ?string
+    {
+        return $this->voidApprovedByUser?->name;
+    }
+
+    public function voidRejectedByUser()
+    {
+        return $this->belongsTo(User::class, 'void_rejected_by');
+    }
+
+    public function getVoidRejectedByNameAttribute(): ?string
+    {
+        return $this->voidRejectedByUser?->name;
+    }
 
     protected $casts = [
         'qty'            => 'integer',

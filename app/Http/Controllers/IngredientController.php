@@ -415,30 +415,39 @@ class IngredientController extends Controller
                 }
 
                 // Match strictly by (business_id, code) so custom codes are honored per business
+                $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
+
+                $ingData = [
+                    'name'                => $name,
+                    'category_id'         => $cat->id,
+                    'category'            => $cat->name,
+                    'type'                => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
+                    'unit_beli'           => $unitBeliInfo['symbol'],
+                    'unit_pakai'          => $unitPakaiInfo['symbol'],
+                    'unit_beli_id'        => $unitBeliInfo['id'],
+                    'unit_pakai_id'       => $unitPakaiInfo['id'],
+                    'konversi'            => $konversi,
+                    'stok_min'            => $minStok,
+                    'tolerance'           => (float)($row['tolerance'] ?? 5),
+                    'notes'               => $row['notes'] ?? 'Imported from Excel',
+                    'created_by'          => $user?->id,
+                    'updated_by'          => $user?->id,
+                ];
+
+                if ($hargaBeli > 0 || !$existingIng) {
+                    $ingData['harga'] = $hargaBeli;
+                    $ingData['last_purchase_price'] = $hargaBeli;
+                }
+                if ($initialStock > 0 || !$existingIng) {
+                    $ingData['stok_awal'] = $initialStock;
+                }
+
                 $ing = Ingredient::updateOrCreate(
                     [
                         'business_id' => $businessId,
                         'code'        => $code,
                     ],
-                    [
-                        'name'                => $name,
-                        'category_id'         => $cat->id,
-                        'category'            => $cat->name,
-                        'type'                => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
-                        'unit_beli'           => $unitBeliInfo['symbol'],
-                        'unit_pakai'          => $unitPakaiInfo['symbol'],
-                        'unit_beli_id'        => $unitBeliInfo['id'],
-                        'unit_pakai_id'       => $unitPakaiInfo['id'],
-                        'konversi'            => $konversi,
-                        'harga'               => $hargaBeli,
-                        'last_purchase_price' => $hargaBeli,
-                        'stok_min'            => $minStok,
-                        'stok_awal'           => $initialStock,
-                        'tolerance'           => (float)($row['tolerance'] ?? 5),
-                        'notes'               => $row['notes'] ?? 'Imported from Excel',
-                        'created_by'          => $user?->id,
-                        'updated_by'          => $user?->id,
-                    ]
+                    $ingData
                 );
 
                 $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
@@ -469,14 +478,14 @@ class IngredientController extends Controller
                     ]);
                     $isTarget = ((int)$bo->id === (int)$targetOutletId);
 
-                    if ($isTarget) {
+                    if ($initialStock > 0 && $isTarget) {
                         $outletRow->stok_awal = $initialStock;
                     } elseif ($outletRow->stok_awal === null) {
                         $outletRow->stok_awal = 0.0;
                     }
-                    if ($minStok > 0 || $outletRow->stok_min === null) {
-                        $outletRow->stok_min = $minStok;
-                    }
+
+                    $outletRow->stok_min = $minStok;
+
                     if ($hargaBeli > 0 || $outletRow->harga === null) {
                         $outletRow->harga = $hargaBeli;
                         $outletRow->last_purchase_price = $hargaBeli;
@@ -489,7 +498,7 @@ class IngredientController extends Controller
         });
 
         return response()->json([
-            'message' => "Berhasil meng-import {$importedCount} master bahan lengkap beserta saldo awal dan harga.",
+            'message' => "Berhasil meng-import {$importedCount} master bahan terpusat.",
             'imported_count' => $importedCount,
         ]);
     }
@@ -582,30 +591,39 @@ class IngredientController extends Controller
                 }
 
                 // Match strictly by (business_id, code) so custom codes are honored per business
+                $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
+
+                $ingData = [
+                    'name'                => $name,
+                    'category_id'         => $cat->id,
+                    'category'            => $cat->name,
+                    'type'                => 'RAW',
+                    'unit_beli'           => $unitBeliInfo['symbol'],
+                    'unit_pakai'          => $unitPakaiInfo['symbol'],
+                    'unit_beli_id'        => $unitBeliInfo['id'],
+                    'unit_pakai_id'       => $unitPakaiInfo['id'],
+                    'konversi'            => $konversi,
+                    'stok_min'            => $minStok,
+                    'tolerance'           => (float)($row['tolerance'] ?? 5),
+                    'notes'               => $row['notes'] ?? 'Imported Perlengkapan from Excel',
+                    'created_by'          => $user?->id,
+                    'updated_by'          => $user?->id,
+                ];
+
+                if ($hargaBeli > 0 || !$existingIng) {
+                    $ingData['harga'] = $hargaBeli;
+                    $ingData['last_purchase_price'] = $hargaBeli;
+                }
+                if ($initialStock > 0 || !$existingIng) {
+                    $ingData['stok_awal'] = $initialStock;
+                }
+
                 $ing = Ingredient::updateOrCreate(
                     [
                         'business_id' => $businessId,
                         'code'        => $code,
                     ],
-                    [
-                        'name'                => $name,
-                        'category_id'         => $cat->id,
-                        'category'            => $cat->name,
-                        'type'                => 'RAW',
-                        'unit_beli'           => $unitBeliInfo['symbol'],
-                        'unit_pakai'          => $unitPakaiInfo['symbol'],
-                        'unit_beli_id'        => $unitBeliInfo['id'],
-                        'unit_pakai_id'       => $unitPakaiInfo['id'],
-                        'konversi'            => $konversi,
-                        'harga'               => $hargaBeli,
-                        'last_purchase_price' => $hargaBeli,
-                        'stok_min'            => $minStok,
-                        'stok_awal'           => $initialStock,
-                        'tolerance'           => (float)($row['tolerance'] ?? 5),
-                        'notes'               => $row['notes'] ?? 'Imported Perlengkapan from Excel',
-                        'created_by'          => $user?->id,
-                        'updated_by'          => $user?->id,
-                    ]
+                    $ingData
                 );
 
                 $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
@@ -636,14 +654,14 @@ class IngredientController extends Controller
                     ]);
                     $isTarget = ((int)$bo->id === (int)$targetOutletId);
 
-                    if ($isTarget) {
+                    if ($initialStock > 0 && $isTarget) {
                         $outletRow->stok_awal = $initialStock;
                     } elseif ($outletRow->stok_awal === null) {
                         $outletRow->stok_awal = 0.0;
                     }
-                    if ($minStok > 0 || $outletRow->stok_min === null) {
-                        $outletRow->stok_min = $minStok;
-                    }
+
+                    $outletRow->stok_min = $minStok;
+
                     if ($hargaBeli > 0 || $outletRow->harga === null) {
                         $outletRow->harga = $hargaBeli;
                         $outletRow->last_purchase_price = $hargaBeli;
@@ -656,7 +674,7 @@ class IngredientController extends Controller
         });
 
         return response()->json([
-            'message' => "Berhasil meng-import {$importedCount} data master perlengkapan lengkap beserta saldo awal dan harga.",
+            'message' => "Berhasil meng-import {$importedCount} data master perlengkapan & packaging terpusat.",
             'imported_count' => $importedCount,
         ]);
     }

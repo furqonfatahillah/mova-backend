@@ -61,6 +61,7 @@ class Receivable extends Model
         'progress_pct',
         'created_by_name',
         'updated_by_name',
+        'shift_name',
     ];
 
     public static function generateReceivableNo(?int $businessId, string $date): string
@@ -151,5 +152,19 @@ class Receivable extends Model
     {
         if ($this->total_amount <= 0) return 100.0;
         return round(($this->paid_amount / $this->total_amount) * 100, 1);
+    }
+
+    public function getShiftNameAttribute(): ?string
+    {
+        if ($this->relationLoaded('shift') && $this->shift) {
+            return $this->shift->shift_name ?: "Shift #{$this->shift->id}";
+        }
+        if ($this->shift_id) {
+            $s = Shift::find($this->shift_id);
+            if ($s) {
+                return $s->shift_name ?: "Shift #{$s->id}";
+            }
+        }
+        return null;
     }
 }

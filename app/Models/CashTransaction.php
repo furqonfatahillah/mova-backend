@@ -72,6 +72,7 @@ class CashTransaction extends Model
             'LOAN_REPAYMENT'    => ['label' => 'Pembayaran Pokok Pinjaman', 'activity' => 'FINANCING', 'default_type' => 'OUT'],
 
             // OPERATING
+            'SETORAN_KASIR'     => ['label' => 'Setoran Uang Kasir ke Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'IN'],
             'SUPPLIER_PURCHASE' => ['label' => 'Belanja Bahan Baku Langsung', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
             'OTHER_INCOME'      => ['label' => 'Pendapatan Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'IN'],
             'OTHER_EXPENSE'     => ['label' => 'Biaya Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
@@ -81,6 +82,7 @@ class CashTransaction extends Model
     public static function accounts(): array
     {
         return [
+            'KAS_BESAR'   => 'Kas Besar / Brankas Utama',
             'BANK_MAIN'   => 'Rekening Bank Utama Resto',
             'CASH_DRAWER' => 'Kas Toko / Laci Kasir',
             'PETTY_CASH'  => 'Kas Kecil (Petty Cash)',

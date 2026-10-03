@@ -7,6 +7,7 @@ use App\Models\ShiftSchedule;
 use App\Models\Outlet;
 use App\Models\StockMovement;
 use App\Models\Transaction;
+use App\Models\ReceivablePayment;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -38,15 +39,39 @@ class ShiftController extends Controller
         }
 
         if ($request->filled('date')) {
-            $query->whereDate('opened_at', $request->date);
+            $d = $request->date;
+            $query->where(function ($q) use ($d) {
+                $q->whereDate('opened_at', $d)
+                  ->orWhereDate('closed_at', $d);
+            });
         }
 
-        if ($request->from) {
-            $query->whereDate('opened_at', '>=', $request->from);
-        }
-
-        if ($request->to) {
-            $query->whereDate('opened_at', '<=', $request->to);
+        if ($request->from && $request->to) {
+            $from = $request->from;
+            $to = $request->to;
+            $query->where(function ($q) use ($from, $to) {
+                $q->where(function ($sub) use ($from, $to) {
+                    $sub->whereDate('opened_at', '>=', $from)
+                        ->whereDate('opened_at', '<=', $to);
+                })->orWhere(function ($sub) use ($from, $to) {
+                    $sub->whereDate('closed_at', '>=', $from)
+                        ->whereDate('closed_at', '<=', $to);
+                });
+            });
+        } elseif ($request->from) {
+            $from = $request->from;
+            $query->where(function ($q) use ($from) {
+                $q->whereDate('opened_at', '>=', $from)
+                  ->orWhereDate('closed_at', '>=', $from);
+            });
+        } elseif ($request->to) {
+            $to = $request->to;
+            $query->where(function ($q) use ($to) {
+                $q->whereDate('opened_at', '<=', $to)
+                  ->orWhere(function ($sub) use ($to) {
+                      $sub->whereNotNull('closed_at')->whereDate('closed_at', '<=', $to);
+                  });
+            });
         }
 
         if ($request->user_id) {
@@ -89,53 +114,115 @@ class ShiftController extends Controller
             ->select('shift_id', 'payment_method', 'dp_payment_method', 'total_price', 'amount_paid')
             ->get();
 
+        // Fetch receivable payments collected during these shifts
+        $receivablePayments = ReceivablePayment::whereIn('shift_id', $shiftIds)->get();
+        $recPaymentsByShift = $receivablePayments->groupBy('shift_id');
+
         $breakdownByShift = [];
+        foreach ($shiftIds as $sId) {
+            $breakdownByShift[$sId] = [
+                'cash'        => 0.0,
+                'qris'        => 0.0,
+                'grab'        => 0.0,
+                'transfer'    => 0.0,
+                'debit'       => 0.0,
+                'other'       => 0.0,
+                'total_sales' => 0.0,
+                'details'     => [],
+            ];
+        }
+
         foreach ($paidTransactions as $t) {
             $sId = $t->shift_id;
-            if (!isset($breakdownByShift[$sId])) {
-                $breakdownByShift[$sId] = [
-                    'cash'        => 0.0,
-                    'qris'        => 0.0,
-                    'grab'        => 0.0,
-                    'transfer'    => 0.0,
-                    'debit'       => 0.0,
-                    'other'       => 0.0,
-                    'total_sales' => 0.0,
-                    'details'     => [],
-                ];
-            }
+            if (!isset($breakdownByShift[$sId])) continue;
 
             $method = strtoupper(trim($t->payment_method ?? 'CASH'));
             $price = (float)$t->total_price;
             $breakdownByShift[$sId]['total_sales'] += $price;
 
-            if (!isset($breakdownByShift[$sId]['details'][$method])) {
-                $breakdownByShift[$sId]['details'][$method] = 0.0;
-            }
-            $breakdownByShift[$sId]['details'][$method] += $price;
-
             if ($method === 'CASH' || $method === 'TUNAI') {
                 $breakdownByShift[$sId]['cash'] += $price;
+                $breakdownByShift[$sId]['details']['CASH'] = ($breakdownByShift[$sId]['details']['CASH'] ?? 0.0) + $price;
             } elseif (str_contains($method, 'QRIS')) {
                 $breakdownByShift[$sId]['qris'] += $price;
+                $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'GRAB') || str_contains($method, 'GOFOOD') || str_contains($method, 'SHOPEE') || str_contains($method, 'TIKTOK')) {
                 $breakdownByShift[$sId]['grab'] += $price;
+                $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'TRANSFER')) {
                 $breakdownByShift[$sId]['transfer'] += $price;
+                $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'DEBIT') || str_contains($method, 'EDC') || str_contains($method, 'CREDIT') || str_contains($method, 'KARTU')) {
                 $breakdownByShift[$sId]['debit'] += $price;
+                $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
-                $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
-                $dpPaid = (float)($t->amount_paid ?? 0);
-                if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
-                    $breakdownByShift[$sId]['cash'] += $dpPaid;
-                } else {
-                    $breakdownByShift[$sId]['other'] += $dpPaid;
+                // If there are NO receivable payment records for this shift, fallback to amount_paid
+                $hasRp = isset($recPaymentsByShift[$sId]) && $recPaymentsByShift[$sId]->count() > 0;
+                if (!$hasRp) {
+                    $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
+                    $dpPaid = (float)($t->amount_paid ?? 0);
+                    if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
+                        $breakdownByShift[$sId]['cash'] += $dpPaid;
+                    } else {
+                        $breakdownByShift[$sId]['other'] += $dpPaid;
+                    }
+                    if ($dpPaid > 0) {
+                        $breakdownByShift[$sId]['details'][$dpMethod] = ($breakdownByShift[$sId]['details'][$dpMethod] ?? 0.0) + $dpPaid;
+                    }
                 }
             } else {
                 $breakdownByShift[$sId]['other'] += $price;
+                $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             }
         }
+
+        // Add collections from kasbon payments received during each shift
+        foreach ($recPaymentsByShift as $sId => $rpList) {
+            if (!isset($breakdownByShift[$sId])) continue;
+            foreach ($rpList as $rp) {
+                $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
+                $rpAmt = (float)$rp->amount;
+
+                if (!isset($breakdownByShift[$sId]['details'][$rpMethod])) {
+                    $breakdownByShift[$sId]['details'][$rpMethod] = 0.0;
+                }
+                $breakdownByShift[$sId]['details'][$rpMethod] += $rpAmt;
+
+                if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
+                    $breakdownByShift[$sId]['cash'] += $rpAmt;
+                } elseif (str_contains($rpMethod, 'QRIS')) {
+                    $breakdownByShift[$sId]['qris'] += $rpAmt;
+                } elseif (str_contains($rpMethod, 'TRANSFER')) {
+                    $breakdownByShift[$sId]['transfer'] += $rpAmt;
+                } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
+                    $breakdownByShift[$sId]['debit'] += $rpAmt;
+                } else {
+                    $breakdownByShift[$sId]['other'] += $rpAmt;
+                }
+            }
+        }
+
+        // Ensure total_sales is at least the sum of payments received
+        foreach ($shiftIds as $sId) {
+            $totalPayments = $breakdownByShift[$sId]['cash'] +
+                             $breakdownByShift[$sId]['qris'] +
+                             $breakdownByShift[$sId]['grab'] +
+                             $breakdownByShift[$sId]['transfer'] +
+                             $breakdownByShift[$sId]['debit'] +
+                             $breakdownByShift[$sId]['other'];
+            if ($breakdownByShift[$sId]['total_sales'] < $totalPayments) {
+                $breakdownByShift[$sId]['total_sales'] = $totalPayments;
+            }
+        }
+
+        // Fetch relevant closed shifts for the outlets in $shifts to calculate selisih modal awal vs kas fisik akhir shift sebelumnya
+        $outletIds = $shifts->pluck('outlet_id')->unique()->filter()->values();
+        $allClosedShifts = Shift::whereIn('outlet_id', $outletIds)
+            ->where('status', 'CLOSED')
+            ->whereNotNull('closing_cash')
+            ->orderBy('opened_at', 'asc')
+            ->orderBy('id', 'asc')
+            ->get(['id', 'outlet_id', 'shift_name', 'user_id', 'opened_at', 'closed_at', 'closing_cash', 'initial_cash']);
 
         foreach ($shifts as $s) {
             $bd = $breakdownByShift[$s->id] ?? [
@@ -155,8 +242,32 @@ class ShiftController extends Controller
             $s->debit_sales = $bd['debit'];
             $s->other_sales = $bd['other'];
             $s->payment_breakdown = $bd['details'];
-            if ($s->status === 'OPEN' || ($s->system_cash == 0 && $bd['total_sales'] > 0)) {
-                $s->system_cash = $bd['total_sales'];
+            $s->system_cash = $bd['total_sales'];
+
+            // Find latest closed shift on the same outlet prior to this shift
+            $prev = $allClosedShifts
+                ->where('outlet_id', $s->outlet_id)
+                ->filter(function ($cs) use ($s) {
+                    if ($cs->id === $s->id) return false;
+                    if ($cs->opened_at && $s->opened_at) {
+                        if ($cs->opened_at < $s->opened_at) return true;
+                        if ($cs->opened_at == $s->opened_at) return $cs->id < $s->id;
+                    }
+                    return $cs->id < $s->id;
+                })
+                ->last();
+
+            if ($prev && $prev->closing_cash !== null) {
+                $prevClosing = (float)$prev->closing_cash;
+                $s->previous_shift_id = $prev->id;
+                $s->previous_shift_name = $prev->shift_name;
+                $s->previous_shift_closing_cash = $prevClosing;
+                $s->initial_cash_difference = round((float)$s->initial_cash - $prevClosing, 2);
+            } else {
+                $s->previous_shift_id = null;
+                $s->previous_shift_name = null;
+                $s->previous_shift_closing_cash = null;
+                $s->initial_cash_difference = null;
             }
         }
 
@@ -208,9 +319,22 @@ class ShiftController extends Controller
             ]);
         }
 
-        $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
+        $paidTransactions = $shift->transactions()
+            ->where(function ($q) {
+                $q->where(function ($sub) {
+                    $sub->where('status', 'PAID')
+                        ->where(function ($inner) {
+                            $inner->whereNull('split_type')->orWhere('split_type', '!=', 'EQUAL');
+                        });
+                })->orWhere('status', 'SPLIT_CLOSED');
+            })
+            ->get();
         $totalTransactions = $paidTransactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
         $totalSales = (float)$paidTransactions->sum('total_price');
+
+        // Fetch receivable payments collected during this shift
+        $shiftRecPayments = $this->getShiftReceivablePayments($shift);
+        $hasShiftRecPayments = $shiftRecPayments->count() > 0;
 
         $cashSales = 0.0;
         $qrisSales = 0.0;
@@ -224,38 +348,107 @@ class ShiftController extends Controller
         foreach ($paidTransactions as $t) {
             $method = strtoupper(trim($t->payment_method ?? 'CASH'));
             $price = (float)$t->total_price;
-            $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
 
             if ($method === 'CASH' || $method === 'TUNAI') {
                 $cashSales += $price;
+                $paymentBreakdown['CASH'] = ($paymentBreakdown['CASH'] ?? 0.0) + $price;
             } elseif (str_contains($method, 'QRIS')) {
                 $qrisSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'GRAB') || str_contains($method, 'GOFOOD') || str_contains($method, 'SHOPEE') || str_contains($method, 'TIKTOK')) {
                 $grabSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'TRANSFER')) {
                 $transferSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'DEBIT') || str_contains($method, 'EDC') || str_contains($method, 'CREDIT') || str_contains($method, 'KARTU')) {
                 $debitSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
-                $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
-                $dpPaid = (float)($t->amount_paid ?? 0);
-                if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
-                    $cashSales += $dpPaid;
-                } else {
-                    $otherSales += $dpPaid;
-                    $nonCashSales += $dpPaid;
+                if (!$hasShiftRecPayments) {
+                    $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
+                    $dpPaid = (float)($t->amount_paid ?? 0);
+                    if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
+                        $cashSales += $dpPaid;
+                    } else {
+                        $otherSales += $dpPaid;
+                        $nonCashSales += $dpPaid;
+                    }
+                    if ($dpPaid > 0) {
+                        $paymentBreakdown[$dpMethod] = ($paymentBreakdown[$dpMethod] ?? 0.0) + $dpPaid;
+                    }
                 }
             } else {
                 $otherSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             }
         }
 
-        $expectedCash = (float)$shift->initial_cash + $cashSales;
+        // Add collections from kasbon payments received during this shift
+        foreach ($shiftRecPayments as $rp) {
+            $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $rpPrice = (float)$rp->amount;
+            $paymentBreakdown[$rpMethod] = ($paymentBreakdown[$rpMethod] ?? 0.0) + $rpPrice;
+
+            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
+                $cashSales += $rpPrice;
+            } elseif (str_contains($rpMethod, 'QRIS')) {
+                $qrisSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            } elseif (str_contains($rpMethod, 'TRANSFER')) {
+                $transferSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
+                $debitSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            } else {
+                $otherSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            }
+        }
+
+        $totalPaymentsReceived = $cashSales + $nonCashSales;
+        if ($totalSales < $totalPaymentsReceived) {
+            $totalSales = $totalPaymentsReceived;
+        }
+
+        $expData = $this->getShiftExpenses($shift);
+        $expectedCash = max(0, (float)$shift->initial_cash + $cashSales - $expData['cash_expenses']);
+
+        $prevShiftForActive = Shift::where('outlet_id', $shift->outlet_id)
+            ->where('status', 'CLOSED')
+            ->whereNotNull('closing_cash')
+            ->where(function ($q) use ($shift) {
+                if ($shift->opened_at) {
+                    $q->where('opened_at', '<', $shift->opened_at)
+                      ->orWhere(function ($sub) use ($shift) {
+                          $sub->where('opened_at', '=', $shift->opened_at)
+                              ->where('id', '<', $shift->id);
+                      });
+                } else {
+                    $q->where('id', '<', $shift->id);
+                }
+            })
+            ->orderByDesc('opened_at')
+            ->orderByDesc('id')
+            ->first();
+
+        if ($prevShiftForActive && $prevShiftForActive->closing_cash !== null) {
+            $shift->previous_shift_id = $prevShiftForActive->id;
+            $shift->previous_shift_name = $prevShiftForActive->shift_name;
+            $shift->previous_shift_closing_cash = (float)$prevShiftForActive->closing_cash;
+            $shift->initial_cash_difference = round((float)$shift->initial_cash - (float)$prevShiftForActive->closing_cash, 2);
+        } else {
+            $shift->previous_shift_id = null;
+            $shift->previous_shift_name = null;
+            $shift->previous_shift_closing_cash = null;
+            $shift->initial_cash_difference = null;
+        }
 
         return response()->json([
             'shift'              => $shift,
@@ -269,6 +462,10 @@ class ShiftController extends Controller
             'other_sales'        => $otherSales,
             'non_cash_sales'     => $nonCashSales,
             'payment_breakdown'  => $paymentBreakdown,
+            'expenses'           => $expData['expenses'],
+            'total_expenses'     => $expData['total_expenses'],
+            'cash_expenses'      => $expData['cash_expenses'],
+            'non_cash_expenses'  => $expData['non_cash_expenses'],
             'expected_cash'      => $expectedCash,
         ]);
     }
@@ -430,6 +627,192 @@ class ShiftController extends Controller
     }
 
     /**
+     * Get receivable payments (pelunasan kasbon) received during this shift.
+     */
+    protected function getShiftReceivablePayments(Shift $shift)
+    {
+        return ReceivablePayment::with(['receivable.customer', 'receiver'])
+            ->where(function ($query) use ($shift) {
+                $query->where('shift_id', $shift->id)
+                      ->orWhere(function ($q) use ($shift) {
+                          $q->whereNull('shift_id')
+                            ->where('outlet_id', $shift->outlet_id);
+                          if ($shift->opened_at && $shift->closed_at) {
+                              $q->whereBetween('created_at', [$shift->opened_at, $shift->closed_at]);
+                          } elseif ($shift->opened_at) {
+                              $q->where('created_at', '>=', $shift->opened_at);
+                          } else {
+                              $q->whereDate('payment_date', now()->toDateString());
+                          }
+                      });
+            })
+            ->get();
+    }
+
+    /**
+     * Get operating expenses and cash deductions associated with a shift.
+     */
+    protected function getShiftExpenses(Shift $shift): array
+    {
+        $openedAt = $shift->opened_at;
+        $closedAt = $shift->closed_at;
+        $openedDate = $openedAt ? $openedAt->toDateString() : now()->toDateString();
+        $closedDate = $closedAt ? $closedAt->toDateString() : now()->toDateString();
+
+        // 1. Operating Expenses (OPEX)
+        $opexQuery = \App\Models\OperatingExpense::with(['user', 'outlet'])
+            ->where(function ($q) use ($shift) {
+                $q->where('outlet_id', $shift->outlet_id)
+                  ->orWhereNull('outlet_id');
+            });
+
+        if ($shift->business_id) {
+            $opexQuery->where('business_id', $shift->business_id);
+        }
+
+        $opexQuery->where(function ($q) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+            if ($openedAt && $closedAt) {
+                $q->where(function ($sub) use ($openedAt, $closedAt) {
+                    $sub->where('created_at', '>=', $openedAt)
+                        ->where('created_at', '<=', $closedAt);
+                })->orWhere(function ($sub) use ($openedDate, $closedDate) {
+                    $sub->whereBetween('date', [$openedDate, $closedDate]);
+                });
+            } elseif ($openedAt) {
+                $q->where(function ($sub) use ($openedAt) {
+                    $sub->where('created_at', '>=', $openedAt);
+                })->orWhere(function ($sub) use ($openedDate) {
+                    $sub->where('date', '>=', $openedDate);
+                });
+            } else {
+                $q->whereDate('date', now()->toDateString());
+            }
+        });
+
+        $opexList = $opexQuery->orderBy('created_at', 'asc')->get();
+
+        $expenses = [];
+        $totalExpenses = 0.0;
+        $cashExpenses = 0.0;
+        $nonCashExpenses = 0.0;
+
+        foreach ($opexList as $exp) {
+            $amt = (float)$exp->amount;
+            $method = strtoupper(trim($exp->payment_method ?? 'CASH'));
+            $isCash = in_array($method, ['CASH', 'TUNAI', 'PETTY_CASH', 'KAS_KECIL']) ||
+                      str_contains($method, 'CASH') ||
+                      str_contains($method, 'TUNAI') ||
+                      str_contains($method, 'PETTY');
+
+            $totalExpenses += $amt;
+            if ($isCash) {
+                $cashExpenses += $amt;
+            } else {
+                $nonCashExpenses += $amt;
+            }
+
+            $desc = $exp->name ?: ($exp->category_label ?? 'Biaya Operasional');
+            $expenses[] = [
+                'id'                   => $exp->id,
+                'source'               => 'OPERATING_EXPENSE',
+                'expense_no'           => $exp->expense_no,
+                'date'                 => $exp->date ? (is_string($exp->date) ? substr($exp->date, 0, 10) : $exp->date->format('Y-m-d')) : null,
+                'time'                 => $exp->created_at ? $exp->created_at->format('H:i') : '-',
+                'category'             => $exp->category,
+                'category_label'       => $exp->category_label ?? $exp->category,
+                'name'                 => $desc,
+                'description'          => $desc,
+                'amount'               => $amt,
+                'payment_method'       => $exp->payment_method ?? 'CASH',
+                'payment_method_label' => $exp->payment_method_label ?? ($isCash ? 'Tunai / Kas di Laci' : 'Transfer Bank'),
+                'is_cash'              => $isCash,
+                'notes'                => $exp->notes,
+                'user_name'            => $exp->user_name ?? ($exp->user?->name ?? 'Kasir'),
+            ];
+        }
+
+        // 2. Cash Transactions (Type OUT for CASH_DRAWER / PETTY_CASH)
+        $cashTrxQuery = \App\Models\CashTransaction::with(['user', 'outlet'])
+            ->where('type', 'OUT')
+            ->whereIn('account', ['CASH_DRAWER', 'PETTY_CASH'])
+            ->where('category', '!=', 'SETORAN_KASIR')
+            ->where(function ($q) use ($shift) {
+                $q->where('outlet_id', $shift->outlet_id)
+                  ->orWhereNull('outlet_id');
+            });
+
+        if ($shift->business_id) {
+            $cashTrxQuery->where('business_id', $shift->business_id);
+        }
+
+        $cashTrxQuery->where(function ($q) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+            if ($openedAt && $closedAt) {
+                $q->where(function ($sub) use ($openedAt, $closedAt) {
+                    $sub->where('created_at', '>=', $openedAt)
+                        ->where('created_at', '<=', $closedAt);
+                })->orWhere(function ($sub) use ($openedDate, $closedDate) {
+                    $sub->whereBetween('date', [$openedDate, $closedDate]);
+                });
+            } elseif ($openedAt) {
+                $q->where(function ($sub) use ($openedAt) {
+                    $sub->where('created_at', '>=', $openedAt);
+                })->orWhere(function ($sub) use ($openedDate) {
+                    $sub->where('date', '>=', $openedDate);
+                });
+            } else {
+                $q->whereDate('date', now()->toDateString());
+            }
+        });
+
+        $cashTrxList = $cashTrxQuery->orderBy('created_at', 'asc')->get();
+
+        foreach ($cashTrxList as $ctx) {
+            // Avoid duplicate if already captured from operating_expenses
+            $isDuplicate = false;
+            $ctxDate = $ctx->date ? (is_string($ctx->date) ? substr($ctx->date, 0, 10) : $ctx->date->format('Y-m-d')) : null;
+            foreach ($expenses as $existing) {
+                if ($existing['source'] === 'OPERATING_EXPENSE' &&
+                    abs($existing['amount'] - (float)$ctx->amount) < 0.01 &&
+                    $existing['date'] === $ctxDate) {
+                    $isDuplicate = true;
+                    break;
+                }
+            }
+            if ($isDuplicate) continue;
+
+            $amt = (float)$ctx->amount;
+            $totalExpenses += $amt;
+            $cashExpenses += $amt;
+
+            $desc = $ctx->name ?: 'Pengeluaran Kas Kecil';
+            $expenses[] = [
+                'id'                   => $ctx->id,
+                'source'               => 'CASH_TRANSACTION',
+                'expense_no'           => $ctx->transaction_no,
+                'date'                 => $ctxDate,
+                'time'                 => $ctx->created_at ? $ctx->created_at->format('H:i') : '-',
+                'category'             => $ctx->category,
+                'category_label'       => $ctx->category_label ?? $ctx->category,
+                'name'                 => $desc,
+                'description'          => $desc,
+                'amount'               => $amt,
+                'payment_method'       => 'CASH',
+                'payment_method_label' => 'Kas di Laci (Tunai)',
+                'is_cash'              => true,
+                'notes'                => $ctx->notes,
+                'user_name'            => $ctx->user_name ?? ($ctx->user?->name ?? 'Kasir'),
+            ];
+        }
+
+        return [
+            'expenses'          => $expenses,
+            'total_expenses'    => $totalExpenses,
+            'cash_expenses'     => $cashExpenses,
+            'non_cash_expenses' => $nonCashExpenses,
+        ];
+    }
+
+    /**
      * Get real-time summary of sales & theoretical ingredient consumption for a shift.
      */
     public function summary(Shift $shift)
@@ -443,9 +826,22 @@ class ShiftController extends Controller
 
         $shift->load(['user', 'closedByUser']);
 
-        $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
+        $paidTransactions = $shift->transactions()
+            ->where(function ($q) {
+                $q->where(function ($sub) {
+                    $sub->where('status', 'PAID')
+                        ->where(function ($inner) {
+                            $inner->whereNull('split_type')->orWhere('split_type', '!=', 'EQUAL');
+                        });
+                })->orWhere('status', 'SPLIT_CLOSED');
+            })
+            ->get();
         $totalTransactions = $paidTransactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
         $totalSales = (float)$paidTransactions->sum('total_price');
+
+        // Fetch receivable payments collected during this shift
+        $shiftRecPayments = $this->getShiftReceivablePayments($shift);
+        $hasShiftRecPayments = $shiftRecPayments->count() > 0;
 
         $cashSales = 0.0;
         $qrisSales = 0.0;
@@ -459,38 +855,77 @@ class ShiftController extends Controller
         foreach ($paidTransactions as $t) {
             $method = strtoupper(trim($t->payment_method ?? 'CASH'));
             $price = (float)$t->total_price;
-            $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
 
             if ($method === 'CASH' || $method === 'TUNAI') {
                 $cashSales += $price;
+                $paymentBreakdown['CASH'] = ($paymentBreakdown['CASH'] ?? 0.0) + $price;
             } elseif (str_contains($method, 'QRIS')) {
                 $qrisSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'GRAB') || str_contains($method, 'GOFOOD') || str_contains($method, 'SHOPEE') || str_contains($method, 'TIKTOK')) {
                 $grabSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'TRANSFER')) {
                 $transferSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'DEBIT') || str_contains($method, 'EDC') || str_contains($method, 'CREDIT') || str_contains($method, 'KARTU')) {
                 $debitSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
-                $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
-                $dpPaid = (float)($t->amount_paid ?? 0);
-                if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
-                    $cashSales += $dpPaid;
-                } else {
-                    $otherSales += $dpPaid;
-                    $nonCashSales += $dpPaid;
+                if (!$hasShiftRecPayments) {
+                    $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
+                    $dpPaid = (float)($t->amount_paid ?? 0);
+                    if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
+                        $cashSales += $dpPaid;
+                    } else {
+                        $otherSales += $dpPaid;
+                        $nonCashSales += $dpPaid;
+                    }
+                    if ($dpPaid > 0) {
+                        $paymentBreakdown[$dpMethod] = ($paymentBreakdown[$dpMethod] ?? 0.0) + $dpPaid;
+                    }
                 }
             } else {
                 $otherSales += $price;
                 $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             }
         }
 
-        $expectedCash = (float)$shift->initial_cash + $cashSales;
+        // Add collections from kasbon payments received during this shift
+        foreach ($shiftRecPayments as $rp) {
+            $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $rpPrice = (float)$rp->amount;
+            $paymentBreakdown[$rpMethod] = ($paymentBreakdown[$rpMethod] ?? 0.0) + $rpPrice;
+
+            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
+                $cashSales += $rpPrice;
+            } elseif (str_contains($rpMethod, 'QRIS')) {
+                $qrisSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            } elseif (str_contains($rpMethod, 'TRANSFER')) {
+                $transferSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
+                $debitSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            } else {
+                $otherSales += $rpPrice;
+                $nonCashSales += $rpPrice;
+            }
+        }
+
+        $totalPaymentsReceived = $cashSales + $nonCashSales;
+        if ($totalSales < $totalPaymentsReceived) {
+            $totalSales = $totalPaymentsReceived;
+        }
+
+        $expData = $this->getShiftExpenses($shift);
+        $expectedCash = max(0, (float)$shift->initial_cash + $cashSales - $expData['cash_expenses']);
 
         // Group actual menus sold (exclude dummy equal split installment rows, include SPLIT_CLOSED actual items)
         $actualMenuTransactions = $shift->transactions()
@@ -556,6 +991,20 @@ class ShiftController extends Controller
             $ordersGrouped[$ordNum]['total_price'] += (float)$t->total_price;
             $ordersGrouped[$ordNum]['total_items'] += (int)$t->qty;
         }
+
+        foreach ($shiftRecPayments as $rp) {
+            $rec = $rp->receivable;
+            $payNo = $rp->payment_no ?: ('PAY-' . $rp->id);
+            $ordersGrouped[$payNo] = [
+                'order_number'    => $payNo . ' (' . ($rec?->order_number ?: $rec?->receivable_no ?: 'Kasbon') . ')',
+                'time'            => $rp->created_at ? $rp->created_at->format('H:i') : '-',
+                'total_price'     => (float)$rp->amount,
+                'total_items'     => 1,
+                'payment_method'  => strtoupper($rp->payment_method ?: 'CASH'),
+                'customer_name'   => 'Pelunasan: ' . ($rec?->customer_name ?: 'Pelanggan'),
+            ];
+        }
+
         $ordersList = array_values($ordersGrouped);
         $orderNumbers = array_keys($ordersGrouped);
         $orderRange = '-';
@@ -577,6 +1026,10 @@ class ShiftController extends Controller
             'other_sales'        => $otherSales,
             'non_cash_sales'     => $nonCashSales,
             'payment_breakdown'  => $paymentBreakdown,
+            'expenses'           => $expData['expenses'],
+            'total_expenses'     => $expData['total_expenses'],
+            'cash_expenses'      => $expData['cash_expenses'],
+            'non_cash_expenses'  => $expData['non_cash_expenses'],
             'expected_cash'      => $expectedCash,
             'menus_sold'         => array_values($menuSummary),
             'ingredient_usages'  => $ingredientUsages,
@@ -638,8 +1091,21 @@ class ShiftController extends Controller
         ]);
 
         $result = DB::transaction(function () use ($request, $shift, $data, $openBillsCount, $openBillsTotal, $allowCarryOver) {
-            $paidTransactions = $shift->transactions()->where('status', 'PAID')->get();
+            $paidTransactions = $shift->transactions()
+                ->where(function ($q) {
+                    $q->where(function ($sub) {
+                        $sub->where('status', 'PAID')
+                            ->where(function ($inner) {
+                                $inner->whereNull('split_type')->orWhere('split_type', '!=', 'EQUAL');
+                            });
+                    })->orWhere('status', 'SPLIT_CLOSED');
+                })
+                ->get();
             $systemSales = (float)$paidTransactions->sum('total_price');
+
+            // Include collections from kasbon payments received during this shift
+            $shiftRecPayments = $this->getShiftReceivablePayments($shift);
+            $hasShiftRecPayments = $shiftRecPayments->count() > 0;
 
             $cashSales = 0.0;
             $nonCashSales = 0.0;
@@ -648,20 +1114,38 @@ class ShiftController extends Controller
                 if ($method === 'CASH' || $method === 'TUNAI') {
                     $cashSales += (float)$t->total_price;
                 } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
-                    $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
-                    $dpPaid = (float)($t->amount_paid ?? 0);
-                    if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
-                        $cashSales += $dpPaid;
-                    } else {
-                        $nonCashSales += $dpPaid;
+                    if (!$hasShiftRecPayments) {
+                        $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
+                        $dpPaid = (float)($t->amount_paid ?? 0);
+                        if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
+                            $cashSales += $dpPaid;
+                        } else {
+                            $nonCashSales += $dpPaid;
+                        }
                     }
                 } else {
                     $nonCashSales += (float)$t->total_price;
                 }
             }
 
+            foreach ($shiftRecPayments as $rp) {
+                $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
+                $rpPrice = (float)$rp->amount;
+                if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
+                    $cashSales += $rpPrice;
+                } else {
+                    $nonCashSales += $rpPrice;
+                }
+            }
+
+            $totalPaymentsReceived = $cashSales + $nonCashSales;
+            if ($systemSales < $totalPaymentsReceived) {
+                $systemSales = $totalPaymentsReceived;
+            }
+
+            $expData = $this->getShiftExpenses($shift);
             $closingCash = (float)$data['closing_cash'];
-            $expectedCash = (float)$shift->initial_cash + $cashSales;
+            $expectedCash = max(0, (float)$shift->initial_cash + $cashSales - $expData['cash_expenses']);
             $cashDiff = $closingCash - $expectedCash;
 
             // 1. Calculate aggregated theoretical ingredient usage
@@ -714,6 +1198,10 @@ class ShiftController extends Controller
                 'total_sales'      => $systemSales,
                 'cash_sales'       => $cashSales,
                 'non_cash_sales'   => $nonCashSales,
+                'expenses'         => $expData['expenses'],
+                'total_expenses'   => $expData['total_expenses'],
+                'cash_expenses'    => $expData['cash_expenses'],
+                'non_cash_expenses'=> $expData['non_cash_expenses'],
                 'expected_cash'    => $expectedCash,
                 'cash_difference'  => $cashDiff,
                 'carry_over_count' => $openBillsCount,
@@ -780,7 +1268,30 @@ class ShiftController extends Controller
             ];
         }
 
-        $totalOrders = $transactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
+        // Add receivable payments collected during shift
+        $shiftRecPayments = $this->getShiftReceivablePayments($shift);
+        foreach ($shiftRecPayments as $rp) {
+            $rec = $rp->receivable;
+            $rows[] = [
+                'id'              => 'rp_' . $rp->id,
+                'order_number'    => $rp->payment_no . ' (' . ($rec?->order_number ?: $rec?->receivable_no ?: 'Kasbon') . ')',
+                'time'            => $rp->created_at ? $rp->created_at->format('H:i') : '-',
+                'date'            => $rp->payment_date ? (is_string($rp->payment_date) ? substr($rp->payment_date, 0, 10) : $rp->payment_date->format('Y-m-d')) : '-',
+                'menu_id'         => null,
+                'menu_name'       => 'Pelunasan Kasbon - ' . ($rec?->customer_name ?: 'Pelanggan'),
+                'menu_price'      => (float)$rp->amount,
+                'qty'             => 1,
+                'total_price'     => (float)$rp->amount,
+                'user_name'       => $rp->receiver?->name ?? 'Kasir',
+                'payment_method'  => strtoupper($rp->payment_method ?: 'CASH'),
+                'status'          => 'PAID',
+                'ingredient_usage'=> null,
+                'ingredient_unit' => null,
+            ];
+        }
+
+        $totalOrders = $transactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count() + $shiftRecPayments->count();
+        $expData = $this->getShiftExpenses($shift);
 
         return response()->json([
             'shift'                      => $shift->load(['user', 'closedByUser', 'outlet']),
@@ -790,6 +1301,10 @@ class ShiftController extends Controller
             'total_transactions'         => $totalOrders,
             'total_items'                => count($rows),
             'total_sales'                => array_sum(array_column($rows, 'total_price')),
+            'expenses'                   => $expData['expenses'],
+            'total_expenses'             => $expData['total_expenses'],
+            'cash_expenses'              => $expData['cash_expenses'],
+            'non_cash_expenses'          => $expData['non_cash_expenses'],
             'transactions'               => $rows,
             'raw_transactions'           => $transactions,
         ]);
@@ -845,60 +1360,69 @@ class ShiftController extends Controller
         }
 
         // Payment method breakdown
-        $allPaidTransactions = $shift->transactions()->where('status', 'PAID')->get();
+        $allPaidTransactions = $paidTransactions;
+        $shiftRecPayments = $this->getShiftReceivablePayments($shift);
+        $hasShiftRecPayments = $shiftRecPayments->count() > 0;
+
         $paymentBreakdown = [];
         $cashTotal = 0.0;
         $nonCashTotal = 0.0;
 
         foreach ($allPaidTransactions as $t) {
             $method = strtoupper($t->payment_method ?? 'CASH');
-            if (!isset($paymentBreakdown[$method])) {
-                $paymentBreakdown[$method] = 0.0;
-            }
-            $paymentBreakdown[$method] += (float)$t->total_price;
 
             if ($method === 'CASH' || $method === 'TUNAI') {
                 $cashTotal += (float)$t->total_price;
+                $paymentBreakdown['CASH'] = ($paymentBreakdown['CASH'] ?? 0.0) + (float)$t->total_price;
             } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
-                $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
-                $dpPaid = (float)($t->amount_paid ?? 0);
-                if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
-                    $cashTotal += $dpPaid;
-                } else {
-                    $nonCashTotal += $dpPaid;
+                if (!$hasShiftRecPayments) {
+                    $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
+                    $dpPaid = (float)($t->amount_paid ?? 0);
+                    if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
+                        $cashTotal += $dpPaid;
+                    } else {
+                        $nonCashTotal += $dpPaid;
+                    }
+                    if ($dpPaid > 0) {
+                        $paymentBreakdown[$dpMethod] = ($paymentBreakdown[$dpMethod] ?? 0.0) + $dpPaid;
+                    }
                 }
             } else {
                 $nonCashTotal += (float)$t->total_price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + (float)$t->total_price;
             }
         }
 
-        // Operating expenses during shift period (if any)
-        $expenses = [];
-        if ($shift->opened_at) {
-            $expenseQuery = \App\Models\OperatingExpense::where('outlet_id', $shift->outlet_id)
-                ->where('business_id', $shift->business_id)
-                ->where('date', '>=', $shift->opened_at->toDateString());
-
-            if ($shift->closed_at) {
-                $expenseQuery->where('date', '<=', $shift->closed_at->toDateString());
+        // Include collections from kasbon payments received during this shift
+        foreach ($shiftRecPayments as $rp) {
+            $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $rpPrice = (float)$rp->amount;
+            if (!isset($paymentBreakdown[$rpMethod])) {
+                $paymentBreakdown[$rpMethod] = 0.0;
             }
+            $paymentBreakdown[$rpMethod] += $rpPrice;
 
-            $expenseQuery->where('created_at', '>=', $shift->opened_at);
-            if ($shift->closed_at) {
-                $expenseQuery->where('created_at', '<=', $shift->closed_at);
+            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
+                $cashTotal += $rpPrice;
+            } else {
+                $nonCashTotal += $rpPrice;
             }
-
-            $expenses = $expenseQuery->get()->map(function ($e) {
-                return [
-                    'description' => $e->description,
-                    'amount'      => (float)$e->amount,
-                ];
-            })->toArray();
         }
 
-        $totalExpenses = array_sum(array_column($expenses, 'amount'));
+        // Operating expenses during shift period
+        $expData = $this->getShiftExpenses($shift);
+        $expenses = $expData['expenses'];
+        $totalExpenses = $expData['total_expenses'];
+        $cashExpenses = $expData['cash_expenses'];
+        $nonCashExpenses = $expData['non_cash_expenses'];
+
         $totalSales = (float)$allPaidTransactions->sum('total_price');
-        $totalTransactions = $allPaidTransactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count();
+        $totalPaymentsReceived = $cashTotal + $nonCashTotal;
+        if ($totalSales < $totalPaymentsReceived) {
+            $totalSales = $totalPaymentsReceived;
+        }
+        $totalTransactions = $allPaidTransactions->unique(fn($t) => $t->order_number ?: ('trx_' . $t->id))->count() + $shiftRecPayments->count();
+        $expectedCashInDrawer = max(0, (float)$shift->initial_cash + $cashTotal - $cashExpenses);
 
         // Group all transactions by order_number for order list on receipt
         $ordersGrouped = [];
@@ -916,6 +1440,19 @@ class ShiftController extends Controller
             }
             $ordersGrouped[$ordNum]['total_price'] += (float)$t->total_price;
             $ordersGrouped[$ordNum]['total_items'] += (int)$t->qty;
+        }
+
+        foreach ($shiftRecPayments as $rp) {
+            $rec = $rp->receivable;
+            $payNo = $rp->payment_no ?: ('PAY-' . $rp->id);
+            $ordersGrouped[$payNo] = [
+                'order_number'    => $payNo . ' (' . ($rec?->order_number ?: $rec?->receivable_no ?: 'Kasbon') . ')',
+                'time'            => $rp->created_at ? $rp->created_at->format('H:i') : '-',
+                'total_price'     => (float)$rp->amount,
+                'total_items'     => 1,
+                'payment_method'  => strtoupper($rp->payment_method ?: 'CASH'),
+                'customer_name'   => 'Pelunasan: ' . ($rec?->customer_name ?: 'Pelanggan'),
+            ];
         }
         $ordersList = array_values($ordersGrouped);
         $orderNumbers = array_keys($ordersGrouped);
@@ -948,11 +1485,72 @@ class ShiftController extends Controller
             })->toArray(),
             'expenses'           => $expenses,
             'total_expenses'     => $totalExpenses,
+            'cash_expenses'      => $cashExpenses,
+            'non_cash_expenses'  => $nonCashExpenses,
+            'expected_cash'      => $expectedCashInDrawer,
             'net_amount'         => $totalSales - $totalExpenses,
             'initial_cash'       => (float)$shift->initial_cash,
             'system_cash'        => $totalSales,
             'closing_cash'       => $shift->closing_cash !== null ? (float)$shift->closing_cash : null,
             'cash_difference'    => $shift->cash_difference !== null ? (float)$shift->cash_difference : null,
         ]);
+    }
+
+    /**
+     * Deposit cash from closing shift to Kas Besar (CashTransaction IN).
+     */
+    public function deposit(Request $request, Shift $shift)
+    {
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$shift->outlet_id !== (int)$user->outlet_id) {
+                return response()->json(['message' => 'Anda tidak memiliki hak akses untuk mengelola shift di cabang outlet lain.'], 403);
+            }
+        }
+
+        $data = $request->validate([
+            'amount'  => 'required|numeric|min:0.01',
+            'account' => 'nullable|string|in:KAS_BESAR,BANK_MAIN',
+            'notes'   => 'nullable|string|max:500',
+            'date'    => 'nullable|date',
+        ]);
+
+        $businessId = $shift->business_id ?? $user->business_id ?? 1;
+        $depositDate = $data['date'] ?? ($shift->closed_at ? $shift->closed_at->toDateString() : now()->toDateString());
+        $account = $data['account'] ?? 'KAS_BESAR';
+        $amount = (float)$data['amount'];
+        $notes = $data['notes'] ?? "Setoran Closing Shift #{$shift->id} ({$shift->shift_name}) ke Kas Besar";
+
+        $transactionNo = \App\Models\CashTransaction::generateTransactionNo($businessId, $depositDate);
+
+        $trx = \App\Models\CashTransaction::create([
+            'business_id'    => $businessId,
+            'outlet_id'      => $shift->outlet_id,
+            'transaction_no' => $transactionNo,
+            'date'           => $depositDate,
+            'type'           => 'IN',
+            'activity_type'  => 'OPERATING',
+            'category'       => 'SETORAN_KASIR',
+            'name'           => "Setoran Kasir Shift #{$shift->id} ke Kas Besar",
+            'amount'         => $amount,
+            'account'        => $account,
+            'payment_method' => 'CASH',
+            'notes'          => $notes,
+            'user_id'        => $user->id,
+            'created_by'     => $user->id,
+        ]);
+
+        // Append to shift notes for audit trail
+        $depositNote = "Setor Kas Besar: Rp " . number_format($amount, 0, ',', '.') . " (" . ($account === 'KAS_BESAR' ? 'Kas Besar' : 'Bank') . ")";
+        $combinedNotes = $shift->notes ? $shift->notes . "\n" . $depositNote : $depositNote;
+        $shift->update([
+            'notes' => $combinedNotes,
+        ]);
+
+        return response()->json([
+            'message'          => 'Uang kasir berhasil disetorkan ke Kas Besar.',
+            'cash_transaction' => $trx,
+            'shift'            => $shift->fresh(['user', 'closedByUser', 'outlet']),
+        ], 201);
     }
 }

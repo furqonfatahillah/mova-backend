@@ -196,8 +196,16 @@ class WasteController extends Controller
             if ($itemType === 'MENU') {
                 $menu = Menu::with(['recipes.items.ingredient', 'bundleItems.bundledMenu', 'bundleItems.ingredient'])->findOrFail($data['menu_id']);
                 
-                // Determine Menu cost price (HPP or Price)
-                $costPerUnit = (float)($menu->cost_price > 0 ? $menu->cost_price : ($menu->hpp > 0 ? $menu->hpp : $menu->price));
+                // Determine real Menu cost price (from active recipe ingredient prices)
+                $costPerUnit = 0;
+                if ($menu->item_type === 'RECIPE' || $menu->item_type === 'BUNDLE') {
+                    $costPerUnit = (float)$menu->calculateHpp($data['date'], $outletId);
+                } else {
+                    $costPerUnit = (float)$menu->costPriceForOutlet($outletId);
+                }
+                if ($costPerUnit <= 0) {
+                    $costPerUnit = (float)($menu->cost_price > 0 ? $menu->cost_price : ($menu->hpp > 0 ? $menu->hpp : $menu->price));
+                }
                 $lossCost = round($qtyPakai * $costPerUnit, 2);
 
                 // Reduce stock based on Menu item type
@@ -212,11 +220,14 @@ class WasteController extends Controller
                         $om->save();
                     }
                 } elseif ($menu->item_type === 'RECIPE') {
-                    // Deduct ingredients for active recipe
+                    // Deduct ingredients for active recipe using Moving Average Cost
                     $recipe = $menu->recipes->sortByDesc('version')->first();
                     if ($recipe && $recipe->items) {
-                        foreach ($recipe.items as $rItem) {
-                            $ingCost = (float)($rItem->ingredient?->harga / max((float)($rItem->ingredient?->konversi ?? 1), 1));
+                        foreach ($recipe->items as $rItem) {
+                            $ingCost = (float)($rItem->ingredient?->costPerPakaiForOutlet($outletId) ?: 0);
+                            if ($ingCost <= 0) {
+                                $ingCost = (float)($rItem->ingredient?->harga / max((float)($rItem->ingredient?->konversi ?? 1), 1));
+                            }
                             $ingQty = (float)$rItem->qty * $qtyPakai;
                             
                             $mov = StockMovement::create([
@@ -228,6 +239,8 @@ class WasteController extends Controller
                                 'qty'           => $ingQty,
                                 'unit_price'    => $ingCost,
                                 'total_price'   => round($ingQty * $ingCost, 2),
+                                'cost_before'   => $ingCost,
+                                'cost_after'    => $ingCost,
                                 'note'          => "Waste Menu [{$menu->name} x {$qtyPakai}] {$reasonLabel}" . (!empty($data['notes']) ? " — {$data['notes']}" : ''),
                                 'shift_id'      => $data['shift_id'] ?? null,
                                 'user_id'       => $request->user()->id,
@@ -242,6 +255,10 @@ class WasteController extends Controller
                         foreach ($menu->bundleItems as $bItem) {
                             $bQty = (float)$bItem->qty * $qtyPakai;
                             if ($bItem->ingredient_id) {
+                                $bIngCost = (float)($bItem->ingredient?->costPerPakaiForOutlet($outletId) ?: 0);
+                                if ($bIngCost <= 0) {
+                                    $bIngCost = (float)($bItem->ingredient?->harga / max((float)($bItem->ingredient?->konversi ?? 1), 1));
+                                }
                                 StockMovement::create([
                                     'date'          => $data['date'],
                                     'ingredient_id' => $bItem->ingredient_id,
@@ -249,6 +266,10 @@ class WasteController extends Controller
                                     'type'          => 'WASTE',
                                     'waste_reason'  => $data['reason_category'],
                                     'qty'           => $bQty,
+                                    'unit_price'    => $bIngCost,
+                                    'total_price'   => round($bQty * $bIngCost, 2),
+                                    'cost_before'   => $bIngCost,
+                                    'cost_after'    => $bIngCost,
                                     'note'          => "Waste Paket Bundling [{$menu->name} x {$qtyPakai}] {$reasonLabel}",
                                     'shift_id'      => $data['shift_id'] ?? null,
                                     'user_id'       => $request->user()->id,
@@ -282,7 +303,7 @@ class WasteController extends Controller
 
                 return $log;
             } else {
-                // INGREDIENT Waste
+                // INGREDIENT Waste - Use exact Weighted Moving Average Cost matching Kartu Stok
                 $ingredient = Ingredient::findOrFail($data['ingredient_id']);
                 $konversi = max((float)$ingredient->konversi, 1);
 
@@ -290,9 +311,12 @@ class WasteController extends Controller
                 $isUnitBeli = ($unitType === 'BELI');
                 $qtyPakai = $isUnitBeli ? round((float)$data['qty'] * $konversi, 3) : (float)$data['qty'];
                 
-                $costPerPakai = (float)$ingredient->harga / $konversi;
-                if ($costPerPakai <= 0 && (float)$ingredient->last_purchase_price > 0) {
-                    $costPerPakai = (float)$ingredient->last_purchase_price / $konversi;
+                $costPerPakai = (float)$ingredient->costPerPakaiForOutlet($outletId);
+                if ($costPerPakai <= 0) {
+                    $costPerPakai = (float)$ingredient->harga / $konversi;
+                    if ($costPerPakai <= 0 && (float)$ingredient->last_purchase_price > 0) {
+                        $costPerPakai = (float)$ingredient->last_purchase_price / $konversi;
+                    }
                 }
 
                 $lossCost = round($qtyPakai * $costPerPakai, 2);

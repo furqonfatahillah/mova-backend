@@ -137,61 +137,72 @@ class OutletController extends Controller
 
         $importedCount = 0;
 
-        \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
-            foreach ($items as $idx => $row) {
-                if (empty($row['name'])) continue;
+        try {
+            \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+                foreach ($items as $idx => $row) {
+                    if (empty($row['name'])) continue;
 
-                $name = trim($row['name']);
-                $lowerName = strtolower($name);
+                    $name = trim($row['name']);
+                    $lowerName = strtolower($name);
 
-                // Filter out accidental header / banner rows
-                if (
-                    str_starts_with($name, '===') ||
-                    str_contains($lowerName, 'template import') ||
-                    str_contains($lowerName, 'petunjuk') ||
-                    str_contains($lowerName, 'daftar outlet') ||
-                    in_array($lowerName, ['kode outlet', 'nama outlet', 'nama outlet*', 'tipe', 'alamat'])
-                ) {
-                    continue;
+                    // Filter out accidental header / banner rows
+                    if (
+                        str_starts_with($name, '===') ||
+                        str_contains($lowerName, 'template import') ||
+                        str_contains($lowerName, 'petunjuk') ||
+                        str_contains($lowerName, 'daftar outlet') ||
+                        in_array($lowerName, ['kode outlet', 'nama outlet', 'nama outlet*', 'tipe', 'alamat'])
+                    ) {
+                        continue;
+                    }
+
+                    $code = !empty($row['code']) ? trim($row['code']) : null;
+
+                    // If user didn't specify a code, auto-generate next safe code for this business without collision
+                    if (empty($code)) {
+                        $seq = Outlet::where('business_id', $businessId)->count() + 1;
+                        do {
+                            $candidateCode = 'OUT-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                            $exists = Outlet::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                            $seq++;
+                        } while ($exists);
+                        $code = $candidateCode;
+                    }
+
+                    $typeRaw = !empty($row['type']) ? strtoupper(trim($row['type'])) : 'CABANG';
+                    $type = in_array($typeRaw, ['CABANG', 'PUSAT', 'GUDANG']) ? $typeRaw : 'CABANG';
+
+                    Outlet::updateOrCreate(
+                        [
+                            'business_id' => $businessId,
+                            'code'        => substr($code, 0, 20),
+                        ],
+                        [
+                            'name'       => $name,
+                            'type'       => $type,
+                            'address'    => $row['address'] ?? null,
+                            'phone'      => $row['phone'] ?? null,
+                            'pic_name'   => $row['pic_name'] ?? null,
+                            'is_main'    => isset($row['is_main']) ? (bool)$row['is_main'] : false,
+                            'active'     => true,
+                            'created_by' => $user?->id,
+                            'updated_by' => $user?->id,
+                        ]
+                    );
+
+                    $importedCount++;
                 }
+            });
+        } catch (\Throwable $e) {
+            try {
+                \Illuminate\Support\Facades\Log::error("bulkImport Outlet error: " . $e->getMessage());
+            } catch (\Throwable $logEx) {}
 
-                $code = !empty($row['code']) ? trim($row['code']) : null;
-
-                // If user didn't specify a code, auto-generate next safe code for this business without collision
-                if (empty($code)) {
-                    $seq = Outlet::where('business_id', $businessId)->count() + 1;
-                    do {
-                        $candidateCode = 'OUT-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                        $exists = Outlet::where('business_id', $businessId)->where('code', $candidateCode)->exists();
-                        $seq++;
-                    } while ($exists);
-                    $code = $candidateCode;
-                }
-
-                $typeRaw = !empty($row['type']) ? strtoupper(trim($row['type'])) : 'CABANG';
-                $type = in_array($typeRaw, ['CABANG', 'PUSAT', 'GUDANG']) ? $typeRaw : 'CABANG';
-
-                Outlet::updateOrCreate(
-                    [
-                        'business_id' => $businessId,
-                        'code'        => $code,
-                    ],
-                    [
-                        'name'       => $name,
-                        'type'       => $type,
-                        'address'    => $row['address'] ?? null,
-                        'phone'      => $row['phone'] ?? null,
-                        'pic_name'   => $row['pic_name'] ?? null,
-                        'is_main'    => isset($row['is_main']) ? (bool)$row['is_main'] : false,
-                        'active'     => true,
-                        'created_by' => $user?->id,
-                        'updated_by' => $user?->id,
-                    ]
-                );
-
-                $importedCount++;
-            }
-        });
+            return response()->json([
+                'message' => 'Gagal meng-import data outlet: ' . $e->getMessage(),
+                'error'   => $e->getMessage(),
+            ], 422);
+        }
 
         return response()->json([
             'message' => "Berhasil meng-import {$importedCount} outlet/gudang dari file Excel.",

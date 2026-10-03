@@ -7,6 +7,7 @@ use App\Models\Menu;
 use App\Models\Customer;
 use App\Models\PointRedemption;
 use App\Models\Receivable;
+use App\Models\ReceivablePayment;
 use App\Models\Discount;
 use App\Models\Outlet;
 use Illuminate\Http\Request;
@@ -29,8 +30,8 @@ class SalesReportController extends Controller
     private function getContextNames(Request $request, ?int $outletId): array
     {
         $user = $request->user();
-        $business = $user->business;
-        $businessName = $business?->name ?: ($user->business_name ?: 'MOVA POS');
+        $business = $user?->business;
+        $businessName = $business?->name ?: ($user?->business_name ?: 'MOVA POS');
 
         $outletName = 'Semua Cabang (Konsolidasi)';
         if ($outletId) {
@@ -315,11 +316,11 @@ class SalesReportController extends Controller
             'to'   => 'required|date|after_or_equal:from',
         ]);
 
-        $businessId = $request->user()->business_id;
+        $businessId = $request->user()?->business_id ?? 1;
         $outletId   = $this->getTargetOutletId($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId);
 
-        $query = Transaction::with(['outlet', 'user', 'customer'])
+        $query = Transaction::with(['outlet', 'user', 'customer', 'receivable.payments'])
             ->where('business_id', $businessId)
             ->where('status', 'PAID')
             ->whereBetween('date', [$request->from, $request->to])
@@ -331,7 +332,12 @@ class SalesReportController extends Controller
         }
 
         if ($request->filled('payment_method') && $request->payment_method !== 'ALL') {
-            $query->where('payment_method', $request->payment_method);
+            $pmUpper = strtoupper($request->payment_method);
+            if (in_array($pmUpper, ['KASBON', 'PIUTANG'])) {
+                $query->whereIn(DB::raw('UPPER(payment_method)'), ['KASBON', 'PIUTANG']);
+            } else {
+                $query->where('payment_method', $request->payment_method);
+            }
         }
 
         $transactions = $query->get();
@@ -351,9 +357,13 @@ class SalesReportController extends Controller
                     $depositAccount = 'QRIS | 005001005015564';
                 } elseif (str_contains($pmLower, 'bri') || str_contains($pmLower, 'transfer') || str_contains($pmLower, 'digital')) {
                     $depositAccount = 'BRI | 005001005015564';
-                } elseif ($payMethod !== 'Tunai' && $payMethod !== 'Cash') {
+                } elseif ($payMethod !== 'Tunai' && $payMethod !== 'Cash' && !$isKasbon) {
                     $depositAccount = $payMethod;
+                } elseif ($isKasbon) {
+                    $depositAccount = 'Piutang Kasbon';
                 }
+
+                $rawDate = $t->date ? substr($t->date, 0, 10) : ($t->created_at ? $t->created_at->format('Y-m-d') : '');
 
                 $grouped[$orderNo] = [
                     'order_number'    => $orderNo,
@@ -367,10 +377,10 @@ class SalesReportController extends Controller
                     'payment_method'  => $payMethod,
                     'deposit_account' => $depositAccount,
                     'total_amount'    => 0.0,
-                    'amount_paid'     => 0.0,
-                    'receivable'      => 0.0,
+                    'dp_amount'       => (float)($t->amount_paid ?? 0),
                     'cashier'         => $t->user?->name ?: 'Lulu',
                     'is_kasbon'       => $isKasbon,
+                    'raw_date'        => $rawDate,
                 ];
             }
 
@@ -378,14 +388,14 @@ class SalesReportController extends Controller
         }
 
         $items = [];
-        $rowNo = 1;
         foreach ($grouped as $ord) {
             $total = $ord['total_amount'];
+            // If Kasbon order, initial DP is paid amount, and remainder is receivable
             $paid = $ord['is_kasbon'] ? 0.0 : $total;
             $receivable = $ord['is_kasbon'] ? $total : 0.0;
 
             $items[] = [
-                'no'               => $rowNo++,
+                'no'               => 0,
                 'date'             => $ord['date'],
                 'time'             => $ord['time'],
                 'created_at'       => $ord['created_at'],
@@ -394,19 +404,110 @@ class SalesReportController extends Controller
                 'order_number'     => $ord['order_number'],
                 'payment_number'   => $ord['payment_number'],
                 'customer'         => $ord['customer'],
+                'customer_name'    => $ord['customer'],
                 'payment_method'   => $ord['payment_method'],
                 'deposit_account'  => $ord['deposit_account'],
                 'total_transaction'=> $total,
                 'paid_amount'      => $paid,
                 'receivable_amount'=> $receivable,
                 'cashier'          => $ord['cashier'],
+                'raw_date'         => $ord['raw_date'],
             ];
         }
+
+        // 2. Fetch all collections / payments of receivables (Kasbon Pelanggan & Settlement)
+        $rpQuery = ReceivablePayment::with(['receivable.customer', 'outlet', 'receiver'])
+            ->where('business_id', $businessId)
+            ->whereBetween('payment_date', [$request->from, $request->to])
+            ->orderBy('payment_date', 'asc')
+            ->orderBy('id', 'asc');
+
+        if ($outletId) {
+            $rpQuery->where('outlet_id', $outletId);
+        }
+
+        if ($request->filled('payment_method') && $request->payment_method !== 'ALL') {
+            $pmFilter = strtoupper($request->payment_method);
+            if (in_array($pmFilter, ['KASBON', 'PIUTANG'])) {
+                // If filter is explicitly KASBON, don't show the cash/bank settlement vouchers
+                $rpQuery->whereRaw('1 = 0');
+            } else {
+                $rpQuery->where(function ($q) use ($pmFilter) {
+                    if (in_array($pmFilter, ['CASH', 'TUNAI'])) {
+                        $q->whereIn(DB::raw('UPPER(payment_method)'), ['CASH', 'TUNAI']);
+                    } elseif (str_contains($pmFilter, 'QRIS')) {
+                        $q->where(DB::raw('UPPER(payment_method)'), 'like', '%QRIS%');
+                    } elseif (str_contains($pmFilter, 'TRANSFER')) {
+                        $q->where(DB::raw('UPPER(payment_method)'), 'like', '%TRANSFER%');
+                    } elseif (str_contains($pmFilter, 'DEBIT')) {
+                        $q->where(DB::raw('UPPER(payment_method)'), 'like', '%DEBIT%');
+                    } else {
+                        $q->where('payment_method', $pmFilter);
+                    }
+                });
+            }
+        }
+
+        $receivablePayments = $rpQuery->get();
+
+        foreach ($receivablePayments as $rp) {
+            $rec = $rp->receivable;
+            $payMethod = strtoupper($rp->payment_method ?: 'CASH');
+
+            $depositAccount = 'Kas Kecil';
+            $pmLower = strtolower($payMethod);
+            if (str_contains($pmLower, 'qris')) {
+                $depositAccount = 'QRIS | 005001005015564';
+            } elseif (str_contains($pmLower, 'bri') || str_contains($pmLower, 'transfer') || str_contains($pmLower, 'bank')) {
+                $depositAccount = 'BRI | 005001005015564';
+            } elseif ($payMethod !== 'CASH' && $payMethod !== 'TUNAI') {
+                $depositAccount = $payMethod;
+            }
+
+            $orderNo = $rec?->order_number ?: ($rec?->receivable_no ?: '-');
+            $custName = $rec?->customer_name ?: ($rec?->customer?->name ?: 'Pelanggan Kasbon');
+            $rpAmt = (float)$rp->amount;
+            $rawDate = $rp->payment_date ? (is_string($rp->payment_date) ? substr($rp->payment_date, 0, 10) : $rp->payment_date->format('Y-m-d')) : '';
+
+            $items[] = [
+                'no'               => 0,
+                'date'             => $rp->payment_date ? (is_string($rp->payment_date) ? date('d/m/Y', strtotime($rp->payment_date)) : $rp->payment_date->format('d/m/Y')) : '',
+                'time'             => $rp->created_at ? $rp->created_at->format('H:i') : '00:00',
+                'created_at'       => $rp->created_at ? $rp->created_at->format('d/m/Y H:i:s') : '',
+                'created_by'       => $rp->receiver?->name ?: 'Kasir',
+                'warehouse'        => $rp->outlet?->name ?: $outletName,
+                'order_number'     => $orderNo,
+                'payment_number'   => $rp->payment_no,
+                'customer'         => $custName,
+                'customer_name'    => $custName,
+                'payment_method'   => $payMethod,
+                'deposit_account'  => $depositAccount,
+                'total_transaction'=> $rpAmt,
+                'paid_amount'      => $rpAmt,
+                'receivable_amount'=> 0.0,
+                'cashier'          => $rp->receiver?->name ?: 'Kasir',
+                'raw_date'         => $rawDate,
+                'is_receivable_pay'=> true,
+            ];
+        }
+
+        // Sort items by date and created_at
+        usort($items, function ($a, $b) {
+            $cmp = strcmp($a['raw_date'] ?? '', $b['raw_date'] ?? '');
+            if ($cmp !== 0) return $cmp;
+            return strcmp($a['created_at'] ?? '', $b['created_at'] ?? '');
+        });
+
+        foreach ($items as $idx => &$it) {
+            $it['no'] = $idx + 1;
+        }
+        unset($it);
 
         if ($request->filled('search')) {
             $s = strtolower(trim($request->search));
             $items = array_filter($items, function ($it) use ($s) {
                 return str_contains(strtolower($it['order_number']), $s)
+                    || str_contains(strtolower($it['payment_number']), $s)
                     || str_contains(strtolower($it['customer']), $s)
                     || str_contains(strtolower($it['payment_method']), $s)
                     || str_contains(strtolower($it['warehouse']), $s)
@@ -419,11 +520,26 @@ class SalesReportController extends Controller
             unset($it);
         }
 
+        $paymentMethodsSummary = [];
+        foreach ($items as $it) {
+            $pm = $it['payment_method'] ?? 'CASH';
+            if (!isset($paymentMethodsSummary[$pm])) {
+                $paymentMethodsSummary[$pm] = [
+                    'method' => $pm,
+                    'count'  => 0,
+                    'amount' => 0.0,
+                ];
+            }
+            $paymentMethodsSummary[$pm]['count']++;
+            $paymentMethodsSummary[$pm]['amount'] += (float)$it['paid_amount'];
+        }
+
         $summary = [
             'total_count'       => count($items),
             'total_transaction' => array_sum(array_column($items, 'total_transaction')),
             'total_paid'        => array_sum(array_column($items, 'paid_amount')),
             'total_receivable'  => array_sum(array_column($items, 'receivable_amount')),
+            'payment_methods'   => array_values($paymentMethodsSummary),
         ];
 
         $comparePeriod = $this->resolveComparePeriod($request, $request->from, $request->to);
@@ -446,6 +562,14 @@ class SalesReportController extends Controller
                     $cTotalPaid += (float)$t->subtotal;
                 }
             }
+
+            // Also include receivable payments in comparison period
+            $cRpQuery = ReceivablePayment::where('business_id', $businessId)
+                ->whereBetween('payment_date', [$comparePeriod['from'], $comparePeriod['to']]);
+            if ($outletId) {
+                $cRpQuery->where('outlet_id', $outletId);
+            }
+            $cTotalPaid += (float)$cRpQuery->sum('amount');
 
             $summary['comparison'] = [
                 'enabled'      => true,
@@ -496,7 +620,7 @@ class SalesReportController extends Controller
         $outletId   = $this->getTargetOutletId($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId);
 
-        $query = Transaction::with(['menu', 'user', 'outlet', 'customer', 'discount'])
+        $query = Transaction::with(['menu', 'user', 'outlet', 'customer', 'discount', 'receivable.payments'])
             ->where('business_id', $businessId)
             ->where('status', 'PAID')
             ->whereBetween('date', [$request->from, $request->to])
@@ -525,8 +649,10 @@ class SalesReportController extends Controller
                 $depositAccount = 'QRIS | 005001005015564';
             } elseif (str_contains($pmLower, 'bri') || str_contains($pmLower, 'transfer') || str_contains($pmLower, 'digital')) {
                 $depositAccount = 'BRI | 005001005015564';
-            } elseif ($payMethod !== 'Tunai' && $payMethod !== 'Cash') {
+            } elseif ($payMethod !== 'Tunai' && $payMethod !== 'Cash' && !$isKasbon) {
                 $depositAccount = $payMethod;
+            } elseif ($isKasbon) {
+                $depositAccount = 'Piutang Kasbon';
             }
 
             $qty = (int)$t->qty;
@@ -535,6 +661,18 @@ class SalesReportController extends Controller
             $subtotal = (float)$t->subtotal;
             $disc = (float)($t->discount_amount ?: 0);
             $profit = $subtotal - ($hpp * $qty);
+
+            $remReceivable = $isKasbon ? $subtotal : 0.0;
+            $rec = $t->receivable;
+            if ($isKasbon && $rec) {
+                $payMethods = $rec->payments->pluck('payment_method')->map(fn($m) => strtoupper(trim($m)))->unique()->filter()->values()->all();
+                $remReceivable = (float)$rec->remaining_amount;
+                if ($remReceivable <= 0 && $rec->paid_amount > 0) {
+                    $payMethod = 'KASBON (Lunas: ' . (count($payMethods) ? implode(', ', $payMethods) : 'CASH') . ')';
+                } elseif ($rec->paid_amount > 0) {
+                    $payMethod = 'KASBON (Cicil: ' . (count($payMethods) ? implode(', ', $payMethods) : 'CASH') . ')';
+                }
+            }
 
             $items[] = [
                 'no'               => $idx + 1,
@@ -562,7 +700,7 @@ class SalesReportController extends Controller
                 'service_charge'   => 0.0,
                 'shipping'         => 0.0,
                 'total_sale'       => $subtotal,
-                'receivable'       => $isKasbon ? $subtotal : 0.0,
+                'receivable'       => $remReceivable,
                 'profit'           => $profit,
                 'cashier'          => $t->user?->name ?: 'Lulu',
                 'receipt_printed'  => 0,
@@ -664,7 +802,7 @@ class SalesReportController extends Controller
         $outletId   = $this->getTargetOutletId($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId);
 
-        $query = Transaction::with(['menu', 'user', 'outlet', 'customer'])
+        $query = Transaction::with(['menu', 'user', 'outlet', 'customer', 'receivable.payments'])
             ->where('business_id', $businessId)
             ->where('status', 'PAID')
             ->whereBetween('date', [$request->from, $request->to])
@@ -687,8 +825,22 @@ class SalesReportController extends Controller
             $qty = (int)$t->qty;
             $price = (float)($menu?->price ?: ($t->total_price / max(1, $qty)));
             $subtotal = (float)$t->subtotal;
+
             $paid = $isKasbon ? 0.0 : $subtotal;
             $receivable = $isKasbon ? $subtotal : 0.0;
+            $rec = $t->receivable;
+            if ($isKasbon && $rec) {
+                $payMethods = $rec->payments->pluck('payment_method')->map(fn($m) => strtoupper(trim($m)))->unique()->filter()->values()->all();
+                $remReceivable = (float)$rec->remaining_amount;
+                $recPaid = (float)$rec->paid_amount;
+                $paid = min($subtotal, $recPaid);
+                $receivable = $remReceivable;
+                if ($remReceivable <= 0 && $recPaid > 0) {
+                    $payMethod = 'KASBON (Lunas: ' . (count($payMethods) ? implode(', ', $payMethods) : 'CASH') . ')';
+                } elseif ($recPaid > 0) {
+                    $payMethod = 'KASBON (Cicil: ' . (count($payMethods) ? implode(', ', $payMethods) : 'CASH') . ')';
+                }
+            }
 
             $items[] = [
                 'no'               => $idx + 1,
@@ -900,7 +1052,7 @@ class SalesReportController extends Controller
         $recCtrl = new \App\Http\Controllers\ReceivableController();
         $recCtrl->syncMerchantReceivables($businessId, $outletId);
 
-        $query = Receivable::with(['customer', 'outlet'])
+        $query = Receivable::with(['customer', 'outlet', 'payments.receiver'])
             ->where('business_id', $businessId)
             ->whereBetween('issue_date', [$request->from, $request->to])
             ->orderBy('issue_date', 'asc');
@@ -921,6 +1073,24 @@ class SalesReportController extends Controller
         // Filter by Settlement Status
         if ($request->filled('settlement_status') && $request->settlement_status !== 'ALL' && $request->settlement_status !== 'all') {
             $query->where('settlement_status', $request->settlement_status);
+        }
+
+        // Filter by Payment Method (e.g. CASH, QRIS, TRANSFER, DEBIT)
+        if ($request->filled('payment_method') && $request->payment_method !== 'ALL') {
+            $pm = strtoupper($request->payment_method);
+            $query->whereHas('payments', function ($q) use ($pm) {
+                if (in_array($pm, ['CASH', 'TUNAI'])) {
+                    $q->whereIn(DB::raw('UPPER(payment_method)'), ['CASH', 'TUNAI']);
+                } elseif (str_contains($pm, 'QRIS')) {
+                    $q->where(DB::raw('UPPER(payment_method)'), 'like', '%QRIS%');
+                } elseif (str_contains($pm, 'TRANSFER')) {
+                    $q->where(DB::raw('UPPER(payment_method)'), 'like', '%TRANSFER%');
+                } elseif (str_contains($pm, 'DEBIT')) {
+                    $q->where(DB::raw('UPPER(payment_method)'), 'like', '%DEBIT%');
+                } else {
+                    $q->where('payment_method', $pm);
+                }
+            });
         }
 
         if ($request->filled('search')) {
@@ -945,12 +1115,21 @@ class SalesReportController extends Controller
             $channel = $r->merchant_channel ?: ($arType === 'CUSTOMER' ? 'Customer Kasbon' : 'QRIS');
             $typeLabel = $arType === 'CUSTOMER' ? 'Piutang Pelanggan' : ($arType === 'MERCHANT_QRIS' ? 'AR Merchant QRIS' : 'AR Merchant E-Commerce');
 
+            $payMethods = $r->payments->pluck('payment_method')->map(fn($m) => strtoupper(trim($m)))->unique()->filter()->values()->all();
+            $paymentMethodStr = count($payMethods) > 0 ? implode(', ', $payMethods) : ($r->paid_amount > 0 ? 'CASH' : '-');
+            $latestPayment = $r->payments->last();
+
             $items[] = [
                 'no'               => $idx + 1,
                 'customer'         => $r->customer_name ?: ($r->customer?->name ?: 'Walk-in Customer'),
                 'ar_type'          => $arType,
                 'ar_type_label'    => $typeLabel,
                 'merchant_channel' => $channel,
+                'payment_method'   => $paymentMethodStr,
+                'payment_methods'  => $payMethods,
+                'latest_payment_method' => $latestPayment ? strtoupper($latestPayment->payment_method) : null,
+                'payments_count'   => $r->payments->count(),
+                'last_payment_date'=> $latestPayment && $latestPayment->payment_date ? (is_string($latestPayment->payment_date) ? date('d/m/Y', strtotime($latestPayment->payment_date)) : $latestPayment->payment_date->format('d/m/Y')) : null,
                 'tanggal'          => $r->issue_date ? date('d/m/Y', strtotime($r->issue_date)) : '',
                 'jam'              => $r->created_at ? $r->created_at->format('H:i') : '00:00',
                 'no_penjualan'     => $r->order_number ?: ($r->receivable_no ?: '-'),

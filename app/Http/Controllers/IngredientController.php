@@ -40,7 +40,8 @@ class IngredientController extends Controller
         if (!empty($ingIds)) {
             $movSummary = DB::table('stock_movements')
                 ->whereIn('ingredient_id', $ingIds)
-                ->selectRaw("ingredient_id, outlet_id, SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->where('type', '!=', 'INITIAL')
+                ->selectRaw("ingredient_id, outlet_id, SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
                 ->groupBy('ingredient_id', 'outlet_id')
                 ->get();
 
@@ -335,167 +336,178 @@ class IngredientController extends Controller
 
         $importedCount = 0;
 
-        DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
-            $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
-            if ($businessOutlets->isEmpty()) {
-                $businessOutlets = \App\Models\Outlet::all();
-            }
-
-            foreach ($items as $idx => $row) {
-                if (empty($row['name'])) continue;
-
-                $name = trim($row['name']);
-                $lowerName = strtolower($name);
-
-                // Filter out accidental header / banner rows
-                if (
-                    str_starts_with($name, '===') ||
-                    str_contains($lowerName, 'template import') ||
-                    str_contains($lowerName, 'petunjuk') ||
-                    str_contains($lowerName, 'data bahan') ||
-                    in_array($lowerName, ['kode bahan', 'nama bahan', 'nama bahan*', 'kategori', 'tipe bahan', 'satuan beli', 'satuan pakai'])
-                ) {
-                    continue;
+        try {
+            DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+                $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
+                if ($businessOutlets->isEmpty()) {
+                    $businessOutlets = \App\Models\Outlet::all();
                 }
 
-                $code = !empty($row['code']) ? trim($row['code']) : null;
-                $name = trim($row['name']);
+                foreach ($items as $idx => $row) {
+                    if (empty($row['name'])) continue;
 
-                // If user didn't specify a code, auto-generate next safe code for this business without collision
-                if (empty($code)) {
-                    $seq = Ingredient::where('business_id', $businessId)->count() + 1;
-                    do {
-                        $candidateCode = 'BHN-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                        $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
-                        $seq++;
-                    } while ($exists);
-                    $code = $candidateCode;
-                }
+                    $name = trim($row['name']);
+                    $lowerName = strtolower($name);
 
-                $categoryName = !empty($row['category']) ? trim($row['category']) : 'BAHAN_BAKU';
-                $cat = Category::firstOrCreate(
-                    ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'INGREDIENT'],
-                    ['slug' => Str::slug($categoryName), 'color' => '#00B14F', 'icon' => 'Package']
-                );
+                    // Filter out accidental header / banner rows
+                    if (
+                        str_starts_with($name, '===') ||
+                        str_contains($lowerName, 'template import') ||
+                        str_contains($lowerName, 'petunjuk') ||
+                        str_contains($lowerName, 'data bahan') ||
+                        in_array($lowerName, ['kode bahan', 'nama bahan', 'nama bahan*', 'kategori', 'tipe bahan', 'satuan beli', 'satuan pakai'])
+                    ) {
+                        continue;
+                    }
 
-                // Smart Unit Normalizer: auto typo-fix, synonym mapping, and auto-register new unit
-                $unitBeliInfo = $this->resolveUnit($row['unit_beli'] ?? 'kg', $businessId, 'kg');
-                $unitPakaiInfo = $this->resolveUnit($row['unit_pakai'] ?? 'gram', $businessId, 'gram');
+                    $code = !empty($row['code']) ? trim($row['code']) : null;
+                    $name = trim($row['name']);
 
-                // Smart Conversion Auto-Fix (if user omitted or entered 1 for different units)
-                $konversi = (float)($row['konversi'] ?? 0);
-                if ($konversi <= 0 || ($konversi == 1 && $unitBeliInfo['symbol'] !== $unitPakaiInfo['symbol'])) {
-                    if ($unitBeliInfo['symbol'] === 'kg' && $unitPakaiInfo['symbol'] === 'gram') {
-                        $konversi = 1000;
-                    } elseif ($unitBeliInfo['symbol'] === 'liter' && $unitPakaiInfo['symbol'] === 'ml') {
-                        $konversi = 1000;
-                    } elseif ($unitBeliInfo['symbol'] === 'slop' && $unitPakaiInfo['symbol'] === 'pcs') {
-                        $konversi = 50;
-                    } elseif ($unitBeliInfo['symbol'] === 'pack' && in_array($unitPakaiInfo['symbol'], ['pcs', 'lembar'])) {
-                        $konversi = ($unitPakaiInfo['symbol'] === 'lembar') ? 200 : 100;
+                    // If user didn't specify a code, auto-generate next safe code for this business without collision
+                    if (empty($code)) {
+                        $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                        do {
+                            $candidateCode = 'BHN-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                            $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                            $seq++;
+                        } while ($exists);
+                        $code = $candidateCode;
+                    }
+
+                    $categoryName = !empty($row['category']) ? trim($row['category']) : 'BAHAN_BAKU';
+                    $cat = Category::firstOrCreate(
+                        ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'INGREDIENT'],
+                        ['slug' => Str::slug($categoryName), 'color' => '#00B14F', 'icon' => 'Package']
+                    );
+
+                    // Smart Unit Normalizer: auto typo-fix, synonym mapping, and auto-register new unit
+                    $unitBeliInfo = $this->resolveUnit($row['unit_beli'] ?? 'kg', $businessId, 'kg');
+                    $unitPakaiInfo = $this->resolveUnit($row['unit_pakai'] ?? 'gram', $businessId, 'gram');
+
+                    // Smart Conversion Auto-Fix (if user omitted or entered 1 for different units)
+                    $konversi = (float)($row['konversi'] ?? 0);
+                    if ($konversi <= 0 || ($konversi == 1 && $unitBeliInfo['symbol'] !== $unitPakaiInfo['symbol'])) {
+                        if ($unitBeliInfo['symbol'] === 'kg' && $unitPakaiInfo['symbol'] === 'gram') {
+                            $konversi = 1000;
+                        } elseif ($unitBeliInfo['symbol'] === 'liter' && $unitPakaiInfo['symbol'] === 'ml') {
+                            $konversi = 1000;
+                        } elseif ($unitBeliInfo['symbol'] === 'slop' && $unitPakaiInfo['symbol'] === 'pcs') {
+                            $konversi = 50;
+                        } elseif ($unitBeliInfo['symbol'] === 'pack' && in_array($unitPakaiInfo['symbol'], ['pcs', 'lembar'])) {
+                            $konversi = ($unitPakaiInfo['symbol'] === 'lembar') ? 200 : 100;
+                        } else {
+                            $konversi = ($konversi <= 0) ? 1 : $konversi;
+                        }
+                    }
+
+                    $hargaBeli = (float)($row['harga'] ?? 0);
+                    $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
+                    $initialStock = (float)(
+                        $row['initial_stock'] ??
+                        $row['stock_awal'] ??
+                        $row['stok_awal'] ??
+                        $row['initialStock'] ??
+                        $row['stock'] ??
+                        $row['stok'] ??
+                        0
+                    );
+                    $initialBalance = round((float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0));
+                    if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
+                        $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
+                    }
+
+                    // Match strictly by (business_id, code) so custom codes are honored per business
+                    $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
+
+                    $ingData = [
+                        'name'                => $name,
+                        'category_id'         => $cat->id,
+                        'category'            => $cat->name,
+                        'type'                => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
+                        'unit_beli'           => substr($unitBeliInfo['symbol'], 0, 20),
+                        'unit_pakai'          => substr($unitPakaiInfo['symbol'], 0, 20),
+                        'unit_beli_id'        => $unitBeliInfo['id'],
+                        'unit_pakai_id'       => $unitPakaiInfo['id'],
+                        'konversi'            => $konversi,
+                        'stok_min'            => $minStok,
+                        'tolerance'           => (float)($row['tolerance'] ?? 5),
+                        'notes'               => $row['notes'] ?? 'Imported from Excel',
+                        'created_by'          => $user?->id,
+                        'updated_by'          => $user?->id,
+                    ];
+
+                    if ($hargaBeli > 0 || !$existingIng) {
+                        $ingData['harga'] = $hargaBeli;
+                        $ingData['last_purchase_price'] = $hargaBeli;
+                    }
+                    if ($initialStock > 0 || !$existingIng) {
+                        $ingData['stok_awal'] = $initialStock;
+                    }
+
+                    $ing = Ingredient::updateOrCreate(
+                        [
+                            'business_id' => $businessId,
+                            'code'        => substr($code, 0, 20),
+                        ],
+                        $ingData
+                    );
+
+                    $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
+                    $matchedOutlet = null;
+                    if (!empty($targetOutletName)) {
+                        $matchedOutlet = $businessOutlets->first(function ($o) use ($targetOutletName) {
+                            return strcasecmp(trim($o->name), $targetOutletName) === 0 ||
+                                   strcasecmp(trim($o->code), $targetOutletName) === 0 ||
+                                   str_contains(strtolower($o->name), strtolower($targetOutletName));
+                        });
+                    }
+
+                    $targetOutletId = null;
+                    if ($matchedOutlet) {
+                        $targetOutletId = (int)$matchedOutlet->id;
+                    } elseif ($user?->outlet_id && $businessOutlets->contains('id', $user->outlet_id)) {
+                        $targetOutletId = (int)$user->outlet_id;
                     } else {
-                        $konversi = ($konversi <= 0) ? 1 : $konversi;
-                    }
-                }
-
-                $hargaBeli = (float)($row['harga'] ?? 0);
-                $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
-                $initialStock = (float)(
-                    $row['initial_stock'] ??
-                    $row['stock_awal'] ??
-                    $row['stok_awal'] ??
-                    $row['initialStock'] ??
-                    $row['stock'] ??
-                    $row['stok'] ??
-                    0
-                );
-                $initialBalance = round((float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0));
-                if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
-                    $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
-                }
-
-                // Match strictly by (business_id, code) so custom codes are honored per business
-                $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
-
-                $ingData = [
-                    'name'                => $name,
-                    'category_id'         => $cat->id,
-                    'category'            => $cat->name,
-                    'type'                => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
-                    'unit_beli'           => $unitBeliInfo['symbol'],
-                    'unit_pakai'          => $unitPakaiInfo['symbol'],
-                    'unit_beli_id'        => $unitBeliInfo['id'],
-                    'unit_pakai_id'       => $unitPakaiInfo['id'],
-                    'konversi'            => $konversi,
-                    'stok_min'            => $minStok,
-                    'tolerance'           => (float)($row['tolerance'] ?? 5),
-                    'notes'               => $row['notes'] ?? 'Imported from Excel',
-                    'created_by'          => $user?->id,
-                    'updated_by'          => $user?->id,
-                ];
-
-                if ($hargaBeli > 0 || !$existingIng) {
-                    $ingData['harga'] = $hargaBeli;
-                    $ingData['last_purchase_price'] = $hargaBeli;
-                }
-                if ($initialStock > 0 || !$existingIng) {
-                    $ingData['stok_awal'] = $initialStock;
-                }
-
-                $ing = Ingredient::updateOrCreate(
-                    [
-                        'business_id' => $businessId,
-                        'code'        => $code,
-                    ],
-                    $ingData
-                );
-
-                $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
-                $matchedOutlet = null;
-                if (!empty($targetOutletName)) {
-                    $matchedOutlet = $businessOutlets->first(function ($o) use ($targetOutletName) {
-                        return strcasecmp(trim($o->name), $targetOutletName) === 0 ||
-                               strcasecmp(trim($o->code), $targetOutletName) === 0 ||
-                               str_contains(strtolower($o->name), strtolower($targetOutletName));
-                    });
-                }
-
-                $targetOutletId = null;
-                if ($matchedOutlet) {
-                    $targetOutletId = (int)$matchedOutlet->id;
-                } elseif ($user?->outlet_id && $businessOutlets->contains('id', $user->outlet_id)) {
-                    $targetOutletId = (int)$user->outlet_id;
-                } else {
-                    $mainOut = $businessOutlets->firstWhere('is_main', true) ?? $businessOutlets->first();
-                    $targetOutletId = $mainOut ? (int)$mainOut->id : 1;
-                }
-
-                // Sync/Initialize OutletIngredient for all business outlets
-                foreach ($businessOutlets as $bo) {
-                    $outletRow = \App\Models\OutletIngredient::firstOrNew([
-                        'outlet_id'     => $bo->id,
-                        'ingredient_id' => $ing->id,
-                    ]);
-                    $isTarget = ((int)$bo->id === (int)$targetOutletId);
-
-                    if ($initialStock > 0 && $isTarget) {
-                        $outletRow->stok_awal = $initialStock;
-                    } elseif ($outletRow->stok_awal === null) {
-                        $outletRow->stok_awal = 0.0;
+                        $mainOut = $businessOutlets->firstWhere('is_main', true) ?? $businessOutlets->first();
+                        $targetOutletId = $mainOut ? (int)$mainOut->id : 1;
                     }
 
-                    $outletRow->stok_min = $minStok;
+                    // Sync/Initialize OutletIngredient for all business outlets
+                    foreach ($businessOutlets as $bo) {
+                        $outletRow = \App\Models\OutletIngredient::firstOrNew([
+                            'outlet_id'     => $bo->id,
+                            'ingredient_id' => $ing->id,
+                        ]);
+                        $isTarget = ((int)$bo->id === (int)$targetOutletId);
 
-                    if ($hargaBeli > 0 || $outletRow->harga === null) {
-                        $outletRow->harga = $hargaBeli;
-                        $outletRow->last_purchase_price = $hargaBeli;
+                        if ($initialStock > 0 && $isTarget) {
+                            $outletRow->stok_awal = $initialStock;
+                        } elseif ($outletRow->stok_awal === null) {
+                            $outletRow->stok_awal = 0.0;
+                        }
+
+                        $outletRow->stok_min = $minStok;
+
+                        if ($hargaBeli > 0 || $outletRow->harga === null) {
+                            $outletRow->harga = $hargaBeli;
+                            $outletRow->last_purchase_price = $hargaBeli;
+                        }
+                        $outletRow->save();
                     }
-                    $outletRow->save();
-                }
 
-                $importedCount++;
-            }
-        });
+                    $importedCount++;
+                }
+            });
+        } catch (\Throwable $e) {
+            try {
+                \Illuminate\Support\Facades\Log::error("bulkImport Ingredient error: " . $e->getMessage());
+            } catch (\Throwable $logEx) {}
+
+            return response()->json([
+                'message' => 'Gagal meng-import master bahan: ' . $e->getMessage(),
+                'error'   => $e->getMessage(),
+            ], 422);
+        }
 
         return response()->json([
             'message' => "Berhasil meng-import {$importedCount} master bahan terpusat.",
@@ -515,163 +527,174 @@ class IngredientController extends Controller
 
         $importedCount = 0;
 
-        DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
-            $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
-            if ($businessOutlets->isEmpty()) {
-                $businessOutlets = \App\Models\Outlet::all();
-            }
-
-            foreach ($items as $idx => $row) {
-                if (empty($row['name'])) continue;
-
-                $name = trim($row['name']);
-                $lowerName = strtolower($name);
-
-                if (
-                    str_starts_with($name, '===') ||
-                    str_contains($lowerName, 'template import') ||
-                    str_contains($lowerName, 'petunjuk') ||
-                    str_contains($lowerName, 'data perlengkapan') ||
-                    in_array($lowerName, ['kode perlengkapan', 'nama perlengkapan', 'nama perlengkapan*', 'kategori', 'satuan beli', 'satuan pakai'])
-                ) {
-                    continue;
+        try {
+            DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+                $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
+                if ($businessOutlets->isEmpty()) {
+                    $businessOutlets = \App\Models\Outlet::all();
                 }
 
-                $code = !empty($row['code']) ? trim($row['code']) : null;
+                foreach ($items as $idx => $row) {
+                    if (empty($row['name'])) continue;
 
-                // If user didn't specify a code, auto-generate next safe code for this business without collision
-                if (empty($code)) {
-                    $seq = Ingredient::where('business_id', $businessId)->count() + 1;
-                    do {
-                        $candidateCode = 'PLK-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                        $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
-                        $seq++;
-                    } while ($exists);
-                    $code = $candidateCode;
-                }
+                    $name = trim($row['name']);
+                    $lowerName = strtolower($name);
 
-                $categoryName = !empty($row['category']) ? trim($row['category']) : 'Perlengkapan';
-                $cat = Category::firstOrCreate(
-                    ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'INGREDIENT'],
-                    ['slug' => Str::slug($categoryName), 'color' => '#00B14F', 'icon' => 'Package']
-                );
+                    if (
+                        str_starts_with($name, '===') ||
+                        str_contains($lowerName, 'template import') ||
+                        str_contains($lowerName, 'petunjuk') ||
+                        str_contains($lowerName, 'data perlengkapan') ||
+                        in_array($lowerName, ['kode perlengkapan', 'nama perlengkapan', 'nama perlengkapan*', 'kategori', 'satuan beli', 'satuan pakai'])
+                    ) {
+                        continue;
+                    }
 
-                // Smart Unit Normalizer: auto typo-fix, synonym mapping, and auto-register new unit
-                $unitBeliInfo = $this->resolveUnit($row['unit_beli'] ?? 'Slop', $businessId, 'Slop');
-                $unitPakaiInfo = $this->resolveUnit($row['unit_pakai'] ?? 'pcs', $businessId, 'pcs');
+                    $code = !empty($row['code']) ? trim($row['code']) : null;
 
-                // Smart Conversion Auto-Fix
-                $konversi = (float)($row['konversi'] ?? 0);
-                if ($konversi <= 0 || ($konversi == 1 && $unitBeliInfo['symbol'] !== $unitPakaiInfo['symbol'])) {
-                    if ($unitBeliInfo['symbol'] === 'slop' && $unitPakaiInfo['symbol'] === 'pcs') {
-                        $konversi = 50;
-                    } elseif ($unitBeliInfo['symbol'] === 'pack' && in_array($unitPakaiInfo['symbol'], ['pcs', 'lembar'])) {
-                        $konversi = ($unitPakaiInfo['symbol'] === 'lembar') ? 200 : 100;
-                    } elseif ($unitBeliInfo['symbol'] === 'kg' && $unitPakaiInfo['symbol'] === 'gram') {
-                        $konversi = 1000;
+                    // If user didn't specify a code, auto-generate next safe code for this business without collision
+                    if (empty($code)) {
+                        $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                        do {
+                            $candidateCode = 'PLK-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                            $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                            $seq++;
+                        } while ($exists);
+                        $code = $candidateCode;
+                    }
+
+                    $categoryName = !empty($row['category']) ? trim($row['category']) : 'Perlengkapan';
+                    $cat = Category::firstOrCreate(
+                        ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'INGREDIENT'],
+                        ['slug' => Str::slug($categoryName), 'color' => '#00B14F', 'icon' => 'Package']
+                    );
+
+                    // Smart Unit Normalizer: auto typo-fix, synonym mapping, and auto-register new unit
+                    $unitBeliInfo = $this->resolveUnit($row['unit_beli'] ?? 'Slop', $businessId, 'Slop');
+                    $unitPakaiInfo = $this->resolveUnit($row['unit_pakai'] ?? 'pcs', $businessId, 'pcs');
+
+                    // Smart Conversion Auto-Fix
+                    $konversi = (float)($row['konversi'] ?? 0);
+                    if ($konversi <= 0 || ($konversi == 1 && $unitBeliInfo['symbol'] !== $unitPakaiInfo['symbol'])) {
+                        if ($unitBeliInfo['symbol'] === 'slop' && $unitPakaiInfo['symbol'] === 'pcs') {
+                            $konversi = 50;
+                        } elseif ($unitBeliInfo['symbol'] === 'pack' && in_array($unitPakaiInfo['symbol'], ['pcs', 'lembar'])) {
+                            $konversi = ($unitPakaiInfo['symbol'] === 'lembar') ? 200 : 100;
+                        } elseif ($unitBeliInfo['symbol'] === 'kg' && $unitPakaiInfo['symbol'] === 'gram') {
+                            $konversi = 1000;
+                        } else {
+                            $konversi = ($konversi <= 0) ? 1 : $konversi;
+                        }
+                    }
+
+                    $hargaBeli = (float)($row['harga'] ?? 0);
+                    $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
+                    $initialStock = (float)(
+                        $row['initial_stock'] ??
+                        $row['stock_awal'] ??
+                        $row['stok_awal'] ??
+                        $row['initialStock'] ??
+                        $row['stock'] ??
+                        $row['stok'] ??
+                        0
+                    );
+                    $initialBalance = round((float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0));
+                    if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
+                        $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
+                    }
+
+                    // Match strictly by (business_id, code) so custom codes are honored per business
+                    $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
+
+                    $ingData = [
+                        'name'                => $name,
+                        'category_id'         => $cat->id,
+                        'category'            => $cat->name,
+                        'type'                => 'RAW',
+                        'unit_beli'           => substr($unitBeliInfo['symbol'], 0, 20),
+                        'unit_pakai'          => substr($unitPakaiInfo['symbol'], 0, 20),
+                        'unit_beli_id'        => $unitBeliInfo['id'],
+                        'unit_pakai_id'       => $unitPakaiInfo['id'],
+                        'konversi'            => $konversi,
+                        'stok_min'            => $minStok,
+                        'tolerance'           => (float)($row['tolerance'] ?? 5),
+                        'notes'               => $row['notes'] ?? 'Imported Perlengkapan from Excel',
+                        'created_by'          => $user?->id,
+                        'updated_by'          => $user?->id,
+                    ];
+
+                    if ($hargaBeli > 0 || !$existingIng) {
+                        $ingData['harga'] = $hargaBeli;
+                        $ingData['last_purchase_price'] = $hargaBeli;
+                    }
+                    if ($initialStock > 0 || !$existingIng) {
+                        $ingData['stok_awal'] = $initialStock;
+                    }
+
+                    $ing = Ingredient::updateOrCreate(
+                        [
+                            'business_id' => $businessId,
+                            'code'        => substr($code, 0, 20),
+                        ],
+                        $ingData
+                    );
+
+                    $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
+                    $matchedOutlet = null;
+                    if (!empty($targetOutletName)) {
+                        $matchedOutlet = $businessOutlets->first(function ($o) use ($targetOutletName) {
+                            return strcasecmp(trim($o->name), $targetOutletName) === 0 ||
+                                   strcasecmp(trim($o->code), $targetOutletName) === 0 ||
+                                   str_contains(strtolower($o->name), strtolower($targetOutletName));
+                        });
+                    }
+
+                    $targetOutletId = null;
+                    if ($matchedOutlet) {
+                        $targetOutletId = (int)$matchedOutlet->id;
+                    } elseif ($user?->outlet_id && $businessOutlets->contains('id', $user->outlet_id)) {
+                        $targetOutletId = (int)$user->outlet_id;
                     } else {
-                        $konversi = ($konversi <= 0) ? 1 : $konversi;
-                    }
-                }
-
-                $hargaBeli = (float)($row['harga'] ?? 0);
-                $minStok = (float)($row['minstok'] ?? $row['stok_min'] ?? 0);
-                $initialStock = (float)(
-                    $row['initial_stock'] ??
-                    $row['stock_awal'] ??
-                    $row['stok_awal'] ??
-                    $row['initialStock'] ??
-                    $row['stock'] ??
-                    $row['stok'] ??
-                    0
-                );
-                $initialBalance = round((float)($row['initial_balance'] ?? $row['saldo_awal_nominal'] ?? $row['saldo_awal'] ?? 0));
-                if ($hargaBeli <= 0 && $initialStock > 0 && $initialBalance > 0) {
-                    $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
-                }
-
-                // Match strictly by (business_id, code) so custom codes are honored per business
-                $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
-
-                $ingData = [
-                    'name'                => $name,
-                    'category_id'         => $cat->id,
-                    'category'            => $cat->name,
-                    'type'                => 'RAW',
-                    'unit_beli'           => $unitBeliInfo['symbol'],
-                    'unit_pakai'          => $unitPakaiInfo['symbol'],
-                    'unit_beli_id'        => $unitBeliInfo['id'],
-                    'unit_pakai_id'       => $unitPakaiInfo['id'],
-                    'konversi'            => $konversi,
-                    'stok_min'            => $minStok,
-                    'tolerance'           => (float)($row['tolerance'] ?? 5),
-                    'notes'               => $row['notes'] ?? 'Imported Perlengkapan from Excel',
-                    'created_by'          => $user?->id,
-                    'updated_by'          => $user?->id,
-                ];
-
-                if ($hargaBeli > 0 || !$existingIng) {
-                    $ingData['harga'] = $hargaBeli;
-                    $ingData['last_purchase_price'] = $hargaBeli;
-                }
-                if ($initialStock > 0 || !$existingIng) {
-                    $ingData['stok_awal'] = $initialStock;
-                }
-
-                $ing = Ingredient::updateOrCreate(
-                    [
-                        'business_id' => $businessId,
-                        'code'        => $code,
-                    ],
-                    $ingData
-                );
-
-                $targetOutletName = trim($row['outlet_name'] ?? $row['outlet'] ?? $row['cabang'] ?? '');
-                $matchedOutlet = null;
-                if (!empty($targetOutletName)) {
-                    $matchedOutlet = $businessOutlets->first(function ($o) use ($targetOutletName) {
-                        return strcasecmp(trim($o->name), $targetOutletName) === 0 ||
-                               strcasecmp(trim($o->code), $targetOutletName) === 0 ||
-                               str_contains(strtolower($o->name), strtolower($targetOutletName));
-                    });
-                }
-
-                $targetOutletId = null;
-                if ($matchedOutlet) {
-                    $targetOutletId = (int)$matchedOutlet->id;
-                } elseif ($user?->outlet_id && $businessOutlets->contains('id', $user->outlet_id)) {
-                    $targetOutletId = (int)$user->outlet_id;
-                } else {
-                    $mainOut = $businessOutlets->firstWhere('is_main', true) ?? $businessOutlets->first();
-                    $targetOutletId = $mainOut ? (int)$mainOut->id : 1;
-                }
-
-                // Sync/Initialize OutletIngredient for all business outlets
-                foreach ($businessOutlets as $bo) {
-                    $outletRow = \App\Models\OutletIngredient::firstOrNew([
-                        'outlet_id'     => $bo->id,
-                        'ingredient_id' => $ing->id,
-                    ]);
-                    $isTarget = ((int)$bo->id === (int)$targetOutletId);
-
-                    if ($initialStock > 0 && $isTarget) {
-                        $outletRow->stok_awal = $initialStock;
-                    } elseif ($outletRow->stok_awal === null) {
-                        $outletRow->stok_awal = 0.0;
+                        $mainOut = $businessOutlets->firstWhere('is_main', true) ?? $businessOutlets->first();
+                        $targetOutletId = $mainOut ? (int)$mainOut->id : 1;
                     }
 
-                    $outletRow->stok_min = $minStok;
+                    // Sync/Initialize OutletIngredient for all business outlets
+                    foreach ($businessOutlets as $bo) {
+                        $outletRow = \App\Models\OutletIngredient::firstOrNew([
+                            'outlet_id'     => $bo->id,
+                            'ingredient_id' => $ing->id,
+                        ]);
+                        $isTarget = ((int)$bo->id === (int)$targetOutletId);
 
-                    if ($hargaBeli > 0 || $outletRow->harga === null) {
-                        $outletRow->harga = $hargaBeli;
-                        $outletRow->last_purchase_price = $hargaBeli;
+                        if ($initialStock > 0 && $isTarget) {
+                            $outletRow->stok_awal = $initialStock;
+                        } elseif ($outletRow->stok_awal === null) {
+                            $outletRow->stok_awal = 0.0;
+                        }
+
+                        $outletRow->stok_min = $minStok;
+
+                        if ($hargaBeli > 0 || $outletRow->harga === null) {
+                            $outletRow->harga = $hargaBeli;
+                            $outletRow->last_purchase_price = $hargaBeli;
+                        }
+                        $outletRow->save();
                     }
-                    $outletRow->save();
-                }
 
-                $importedCount++;
-            }
-        });
+                    $importedCount++;
+                }
+            });
+        } catch (\Throwable $e) {
+            try {
+                \Illuminate\Support\Facades\Log::error("bulkImportPerlengkapan error: " . $e->getMessage());
+            } catch (\Throwable $logEx) {}
+
+            return response()->json([
+                'message' => 'Gagal meng-import master perlengkapan: ' . $e->getMessage(),
+                'error'   => $e->getMessage(),
+            ], 422);
+        }
 
         return response()->json([
             'message' => "Berhasil meng-import {$importedCount} data master perlengkapan & packaging terpusat.",

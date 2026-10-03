@@ -10,6 +10,8 @@ class OutletIngredient extends Model
         'outlet_id',
         'ingredient_id',
         'stok_awal',
+        'saldo_awal_nominal',
+        'tanggal_saldo_awal',
         'stok_min',
         'harga',
         'last_purchase_price',
@@ -17,6 +19,8 @@ class OutletIngredient extends Model
 
     protected $casts = [
         'stok_awal'           => 'float',
+        'saldo_awal_nominal'  => 'float',
+        'tanggal_saldo_awal'  => 'string',
         'stok_min'            => 'float',
         'harga'               => 'float',
         'last_purchase_price' => 'float',

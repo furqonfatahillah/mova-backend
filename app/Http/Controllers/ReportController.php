@@ -11,6 +11,8 @@ use App\Models\OperatingExpense;
 use App\Models\WasteLog;
 use App\Models\Outlet;
 use App\Models\Receivable;
+use App\Models\Payable;
+use App\Models\Supplier;
 use App\Models\Shift;
 use App\Models\CashTransaction;
 use Illuminate\Http\Request;
@@ -37,7 +39,7 @@ class ReportController extends Controller
 
     /**
      * Pre-compute movement aggregates for a single ingredient's movements.
-     * Returns all needed sums in a SINGLE pass — no repeated loops.
+     * Returns all needed sums in a SINGLE pass — matching Kartu Stok movement ledger.
      */
     private function aggregateIngredientMovements(array $ingMovements, string $from, string $to): array
     {
@@ -50,18 +52,26 @@ class ReportController extends Controller
         $transferIn = 0.0;
         $transferOut = 0.0;
         $adjustment = 0.0;
+        $initialInPeriod = 0.0;
         $wasteRecords = [];
 
         foreach ($ingMovements as $m) {
             $date = $m->date;
             $type = $m->type;
             $qty  = (float) $m->qty;
+            $note = $m->note ?? '';
+
+            if (str_contains($note, 'VOID WASTED')) {
+                $type = 'WASTE';
+            } elseif (str_contains($note, 'VOID SALAH INPUT')) {
+                continue;
+            }
 
             if ($date < $from) {
                 // Pre-period: accumulate opening balance
                 $balanceBefore += $this->signedQtyByType($type, $qty);
             } elseif ($date <= $to) {
-                // In-period: aggregate by type
+                // In-period: aggregate by type matching Kartu Stok
                 switch ($type) {
                     case 'PURCHASE':       $purchase += $qty; break;
                     case 'SALE_USAGE':     $saleUsage += $qty; break;
@@ -78,13 +88,12 @@ class ReportController extends Controller
                     case 'ADJUSTMENT_OUT':
                         $adjustment -= $qty; break;
                     default:
-                        // Other types in-period contribute to opening balance logic if needed
                         break;
                 }
             }
         }
 
-        return compact('balanceBefore', 'purchase', 'saleUsage', 'prepUsage', 'prepOutput', 'waste', 'transferIn', 'transferOut', 'adjustment', 'wasteRecords');
+        return compact('balanceBefore', 'purchase', 'saleUsage', 'prepUsage', 'prepOutput', 'waste', 'transferIn', 'transferOut', 'adjustment', 'initialInPeriod', 'wasteRecords');
     }
 
     private function statusOf(float $absPct, float $tol): string
@@ -102,20 +111,20 @@ class ReportController extends Controller
         $p = $this->validatePeriod($request);
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
 
         return response()->json($this->buildVarianceArray($p['from'], $p['to'], $outletId));
     }
 
     /**
-     * Variance per menu (allocation by theoretical usage share).
-    /**
-     * Internal variance per menu calculation
+     * Internal variance per menu calculation (aligned with stock card & recipe shares)
      */
     private function calculateVarianceMenusData(string $from, string $to, ?int $outletId): array
     {
         $varData = $this->buildVarianceArray($from, $to, $outletId);
-        $menus   = Menu::with(['recipes.items.ingredient', 'outletMenus'])->get();
+        $varDataByIng = collect($varData)->keyBy(fn($iv) => $iv['ingredient']['id'] ?? ($iv['ingredient']->id ?? 0));
+
+        $menus = Menu::with(['recipes.items.ingredient', 'bundleItems.ingredient', 'outletMenus'])->get();
         $trxQuery = Transaction::whereBetween('date', [$from, $to])->where('status', 'PAID');
         if ($outletId) {
             $trxQuery->where('outlet_id', $outletId);
@@ -125,88 +134,98 @@ class ReportController extends Controller
         $perMenu = [];
         foreach ($menus as $m) {
             $perMenu[$m->id] = [
-                'menu'           => $m,
-                'variance_value' => 0,
-                'weighted_pct_num' => 0,
-                'weighted_pct_den' => 0,
-                'qty_terjual'    => 0,
-                'items'          => [],
+                'menu'             => $m,
+                'variance_value'   => 0.0,
+                'weighted_pct_num' => 0.0,
+                'weighted_pct_den' => 0.0,
+                'qty_terjual'      => 0,
+                'items'            => [],
             ];
         }
 
-        // qty terjual per menu
+        // Qty terjual per menu
         foreach ($transactions as $t) {
             if (isset($perMenu[$t->menu_id])) {
-                $perMenu[$t->menu_id]['qty_terjual'] += $t->qty;
+                $perMenu[$t->menu_id]['qty_terjual'] += (int)$t->qty;
             }
         }
 
-        foreach ($varData as $iv) {
-            if ($iv['variance_value'] === null) continue;
-            $ingId = $iv['ingredient']['id'];
+        // 1. Compute theoretical ingredient usages per menu across all transactions
+        $menuIngUsages = []; // [menu_id => [ing_id => total_usage_qty]]
+        $totalIngUsages = []; // [ing_id => total_usage_across_all_menus]
 
-            // Compute theoretical usage per menu for this ingredient
-            $shares = [];
-            foreach ($transactions as $t) {
-                $menu = $menus->find($t->menu_id);
-                if (! $menu) continue;
-                $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?? $menu->recipes->first();
-                if (! $recipe) continue;
-                $item = $recipe->items->firstWhere('ingredient_id', $ingId);
-                if (! $item) continue;
-                $shares[$t->menu_id] = ($shares[$t->menu_id] ?? 0) + $item->qty * $t->qty;
-            }
+        foreach ($transactions as $t) {
+            $menu = $menus->find($t->menu_id);
+            if (!$menu) continue;
 
-            $total = array_sum($shares);
-            if ($total <= 0) continue;
-
-            foreach ($shares as $menuId => $usage) {
-                if (! isset($perMenu[$menuId])) continue;
-                $share = $usage / $total;
-                $perMenu[$menuId]['variance_value'] += $iv['variance_value'] * $share;
-                $perMenu[$menuId]['weighted_pct_num'] += abs($iv['variance_pct'] ?? 0) * $usage;
-                $perMenu[$menuId]['weighted_pct_den'] += $usage;
-                $perMenu[$menuId]['items'][] = [
-                    'ingredient'   => $iv['ingredient'],
-                    'usage'        => round($usage, 3),
-                    'share'        => round($share, 4),
-                    'alloc_value'  => round($iv['variance_value'] * $share, 0),
-                    'variance_pct' => $iv['variance_pct'],
-                    'status'       => $iv['status'],
-                ];
-            }
-        }
-
-        // Fallback for menu drilldown: If menu has recipe items but 0 sales in period, list recipe items
-        $varDataByIng = collect($varData)->keyBy(fn($iv) => $iv['ingredient']['id'] ?? 0);
-        foreach ($perMenu as $menuId => &$mRow) {
-            if (empty($mRow['items'])) {
-                $menuObj = $mRow['menu'];
-                $activeRecipe = $menuObj->recipes->first();
-                if ($activeRecipe && $activeRecipe->items) {
-                    foreach ($activeRecipe->items as $rItem) {
-                        $ingObj = $rItem->ingredient;
-                        if (!$ingObj) continue;
-                        $varObj = $varDataByIng->get($ingObj->id);
-                        $mRow['items'][] = [
-                            'ingredient'   => $ingObj,
-                            'usage'        => (float)$rItem->qty,
-                            'share'        => 0,
-                            'alloc_value'  => 0,
-                            'variance_pct' => $varObj['variance_pct'] ?? null,
-                            'status'       => $varObj['status'] ?? 'NORMAL',
-                        ];
-                    }
+            $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?? $menu->recipes->first();
+            if ($recipe && $recipe->items) {
+                foreach ($recipe->items as $rItem) {
+                    $ingId = (int)$rItem->ingredient_id;
+                    $usage = (float)$rItem->qty * (float)$t->qty;
+                    $menuIngUsages[$t->menu_id][$ingId] = ($menuIngUsages[$t->menu_id][$ingId] ?? 0.0) + $usage;
+                    $totalIngUsages[$ingId] = ($totalIngUsages[$ingId] ?? 0.0) + $usage;
                 }
             }
         }
-        unset($mRow);
+
+        // 2. Allocate ingredient variances and items to each menu
+        foreach ($menus as $m) {
+            $mId = $m->id;
+            $activeRecipe = $m->recipes->first();
+            $recipeItems = $activeRecipe ? $activeRecipe->items : collect();
+            $ingUsagesForThisMenu = $menuIngUsages[$mId] ?? [];
+
+            // If menu has transactions with usages
+            if (!empty($ingUsagesForThisMenu)) {
+                foreach ($ingUsagesForThisMenu as $ingId => $usageQty) {
+                    $varObj = $varDataByIng->get($ingId);
+                    if (!$varObj) continue;
+
+                    $totUsage = $totalIngUsages[$ingId] ?? $usageQty;
+                    $share = $totUsage > 0 ? ($usageQty / $totUsage) : 1.0;
+
+                    // Variance value allocated to this menu for this ingredient
+                    $ingVarValue = (float)($varObj['variance_value'] ?? 0.0);
+                    $allocVal = round($ingVarValue * $share, 0);
+
+                    $perMenu[$mId]['variance_value'] += $allocVal;
+                    $varPct = $varObj['variance_pct'] !== null ? abs((float)$varObj['variance_pct']) : 0.0;
+                    $perMenu[$mId]['weighted_pct_num'] += $varPct * $usageQty;
+                    $perMenu[$mId]['weighted_pct_den'] += $usageQty;
+
+                    $perMenu[$mId]['items'][] = [
+                        'ingredient'   => $varObj['ingredient'],
+                        'usage'        => round($usageQty, 3),
+                        'share'        => round($share, 4),
+                        'alloc_value'  => $allocVal,
+                        'variance_pct' => $varObj['variance_pct'] !== null ? round((float)$varObj['variance_pct'], 2) : 0.0,
+                        'status'       => $varObj['status'] ?? 'NORMAL',
+                    ];
+                }
+            } elseif ($recipeItems->isNotEmpty()) {
+                // Fallback for drilldown: If menu has recipe items but 0 sales in period, list recipe items
+                foreach ($recipeItems as $rItem) {
+                    $ingObj = $rItem->ingredient;
+                    if (!$ingObj) continue;
+                    $varObj = $varDataByIng->get($ingObj->id);
+                    $perMenu[$mId]['items'][] = [
+                        'ingredient'   => $ingObj,
+                        'usage'        => (float)$rItem->qty,
+                        'share'        => 0,
+                        'alloc_value'  => 0,
+                        'variance_pct' => $varObj['variance_pct'] !== null ? round((float)$varObj['variance_pct'], 2) : 0.0,
+                        'status'       => $varObj['status'] ?? 'NORMAL',
+                    ];
+                }
+            }
+        }
 
         return array_values(array_map(function ($row) {
             $row['variance_value'] = round($row['variance_value'], 0);
             $row['weighted_pct'] = $row['weighted_pct_den'] > 0
                 ? round($row['weighted_pct_num'] / $row['weighted_pct_den'], 2)
-                : 0;
+                : 0.0;
             unset($row['weighted_pct_num'], $row['weighted_pct_den']);
             return $row;
         }, $perMenu));
@@ -220,7 +239,7 @@ class ReportController extends Controller
         $p = $this->validatePeriod($request);
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
 
         return response()->json($this->calculateVarianceMenusData($p['from'], $p['to'], $outletId));
     }
@@ -231,7 +250,7 @@ class ReportController extends Controller
         $p = $this->validatePeriod($request);
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
 
         $menus        = Menu::with(['recipes.items.ingredient', 'outletMenus'])->get();
         $trxQuery     = Transaction::whereBetween('date', [$p['from'], $p['to']])->where('status', 'PAID');
@@ -281,7 +300,7 @@ class ReportController extends Controller
         $p = $this->validatePeriod($request);
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
         $varData = $this->buildVarianceArray($p['from'], $p['to'], $outletId);
 
         $statusCounts      = ['NORMAL' => 0, 'WASPADA' => 0, 'TIDAK WAJAR' => 0];
@@ -448,6 +467,7 @@ class ReportController extends Controller
                 'net_sales'         => $this->calculateDelta($current['revenue']['net_sales'], $previous['revenue']['net_sales'], true),
                 'gross_sales'       => $this->calculateDelta($current['revenue']['gross_sales'], $previous['revenue']['gross_sales'], true),
                 'total_discount'    => $this->calculateDelta($current['revenue']['total_discount'], $previous['revenue']['total_discount'], false),
+                'cash_over'         => $this->calculateDelta($current['revenue']['cash_over'] ?? 0, $previous['revenue']['cash_over'] ?? 0, true),
                 'transaction_count' => $this->calculateDelta($current['revenue']['transaction_count'], $previous['revenue']['transaction_count'], true),
                 'avg_order_value'   => $this->calculateDelta($current['revenue']['avg_order_value'], $previous['revenue']['avg_order_value'], true),
                 'nota_generate_net' => $this->calculateDelta($current['revenue']['nota_generate']['net_sales'] ?? 0, $previous['revenue']['nota_generate']['net_sales'] ?? 0, true),
@@ -467,6 +487,7 @@ class ReportController extends Controller
             ],
             'opex' => [
                 'total_opex'     => $this->calculateDelta($current['opex']['total_opex'], $previous['opex']['total_opex'], false),
+                'cash_shortage'  => $this->calculateDelta($current['opex']['cash_shortage'] ?? 0, $previous['opex']['cash_shortage'] ?? 0, false),
                 'opex_ratio_pct' => $this->calculateDelta($current['opex']['opex_ratio_pct'], $previous['opex']['opex_ratio_pct'], false),
             ],
             'bottom_line' => [
@@ -914,7 +935,7 @@ class ReportController extends Controller
             $itemCount = $genItemCount;
             $paymentBreakdown = $genPaymentBreakdown;
             $targetTransactions = $transactions->filter(fn($t) => !$t->is_urgent_note);
-            $notaRatio = $allNet > 0 ? ($genNet / $allNet) : 0.0;
+            $notaRatio = $allNet > 0 ? ($genNet / $allNet) : 1.0;
         } elseif ($notaType === 'MANUAL') {
             $grossSales = $manGross;
             $totalDiscount = $manDiscount;
@@ -1069,8 +1090,66 @@ class ReportController extends Controller
             });
         }
         $expenses = $opexQuery->get();
-        $totalOpexBase = round((float)$expenses->sum('amount'), 2);
-        $totalOpex = round($totalOpexBase * $notaRatio, 2);
+        $totalExpensesOnlyBase = round((float)$expenses->sum('amount'), 2);
+
+        // 4b. SELISIH KASIR DARI HASIL CLOSING SHIFT (CASH OVER / SHORTAGE)
+        $shiftsQuery = Shift::with('user')
+            ->where(function($q) use ($from, $to) {
+                $q->where(function ($sub) use ($from, $to) {
+                    $sub->whereDate('opened_at', '>=', $from)
+                        ->whereDate('opened_at', '<=', $to);
+                })->orWhere(function ($sub) use ($from, $to) {
+                    $sub->whereDate('closed_at', '>=', $from)
+                        ->whereDate('closed_at', '<=', $to);
+                });
+            })
+            ->where('status', 'CLOSED');
+
+        if ($outletId) {
+            $shiftsQuery->where('outlet_id', $outletId);
+        }
+        $closedShifts = $shiftsQuery->get();
+
+        $cashOverTotalBase = 0.0;
+        $cashShortTotalBase = 0.0;
+        $cashOverShifts = [];
+        $cashShortShifts = [];
+
+        foreach ($closedShifts as $s) {
+            $diff = $s->cash_difference !== null 
+                ? (float)$s->cash_difference 
+                : ($s->closing_cash !== null && $s->system_cash !== null ? round((float)$s->closing_cash - (float)$s->system_cash, 2) : 0.0);
+
+            $shiftItem = [
+                'id'              => $s->id,
+                'shift_name'      => $s->shift_name,
+                'cashier_name'    => $s->user?->name ?: 'Kasir',
+                'date'            => $s->opened_at ? substr($s->opened_at, 0, 10) : null,
+                'opened_at'       => $s->opened_at,
+                'closed_at'       => $s->closed_at,
+                'initial_cash'    => (float)$s->initial_cash,
+                'system_cash'     => (float)$s->system_cash,
+                'closing_cash'    => (float)$s->closing_cash,
+                'cash_difference' => $diff,
+                'notes'           => $s->notes,
+            ];
+
+            if ($diff > 0) {
+                $cashOverTotalBase += $diff;
+                $cashOverShifts[] = $shiftItem;
+            } elseif ($diff < 0) {
+                $shortAmt = abs($diff);
+                $cashShortTotalBase += $shortAmt;
+                $shiftItem['shortage_amount'] = $shortAmt;
+                $cashShortShifts[] = $shiftItem;
+            }
+        }
+
+        $cashOver = round($cashOverTotalBase * $notaRatio, 2);
+        $cashShort = round($cashShortTotalBase * $notaRatio, 2);
+
+        $totalOpexBase = round($totalExpensesOnlyBase + $cashShortTotalBase, 2);
+        $totalOpex = round(($totalExpensesOnlyBase * $notaRatio) + $cashShort, 2);
         $opexRatioPct = $netSales > 0 ? round(($totalOpex / $netSales) * 100, 1) : 0;
 
         $expenseCategoriesConfig = OperatingExpense::categories();
@@ -1088,10 +1167,22 @@ class ReportController extends Controller
                 ];
             }
         }
+
+        // Tambahkan Beban Selisih Kurang Kasir ke Breakdown OPEX jika ada tekor kasir
+        if ($cashShort > 0) {
+            $opexBreakdown[] = [
+                'category'   => 'CASH_SHORTAGE',
+                'label'      => 'Beban Selisih Kurang Kasir (Kasir Tekor)',
+                'total'      => round($cashShort, 2),
+                'count'      => count($cashShortShifts),
+                'percentage' => $totalOpex > 0 ? round(($cashShort / $totalOpex) * 100, 1) : 0,
+            ];
+        }
+
         usort($opexBreakdown, fn($a, $b) => $b['total'] <=> $a['total']);
 
         // 5. LABA BERSIH USAHA (NET OPERATING PROFIT)
-        $netProfit = round($operatingProfitAfterWaste - $totalOpex, 2);
+        $netProfit = round(($grossProfit + $cashOver) - $totalWasteLoss - $totalOpex, 2);
         $netMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 1) : 0;
 
         // Pre-compute Full Parallel Metrics for Generate vs Manual vs Combined
@@ -1105,12 +1196,12 @@ class ReportController extends Controller
         $wasteGen = $totalWasteLossBase * $genRatio;
         $wasteMan = $totalWasteLossBase * $manRatio;
 
-        $opexGen = $totalOpexBase * $genRatio;
-        $opexMan = $totalOpexBase * $manRatio;
+        $opexGen = ($totalExpensesOnlyBase * $genRatio) + ($cashShortTotalBase * $genRatio);
+        $opexMan = ($totalExpensesOnlyBase * $manRatio) + ($cashShortTotalBase * $manRatio);
 
-        $netProfitGen = ($genNet - $cogsGen) - $wasteGen - $opexGen;
-        $netProfitMan = ($manNet - $cogsMan) - $wasteMan - $opexMan;
-        $netProfitAll = ($allNet - $cogsAll) - $totalWasteLossBase - $totalOpexBase;
+        $netProfitGen = ($genNet - $cogsGen) + ($cashOverTotalBase * $genRatio) - $wasteGen - $opexGen;
+        $netProfitMan = ($manNet - $cogsMan) + ($cashOverTotalBase * $manRatio) - $wasteMan - $opexMan;
+        $netProfitAll = ($allNet - $cogsAll) + $cashOverTotalBase - $totalWasteLossBase - $totalOpexBase;
 
         $netMarginGen = $genNet > 0 ? round(($netProfitGen / $genNet) * 100, 1) : 0.0;
         $netMarginMan = $manNet > 0 ? round(($netProfitMan / $manNet) * 100, 1) : 0.0;
@@ -1152,11 +1243,24 @@ class ReportController extends Controller
             ],
             [
                 'step'        => 'net_sales',
-                'name'        => 'Omset Bersih (Net Revenue)',
+                'name'        => 'Omset Penjualan Bersih',
                 'amount'      => round($netSales, 2),
                 'type'        => 'subtotal',
                 'pct_of_net'  => 100.0,
             ],
+        ];
+
+        if ($cashOver > 0) {
+            $waterfall[] = [
+                'step'        => 'cash_over',
+                'name'        => '(+) Pendapatan Selisih Lebih Kasir',
+                'amount'      => round($cashOver, 2),
+                'type'        => 'addition',
+                'pct_of_net'  => $netSales > 0 ? round(($cashOver / $netSales) * 100, 1) : 0,
+            ];
+        }
+
+        $waterfall = array_merge($waterfall, [
             [
                 'step'        => 'cogs_recipes',
                 'name'        => 'HPP Teoretis Resep',
@@ -1199,7 +1303,7 @@ class ReportController extends Controller
                 'type'        => 'result',
                 'pct_of_net'  => $netMarginPct,
             ],
-        ];
+        ]);
 
         return [
             'period' => [
@@ -1212,6 +1316,10 @@ class ReportController extends Controller
                 'gross_sales'        => round($grossSales, 2),
                 'total_discount'     => round($totalDiscount, 2),
                 'net_sales'          => round($netSales, 2),
+                'cash_over'          => round($cashOver, 2),
+                'cash_over_count'    => count($cashOverShifts),
+                'cash_over_shifts'   => $cashOverShifts,
+                'net_revenue_total'  => round($netSales + $cashOver, 2),
                 'transaction_count'  => $transactionCount,
                 'item_sold_count'    => $itemCount,
                 'avg_order_value'    => $avgOrderValue,
@@ -1267,10 +1375,23 @@ class ReportController extends Controller
                 'total_records'                => $wasteLogs->count(),
             ],
             'opex' => [
-                'total_opex'     => round($totalOpex, 2),
-                'opex_ratio_pct' => $opexRatioPct,
-                'breakdown'      => $opexBreakdown,
-                'total_records'  => $expenses->count(),
+                'total_opex'          => round($totalOpex, 2),
+                'expenses_only'       => round($totalExpensesOnlyBase * $notaRatio, 2),
+                'cash_shortage'       => round($cashShort, 2),
+                'cash_short_count'    => count($cashShortShifts),
+                'cash_short_shifts'   => $cashShortShifts,
+                'opex_ratio_pct'      => $opexRatioPct,
+                'breakdown'           => $opexBreakdown,
+                'total_records'       => $expenses->count() + count($cashShortShifts),
+            ],
+            'cash_discrepancy' => [
+                'cash_over'          => round($cashOver, 2),
+                'cash_over_count'    => count($cashOverShifts),
+                'cash_over_shifts'   => $cashOverShifts,
+                'cash_shortage'      => round($cashShort, 2),
+                'cash_short_count'   => count($cashShortShifts),
+                'cash_short_shifts'  => $cashShortShifts,
+                'net_discrepancy'    => round($cashOver - $cashShort, 2),
             ],
             'bottom_line' => [
                 'net_profit'     => round($netProfit, 2),
@@ -1342,31 +1463,36 @@ class ReportController extends Controller
         ];
     }
 
-    /** Internal helper - reuse variance computation (OPTIMIZED: pre-indexed by ingredient) */
+    /** Internal helper - reuse variance computation (ALIGNED WITH KARTU STOK) */
     public function buildVarianceArray(string $from, string $to, ?int $outletId = null): array
     {
-        if ($this->cachedActiveIngredients === null) {
-            $this->cachedActiveIngredients = Ingredient::with(['outletIngredients'])->where('active', true)->get();
-        }
-        $ingredients = $this->cachedActiveIngredients;
+        // Load all ingredients (including outletIngredients)
+        $ingredients = Ingredient::with(['outletIngredients' => function($q) use ($outletId) {
+            if ($outletId) {
+                $q->where('outlet_id', $outletId);
+            }
+        }])->get();
 
-        // Fetch movements WITHOUT heavy eager-loads (creator/user only needed for waste display)
-        // ⚡ Exclude automatic opname physical adjustments of the CURRENT period (e.g. 'Penyesuaian Opname Fisik%')
-        // so that the theoretical baseline represents pure pre-opname stock movements.
-        // For date < $from (prior movements), previous opname adjustments MUST be included in balanceBefore.
-        $movQuery = StockMovement::where(function ($q) use ($from, $to) {
-            $q->where('date', '<', $from)->orWhereBetween('date', [$from, $to]);
-        })->where(function ($q) use ($from) {
-            $q->where('date', '<', $from)
-              ->orWhereNull('note')
-              ->orWhere('note', 'not like', 'Penyesuaian Opname Fisik%');
-        });
+        $ingIds = $ingredients->pluck('id')->all();
+
+        // Fetch movements
+        // Exclude automatic opname physical adjustments of the CURRENT period so that theoretical baseline represents pure pre-opname stock movements.
+        // For date < $from (prior movements), previous opname adjustments are included in balanceBefore.
+        $movQuery = StockMovement::whereIn('ingredient_id', $ingIds)
+            ->where('type', '!=', 'INITIAL')
+            ->where(function ($q) use ($from, $to) {
+                $q->where('date', '<', $from)->orWhereBetween('date', [$from, $to]);
+            })->where(function ($q) use ($from) {
+                $q->where('date', '<', $from)
+                  ->orWhereNull('note')
+                  ->orWhere('note', 'not like', 'Penyesuaian Opname Fisik%');
+            });
         if ($outletId) {
             $movQuery->where('outlet_id', $outletId);
         }
         $allMovements = $movQuery->get();
 
-        // ⚡ KEY OPTIMIZATION: Pre-index movements by ingredient_id — O(m) once
+        // Pre-index movements by ingredient_id — O(m) once
         $movementsByIngredient = [];
         foreach ($allMovements as $m) {
             $movementsByIngredient[$m->ingredient_id][] = $m;
@@ -1390,8 +1516,7 @@ class ReportController extends Controller
         }
         $opnames = $opnQuery->get()->keyBy('ingredient_id');
 
-        // Fallback: If no exact period match was found (e.g. user selected full month 1-30 Sep, but opname was recorded on 28 Sep),
-        // query the most recent opname for each ingredient within [$from, $to].
+        // Fallback: If no exact period match was found, query most recent opname for each ingredient within [$from, $to]
         if ($opnames->isEmpty()) {
             $fallbackQuery = Opname::where(function ($q) use ($from, $to) {
                 $q->whereBetween('period_to', [$from, $to])
@@ -1450,14 +1575,14 @@ class ReportController extends Controller
 
         $result = [];
         foreach ($ingredients as $ing) {
-            // ⚡ Only process THIS ingredient's movements — O(k) per ingredient
+            // Only process this ingredient's movements
             $ingMovements = $movementsByIngredient[$ing->id] ?? [];
             $agg = $this->aggregateIngredientMovements($ingMovements, $from, $to);
 
-            // Opening stock calculation
+            // Opening stock calculation matching Kartu Stok (MovementController)
+            $stokAwalMaster = 0.0;
             if ($outletId) {
-                $outletRow = $ing->outletIngredients->firstWhere('outlet_id', $outletId);
-                $stokAwalMaster = 0.0;
+                $outletRow = $ing->outletIngredients->first();
                 if ($outletRow && (float)$outletRow->stok_awal > 0) {
                     $stokAwalMaster = (float)$outletRow->stok_awal;
                 } elseif ($isHoldingOutlet) {
@@ -1473,8 +1598,7 @@ class ReportController extends Controller
             $hargaPerPakai = (float) $ing->costPerPakaiForOutlet($targetOid);
 
             if ($opname && $opname->is_closed && $opname->period_from === $from && $opname->period_to === $to) {
-                // 🔒 LOCKED SNAPSHOT: Sisa teoritis di stok opname TIDAK AKAN BERUBAH setelah di-release!
-                // Walaupun ada transaksi pembelian/penjualan/pengeluaran baru, angka teoritis dan selisih tetap mengunci snapshot sebelum opname.
+                // Locked snapshot
                 $stokAwalPeriode   = (float) ($opname->stok_awal_periode ?? 0);
                 $pembelian         = (float) ($opname->pembelian ?? 0);
                 $pemakaianTeo      = (float) ($opname->pemakaian_teoritis ?? 0);
@@ -1496,24 +1620,24 @@ class ReportController extends Controller
                 $varianceStockPct  = $opname->variance_pct !== null ? (float) $opname->variance_pct : null;
                 $status            = $opname->status;
 
-                $pemakaianAktual   = $hasActual ? ($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty) : null;
-                $totalTeoritisPakai = $pemakaianTeo + $prepUsage;
+                $pemakaianAktual   = $hasActual ? round($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty, 4) : null;
+                $totalTeoritisPakai = round($pemakaianTeo + $prepUsage, 4);
                 $varianceGrossQty  = $hasActual ? round($pemakaianAktual - $totalTeoritisPakai, 4) : null;
                 $varianceGrossValue = $hasActual ? round($varianceGrossQty * $costPerUnit, 0) : null;
                 $unaccountedQty    = $hasActual ? round($varianceGrossQty - $wasteQty, 4) : null;
                 $unaccountedValue  = $hasActual ? round($unaccountedQty * $costPerUnit, 0) : null;
             } else {
-                $stokAwalPeriode = $stokAwalMaster + $agg['balanceBefore'];
-                $pembelian       = $agg['purchase'];
-                $pemakaianTeo    = $agg['saleUsage'];
-                $prepUsage       = $agg['prepUsage'] ?? 0.0;
-                $prepOutput      = $agg['prepOutput'] ?? 0.0;
-                $wasteQty        = $agg['waste'];
-                $transferIn      = $agg['transferIn'];
-                $transferOut     = $agg['transferOut'];
-                $adjustment      = $agg['adjustment'];
+                $stokAwalPeriode = round($stokAwalMaster + $agg['balanceBefore'], 3);
+                $pembelian       = round($agg['purchase'] + $agg['initialInPeriod'], 3);
+                $pemakaianTeo    = round($agg['saleUsage'], 3);
+                $prepUsage       = round($agg['prepUsage'] ?? 0.0, 3);
+                $prepOutput      = round($agg['prepOutput'] ?? 0.0, 3);
+                $wasteQty        = round($agg['waste'], 3);
+                $transferIn      = round($agg['transferIn'], 3);
+                $transferOut     = round($agg['transferOut'], 3);
+                $adjustment      = round($agg['adjustment'], 3);
 
-                $stokAkhirTeo = $stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $pemakaianTeo - $prepUsage - $wasteQty - $transferOut + $adjustment;
+                $stokAkhirTeo = round($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $pemakaianTeo - $prepUsage - $wasteQty - $transferOut + $adjustment, 3);
 
                 $actualQty = ($opname && $opname->actual_qty !== null) ? (float)$opname->actual_qty : null;
                 $hasActual = $actualQty !== null;
@@ -1523,27 +1647,57 @@ class ReportController extends Controller
                 $nilaiTeoritis       = round($stokAkhirTeo * $hargaPerPakai, 0);
                 $nilaiAktual         = $hasActual ? round($actualQty * $hargaPerPakai, 0) : null;
 
-                // Selisih Stok Opname (Fisik - Sisa Teoritis)
-                $varianceStockQty    = $hasActual ? round($actualQty - $stokAkhirTeo, 4) : null;
-                $varianceStockValue  = $hasActual ? round($varianceStockQty * $hargaPerPakai, 0) : null;
-
-                $denomStock          = abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : ($hasActual && abs($actualQty) > 0.0001 ? abs($actualQty) : 1.0);
-                $varianceStockPct    = $hasActual ? round(($varianceStockQty / $denomStock) * 100, 2) : null;
-
-                $status              = null;
                 if ($hasActual) {
-                    $status = abs($varianceStockQty) < 0.0001 ? 'NORMAL' : $this->statusOf(abs($varianceStockPct ?? 0), $ing->tolerance);
-                }
+                    // Selisih Stok Opname (Fisik - Sisa Teoritis)
+                    $varianceStockQty    = round($actualQty - $stokAkhirTeo, 4);
+                    $varianceStockValue  = round($varianceStockQty * $hargaPerPakai, 0);
 
-                // Pemakaian fisik lapangan (memperhitungkan transfer & batch prep)
-                $pemakaianAktual     = $hasActual ? ($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty) : null;
-                // Variance kotor terhadap total pemakaian resep (POS + Batch Prep)
-                $totalTeoritisPakai  = $pemakaianTeo + $prepUsage;
-                $varianceGrossQty    = $hasActual ? round($pemakaianAktual - $totalTeoritisPakai, 4) : null;
-                $varianceGrossValue  = $hasActual ? round($varianceGrossQty * $hargaPerPakai, 0) : null;
-                // Unaccounted variance (setelah dikurangi waste tercatat)
-                $unaccountedQty      = $hasActual ? round($varianceGrossQty - $wasteQty, 4) : null;
-                $unaccountedValue    = $hasActual ? round($unaccountedQty * $hargaPerPakai, 0) : null;
+                    $denomStock          = abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : (abs($actualQty) > 0.0001 ? abs($actualQty) : 1.0);
+                    $varianceStockPct    = round(($varianceStockQty / $denomStock) * 100, 2);
+
+                    $status              = abs($varianceStockQty) < 0.0001 ? 'NORMAL' : $this->statusOf(abs($varianceStockPct ?? 0), (float)$ing->tolerance);
+
+                    // Pemakaian fisik lapangan (memperhitungkan transfer & batch prep)
+                    $pemakaianAktual     = round($stokAwalPeriode + $pembelian + $prepOutput + $transferIn - $transferOut - $actualQty, 4);
+                    // Variance kotor terhadap total pemakaian resep (POS + Batch Prep)
+                    $totalTeoritisPakai  = round($pemakaianTeo + $prepUsage, 4);
+                    $varianceGrossQty    = round($pemakaianAktual - $totalTeoritisPakai, 4);
+                    $varianceGrossValue  = round($varianceGrossQty * $hargaPerPakai, 0);
+                    // Unaccounted variance (setelah dikurangi waste tercatat)
+                    $unaccountedQty      = round($varianceGrossQty - $wasteQty, 4);
+                    $unaccountedValue    = round($unaccountedQty * $hargaPerPakai, 0);
+                } else {
+                    // When no physical opname count is conducted, connect directly with Kartu Stok ledger:
+                    $hasKartuStokVariance = ($wasteQty > 0.0001 || abs($adjustment) > 0.0001);
+                    $totalTeoritisPakai   = round($pemakaianTeo + $prepUsage, 4);
+
+                    if ($hasKartuStokVariance) {
+                        // Net Kartu Stok difference: negative adjustment and waste are losses
+                        $varianceStockQty   = round($adjustment - $wasteQty, 4);
+                        $varianceStockValue = round($varianceStockQty * $hargaPerPakai, 0);
+                        $denomStock         = $totalTeoritisPakai > 0.0001 ? $totalTeoritisPakai : (abs($stokAkhirTeo) > 0.0001 ? abs($stokAkhirTeo) : 1.0);
+                        $varianceStockPct   = round(($varianceStockQty / $denomStock) * 100, 2);
+                        $status             = (abs($varianceStockQty) < 0.0001) ? 'NORMAL' : $this->statusOf(abs($varianceStockPct), (float)$ing->tolerance);
+
+                        $pemakaianAktual    = round($totalTeoritisPakai + $wasteQty - $adjustment, 4);
+                        $varianceGrossQty   = round($wasteQty - $adjustment, 4);
+                        $varianceGrossValue = round($varianceGrossQty * $hargaPerPakai, 0);
+                        $unaccountedQty     = round(-$adjustment, 4);
+                        $unaccountedValue   = round($unaccountedQty * $hargaPerPakai, 0);
+                    } else {
+                        // 100% matched with Kartu Stok standard usage
+                        $varianceStockQty   = 0.0;
+                        $varianceStockValue = 0.0;
+                        $varianceStockPct   = 0.0;
+                        $status             = 'NORMAL';
+
+                        $pemakaianAktual    = $totalTeoritisPakai;
+                        $varianceGrossQty   = 0.0;
+                        $varianceGrossValue = 0.0;
+                        $unaccountedQty     = 0.0;
+                        $unaccountedValue   = 0.0;
+                    }
+                }
             }
 
             // Waste records already collected during aggregation — no extra loop needed
@@ -1629,13 +1783,13 @@ class ReportController extends Controller
         $pnl = $this->calculatePnlData($from, $to, $outletId, 'ALL');
         $pnlSummary = [
             'gross_sales'  => (float)($pnl['revenue']['gross_sales'] ?? 0),
-            'discount'     => (float)($pnl['revenue']['total_discounts'] ?? 0),
+            'discount'     => (float)($pnl['revenue']['total_discount'] ?? ($pnl['revenue']['total_discounts'] ?? 0)),
             'net_sales'    => (float)($pnl['revenue']['net_sales'] ?? 0),
             'cogs'         => (float)($pnl['cogs']['total_cogs'] ?? 0),
-            'gross_profit' => (float)($pnl['gross_profit'] ?? 0),
+            'gross_profit' => (float)($pnl['cogs']['gross_profit'] ?? ($pnl['gross_profit'] ?? 0)),
             'opex'         => (float)($pnl['opex']['total_opex'] ?? 0),
-            'net_profit'   => (float)($pnl['net_profit'] ?? 0),
-            'net_margin'   => (float)($pnl['net_profit_pct'] ?? 0),
+            'net_profit'   => (float)($pnl['bottom_line']['net_profit'] ?? ($pnl['net_profit'] ?? 0)),
+            'net_margin'   => (float)($pnl['bottom_line']['net_margin_pct'] ?? ($pnl['net_profit_pct'] ?? 0)),
         ];
 
         // 3. Beban Perusahaan / Pengeluaran (Operating Expenses Breakdown)
@@ -1800,12 +1954,91 @@ class ReportController extends Controller
             'total_sales'  => (float)$activeShift->total_sales,
         ] : null;
 
+        // 11. Ringkasan Pembelian & Pengadaan Bahan Baku (Purchases & Payables)
+        $purchaseQuery = StockMovement::with(['ingredient'])
+            ->where('business_id', $businessId)
+            ->where('type', 'PURCHASE')
+            ->whereBetween('date', [$from, $to]);
+        if ($outletId) {
+            $purchaseQuery->where('outlet_id', $outletId);
+        }
+        $purchaseMovements = $purchaseQuery->get();
+
+        $totalPurchaseAmount = 0.0;
+        $totalCashPurchases = 0.0;
+        $totalBankPurchases = 0.0;
+        $totalCreditPurchases = 0.0;
+
+        foreach ($purchaseMovements as $m) {
+            $cost = (float)($m->total_price ?: ($m->qty * $m->unit_price));
+            $totalPurchaseAmount += $cost;
+            $ptype = strtoupper($m->payment_type ?: 'CASH');
+            if ($ptype === 'HUTANG' || $ptype === 'TEMPO' || $m->payable_id) {
+                $totalCreditPurchases += $cost;
+            } elseif ($ptype === 'BANK' || $ptype === 'TRANSFER') {
+                $totalBankPurchases += $cost;
+            } else {
+                $totalCashPurchases += $cost;
+            }
+        }
+
+        // Hutang Supplier Aktif
+        $payableQuery = Payable::where('business_id', $businessId);
+        if ($outletId) {
+            $payableQuery->where('outlet_id', $outletId);
+        }
+        $unpaidPayables = (float)$payableQuery->clone()->whereIn('status', ['UNPAID', 'PARTIAL'])->sum('remaining_amount');
+        $overduePayables = (float)$payableQuery->clone()->whereIn('status', ['UNPAID', 'PARTIAL'])->where('due_date', '<', date('Y-m-d'))->sum('remaining_amount');
+
+        // Top 5 Pemasok Terbesar
+        $topSuppliers = $purchaseMovements->groupBy(function ($m) {
+            return $m->supplier_name ?: 'Supplier Umum';
+        })->map(function ($items, $supplierName) {
+            $sumVal = (float)$items->sum(fn($it) => (float)($it->total_price ?: ($it->qty * $it->unit_price)));
+            $count = $items->count();
+            return [
+                'supplier_name' => $supplierName,
+                'total_amount'  => round($sumVal, 2),
+                'item_count'    => $count,
+            ];
+        })->sortByDesc('total_amount')->values()->take(5);
+
+        // Top 5 Bahan Baku Terbanyak Dipesan
+        $topIngredientsPurchased = $purchaseMovements->groupBy('ingredient_id')->map(function ($items, $ingId) {
+            $first = $items->first();
+            $name = $first->ingredient?->name ?: ($first->note ?: "Bahan #{$ingId}");
+            $unit = $first->ingredient?->unit_pakai ?: 'satuan';
+            $qty = (float)$items->sum('qty');
+            $val = (float)$items->sum(fn($it) => (float)($it->total_price ?: ($it->qty * $it->unit_price)));
+            return [
+                'ingredient_id' => $ingId,
+                'name'          => $name,
+                'unit'          => $unit,
+                'qty'           => round($qty, 2),
+                'total_cost'    => round($val, 2),
+            ];
+        })->sortByDesc('total_cost')->values()->take(5);
+
+        $purchasesSummary = [
+            'total_purchase'          => round($totalPurchaseAmount, 2),
+            'cash_purchases'          => round($totalCashPurchases, 2),
+            'bank_purchases'          => round($totalBankPurchases, 2),
+            'credit_purchases'        => round($totalCreditPurchases, 2),
+            'paid_purchases'          => round($totalCashPurchases + $totalBankPurchases, 2),
+            'unpaid_payables'         => round($unpaidPayables, 2),
+            'overdue_payables'        => round($overduePayables, 2),
+            'transaction_count'       => $purchaseMovements->count(),
+            'top_suppliers'           => $topSuppliers,
+            'top_ingredients'         => $topIngredientsPurchased,
+        ];
+
         return response()->json([
             'sales_trend'       => $salesTrend,
             'pnl'               => $pnlSummary,
             'opex_breakdown'    => $opexByCategory,
             'cash_flow'         => $cashFlowSummary,
             'sales_receivables' => $salesReceivables,
+            'purchases'         => $purchasesSummary,
             'min_stock_items'   => $minStockItems,
             'recent_activities' => $recentTransactions,
             'top_products'      => $topProducts,

@@ -88,6 +88,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/shifts/open',                  [ShiftController::class, 'open']);
     Route::get('/shifts/{shift}/summary',        [ShiftController::class, 'summary']);
     Route::post('/shifts/{shift}/close',         [ShiftController::class, 'close']);
+    Route::post('/shifts/{shift}/deposit',       [ShiftController::class, 'deposit']);
     Route::get('/shifts/{shift}/transactions',   [ShiftController::class, 'transactions']);
     Route::get('/shifts/{shift}/receipt',        [ShiftController::class, 'receipt']);
 
@@ -103,9 +104,14 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::apiResource('ingredients', IngredientController::class);
     Route::patch('/menus/{menu}/toggle-active', [MenuController::class, 'toggleActive']);
     Route::apiResource('menus', MenuController::class);
-    Route::post('/menus/{menu}/recipes', [MenuController::class, 'storeRecipe']);
-    Route::post('/menus/{menu}/restock', [MenuController::class, 'restock']);
-    Route::get('/menus/{menu}/hpp-history', [MenuController::class, 'hppHistory']);
+    Route::post('/menus/{menu}/recipes',                           [MenuController::class, 'storeRecipe']);
+    Route::delete('/menus/{menu}/recipes/{recipe}/items/{item}',   [MenuController::class, 'destroyRecipeItem']);
+    Route::delete('/menus/{menu}/recipes/{recipe}',                [MenuController::class, 'destroyRecipe']);
+    Route::delete('/menus/{menu}/recipes',                         [MenuController::class, 'destroyAllRecipes']);
+    Route::delete('/recipes/{recipe}',                             [MenuController::class, 'destroyRecipeDirect']);
+    Route::delete('/recipe-items/{item}',                          [MenuController::class, 'destroyRecipeItemDirect']);
+    Route::post('/menus/{menu}/restock',                           [MenuController::class, 'restock']);
+    Route::get('/menus/{menu}/hpp-history',        [MenuController::class, 'hppHistory']);
     Route::apiResource('outlets', OutletController::class);
 
     // Master Customer / Member & Poin
@@ -185,6 +191,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/stock-card',         [MovementController::class, 'stockCard']);
     Route::post('/stock-card/recalculate-all', [MovementController::class, 'recalculateAll']);
     Route::post('/stock-card/bulk-import-initial', [MovementController::class, 'bulkImportInitial']);
+    Route::post('/stock-card/reset', [MovementController::class, 'resetStockCard']);
 
     // Waste & Spoilage Tracking (Bahan Terbuang & Rusak)
     Route::get('/waste-logs/analytics', [WasteController::class, 'analytics']);
@@ -209,6 +216,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::apiResource('expenses', ExpenseController::class);
 
     // Kasbon Customer & AR Merchant (Accounts Receivable & Pembayaran Kasbon)
+    Route::get('/receivables/search-history-customers',                 [ReceivableController::class, 'searchHistoryCustomers']);
     Route::get('/receivables/customers',                                [ReceivableController::class, 'byCustomer']);
     Route::get('/receivables/merchants',                                [ReceivableController::class, 'byMerchant']);
     Route::get('/receivables/ecommerce-grouped',                        [ReceivableController::class, 'ecommerceGrouped']);
@@ -242,6 +250,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/profitability',       [ReportController::class, 'profitability']);
     Route::get('/reports/profit-loss',          [ReportController::class, 'profitAndLoss']);
     Route::get('/reports/balance-sheet',        [BalanceSheetController::class, 'index']);
+    Route::get('/reports/balance-sheet/detail', [BalanceSheetController::class, 'detail']);
     Route::get('/reports/outlet-benchmark',    [ReportController::class, 'outletBenchmark']);
 
     // Sales Reports (Laporan Penjualan POS)

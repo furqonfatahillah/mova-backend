@@ -3,9 +3,11 @@
 namespace App\Http\Controllers;
 
 use App\Models\Menu;
+use App\Models\Ingredient;
 use App\Models\Recipe;
 use App\Models\RecipeItem;
 use App\Models\OutletMenu;
+use App\Models\Category;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Validation\Rule;
@@ -273,7 +275,11 @@ class MenuController extends Controller
     public function destroy(Menu $menu)
     {
         \Illuminate\Support\Facades\DB::transaction(function () use ($menu) {
-            \Illuminate\Support\Facades\DB::table('recipe_items')->where('menu_id', $menu->id)->delete();
+            $recipeIds = \Illuminate\Support\Facades\DB::table('recipes')->where('menu_id', $menu->id)->pluck('id')->toArray();
+            if (!empty($recipeIds)) {
+                \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('recipe_id', $recipeIds)->delete();
+                \Illuminate\Support\Facades\DB::table('recipes')->whereIn('id', $recipeIds)->delete();
+            }
             if (\Illuminate\Support\Facades\Schema::hasTable('menu_modifier_groups')) {
                 \Illuminate\Support\Facades\DB::table('menu_modifier_groups')->where('menu_id', $menu->id)->delete();
             }
@@ -313,7 +319,11 @@ class MenuController extends Controller
         \Illuminate\Support\Facades\DB::transaction(function () use ($menus, &$deletedCount) {
             $validIds = $menus->pluck('id')->toArray();
 
-            \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('menu_id', $validIds)->delete();
+            $recipeIds = \Illuminate\Support\Facades\DB::table('recipes')->whereIn('menu_id', $validIds)->pluck('id')->toArray();
+            if (!empty($recipeIds)) {
+                \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('recipe_id', $recipeIds)->delete();
+                \Illuminate\Support\Facades\DB::table('recipes')->whereIn('id', $recipeIds)->delete();
+            }
             if (\Illuminate\Support\Facades\Schema::hasTable('menu_modifier_groups')) {
                 \Illuminate\Support\Facades\DB::table('menu_modifier_groups')->whereIn('menu_id', $validIds)->delete();
             }
@@ -444,6 +454,152 @@ class MenuController extends Controller
         return response()->json($recipe, 201);
     }
 
+    /** Delete a specific recipe version of a menu */
+    public function destroyRecipe(Request $request, Menu $menu, Recipe $recipe)
+    {
+        if ((int)$recipe->menu_id !== (int)$menu->id) {
+            return response()->json(['message' => 'Resep tidak sesuai dengan menu yang dipilih.'], 404);
+        }
+
+        $oldHpp = (float)$menu->calculateHpp();
+        $deletedVersion = $recipe->version;
+
+        \Illuminate\Support\Facades\DB::transaction(function () use ($recipe) {
+            \Illuminate\Support\Facades\DB::table('recipe_items')->where('recipe_id', $recipe->id)->delete();
+            $recipe->delete();
+        });
+
+        $menu->unsetRelation('recipes');
+        $newHpp = (float)$menu->calculateHpp();
+
+        try {
+            \App\Services\MenuHppService::recordForRecipeUpdate(
+                $menu,
+                $oldHpp,
+                $newHpp,
+                $request->user()?->id,
+                "Penghapusan resep Versi {$deletedVersion}"
+            );
+        } catch (\Throwable $e) {}
+
+        return response()->json([
+            'message'  => "Resep Versi {$deletedVersion} untuk menu '{$menu->name}' berhasil dihapus.",
+            'menu_id'  => $menu->id,
+            'new_hpp'  => $newHpp,
+            'remaining_recipes' => $menu->recipes()->with(['creator', 'updater', 'items.ingredient'])->orderByDesc('version')->get(),
+        ]);
+    }
+
+    /** Delete all recipes of a menu */
+    public function destroyAllRecipes(Request $request, Menu $menu)
+    {
+        $oldHpp = (float)$menu->calculateHpp();
+
+        \Illuminate\Support\Facades\DB::transaction(function () use ($menu) {
+            $recipeIds = $menu->recipes()->pluck('id')->toArray();
+            if (!empty($recipeIds)) {
+                \Illuminate\Support\Facades\DB::table('recipe_items')->whereIn('recipe_id', $recipeIds)->delete();
+                \App\Models\Recipe::whereIn('id', $recipeIds)->delete();
+            }
+        });
+
+        $menu->unsetRelation('recipes');
+        $newHpp = (float)$menu->calculateHpp();
+
+        try {
+            \App\Services\MenuHppService::recordForRecipeUpdate(
+                $menu,
+                $oldHpp,
+                $newHpp,
+                $request->user()?->id,
+                "Penghapusan seluruh komposisi resep (BOM)"
+            );
+        } catch (\Throwable $e) {}
+
+        return response()->json([
+            'message' => "Seluruh resep (BOM) untuk menu '{$menu->name}' berhasil dihapus.",
+            'menu_id' => $menu->id,
+            'new_hpp' => $newHpp,
+        ]);
+    }
+
+    /** Delete a single recipe item (bahan per satuan dalam resep) */
+    public function destroyRecipeItem(Request $request, Menu $menu, Recipe $recipe, $item)
+    {
+        if ((int)$recipe->menu_id !== (int)$menu->id) {
+            return response()->json(['message' => 'Resep tidak sesuai dengan menu yang dipilih.'], 404);
+        }
+
+        $recipeItem = RecipeItem::where('recipe_id', $recipe->id)->where('id', $item)->first();
+        if (!$recipeItem) {
+            // Fallback by ingredient_id if $item passed was ingredient_id
+            $recipeItem = RecipeItem::where('recipe_id', $recipe->id)->where('ingredient_id', $item)->first();
+        }
+
+        if (!$recipeItem) {
+            return response()->json(['message' => 'Item bahan tidak ditemukan dalam resep ini.'], 404);
+        }
+
+        $ingName = $recipeItem->ingredient?->name ?: "Bahan #{$recipeItem->ingredient_id}";
+        $oldHpp = (float)$menu->calculateHpp();
+
+        \Illuminate\Support\Facades\DB::transaction(function () use ($recipeItem, $recipe) {
+            $recipeItem->delete();
+            // If recipe has no items left, delete the recipe version as well
+            if (RecipeItem::where('recipe_id', $recipe->id)->count() === 0) {
+                $recipe->delete();
+            }
+        });
+
+        $menu->unsetRelation('recipes');
+        $newHpp = (float)$menu->calculateHpp();
+
+        try {
+            \App\Services\MenuHppService::recordForRecipeUpdate(
+                $menu,
+                $oldHpp,
+                $newHpp,
+                $request->user()?->id,
+                "Penghapusan item bahan '{$ingName}' dari resep Versi {$recipe->version}"
+            );
+        } catch (\Throwable $e) {}
+
+        return response()->json([
+            'message'  => "Bahan '{$ingName}' berhasil dihapus dari resep.",
+            'menu_id'  => $menu->id,
+            'new_hpp'  => $newHpp,
+            'remaining_items' => RecipeItem::where('recipe_id', $recipe->id)->with('ingredient')->get(),
+        ]);
+    }
+
+    /** Direct delete recipe item by item ID */
+    public function destroyRecipeItemDirect(Request $request, $item)
+    {
+        $recipeItem = RecipeItem::with(['recipe.menu', 'ingredient'])->find($item);
+        if (!$recipeItem) {
+            return response()->json(['message' => 'Item bahan resep tidak ditemukan.'], 404);
+        }
+        $recipe = $recipeItem->recipe;
+        $menu = $recipe?->menu;
+        if ($menu && $recipe) {
+            return $this->destroyRecipeItem($request, $menu, $recipe, $recipeItem->id);
+        }
+        $recipeItem->delete();
+        return response()->json(['message' => 'Item bahan berhasil dihapus.']);
+    }
+
+    /** Direct delete recipe by recipe ID */
+    public function destroyRecipeDirect(Request $request, Recipe $recipe)
+    {
+        $menu = $recipe->menu;
+        if (!$menu) {
+            \Illuminate\Support\Facades\DB::table('recipe_items')->where('recipe_id', $recipe->id)->delete();
+            $recipe->delete();
+            return response()->json(['message' => 'Resep berhasil dihapus.']);
+        }
+        return $this->destroyRecipe($request, $menu, $recipe);
+    }
+
     /**
      * Get Menu HPP fluctuation history & composition breakdown (Weighted Moving Average)
      */
@@ -476,66 +632,77 @@ class MenuController extends Controller
 
         $importedCount = 0;
 
-        \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
-            foreach ($items as $idx => $row) {
-                if (empty($row['name'])) continue;
+        try {
+            \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+                foreach ($items as $idx => $row) {
+                    if (empty($row['name'])) continue;
 
-                $name = trim($row['name']);
-                $lowerName = strtolower($name);
+                    $name = trim((string)$row['name']);
+                    $lowerName = strtolower($name);
 
-                // Filter out accidental header / banner rows
-                if (
-                    str_starts_with($name, '===') ||
-                    str_contains($lowerName, 'template import') ||
-                    str_contains($lowerName, 'petunjuk') ||
-                    str_contains($lowerName, 'daftar menu') ||
-                    in_array($lowerName, ['kode menu', 'nama menu', 'nama menu*', 'kategori', 'kategori*', 'tipe item', 'harga jual'])
-                ) {
-                    continue;
+                    // Filter out accidental header / banner rows
+                    if (
+                        str_starts_with($name, '===') ||
+                        str_contains($lowerName, 'template import') ||
+                        str_contains($lowerName, 'petunjuk') ||
+                        str_contains($lowerName, 'daftar menu') ||
+                        in_array($lowerName, ['kode menu', 'nama menu', 'nama menu*', 'kategori', 'kategori*', 'tipe item', 'harga jual'])
+                    ) {
+                        continue;
+                    }
+
+                    $code = !empty($row['code']) ? trim((string)$row['code']) : null;
+
+                    // If user didn't specify a code, auto-generate next safe code for this business without collision
+                    if (empty($code)) {
+                        $seq = Menu::where('business_id', $businessId)->count() + 1;
+                        do {
+                            $candidateCode = 'MNU-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                            $exists = Menu::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                            $seq++;
+                        } while ($exists);
+                        $code = $candidateCode;
+                    }
+
+                    $categoryName = !empty($row['category']) ? trim((string)$row['category']) : 'Umum';
+                    $cat = \App\Models\Category::firstOrCreate(
+                        ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'MENU'],
+                        ['slug' => \Illuminate\Support\Str::slug($categoryName), 'color' => '#7C3AED', 'icon' => 'Utensils']
+                    );
+
+                    Menu::updateOrCreate(
+                        [
+                            'business_id' => $businessId,
+                            'code'        => substr($code, 0, 20),
+                        ],
+                        [
+                            'name'         => $name,
+                            'barcode'      => $row['barcode'] ?? null,
+                            'category_id'  => $cat->id,
+                            'category'     => $cat->name,
+                            'item_type'    => !empty($row['item_type']) ? strtoupper((string)$row['item_type']) : 'RECIPE',
+                            'price'        => (float)($row['price'] ?? 0),
+                            'cost_price'   => (float)($row['cost_price'] ?? 0),
+                            'description'  => $row['description'] ?? null,
+                            'is_available' => isset($row['is_available']) ? (bool)$row['is_available'] : true,
+                            'created_by'   => $user?->id,
+                            'updated_by'   => $user?->id,
+                        ]
+                    );
+
+                    $importedCount++;
                 }
+            });
+        } catch (\Throwable $e) {
+            try {
+                \Illuminate\Support\Facades\Log::error("bulkImport Menu error: " . $e->getMessage());
+            } catch (\Throwable $logEx) {}
 
-                $code = !empty($row['code']) ? trim($row['code']) : null;
-
-                // If user didn't specify a code, auto-generate next safe code for this business without collision
-                if (empty($code)) {
-                    $seq = Menu::where('business_id', $businessId)->count() + 1;
-                    do {
-                        $candidateCode = 'MNU-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                        $exists = Menu::where('business_id', $businessId)->where('code', $candidateCode)->exists();
-                        $seq++;
-                    } while ($exists);
-                    $code = $candidateCode;
-                }
-
-                $categoryName = !empty($row['category']) ? trim($row['category']) : 'Umum';
-                $cat = \App\Models\Category::firstOrCreate(
-                    ['business_id' => $businessId, 'name' => $categoryName, 'type' => 'MENU'],
-                    ['slug' => \Illuminate\Support\Str::slug($categoryName), 'color' => '#7C3AED', 'icon' => 'Utensils']
-                );
-
-                Menu::updateOrCreate(
-                    [
-                        'business_id' => $businessId,
-                        'code'        => $code,
-                    ],
-                    [
-                        'name'         => $name,
-                        'barcode'      => $row['barcode'] ?? null,
-                        'category_id'  => $cat->id,
-                        'category'     => $cat->name,
-                        'item_type'    => !empty($row['item_type']) ? strtoupper($row['item_type']) : 'RECIPE',
-                        'price'        => (float)($row['price'] ?? 0),
-                        'cost_price'   => (float)($row['cost_price'] ?? 0),
-                        'description'  => $row['description'] ?? null,
-                        'is_available' => isset($row['is_available']) ? (bool)$row['is_available'] : true,
-                        'created_by'   => $user?->id,
-                        'updated_by'   => $user?->id,
-                    ]
-                );
-
-                $importedCount++;
-            }
-        });
+            return response()->json([
+                'message' => 'Gagal meng-import menu: ' . $e->getMessage(),
+                'error'   => $e->getMessage(),
+            ], 422);
+        }
 
         return response()->json([
             'message' => "Berhasil meng-import {$importedCount} master menu dari file Excel.",
@@ -563,205 +730,249 @@ class MenuController extends Controller
         $importedMenuCount = 0;
         $totalItemsCount = 0;
 
-        \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedMenuCount, &$totalItemsCount) {
-            // Group rows by menu identifier (menu_code or menu_name)
-            $groupedByMenu = [];
-            foreach ($items as $row) {
-                $menuName = trim($row['menu_name'] ?? $row['menu'] ?? $row['nama_menu'] ?? '');
-                $menuCode = trim($row['menu_code'] ?? $row['kode_menu'] ?? '');
-                if (empty($menuName) && empty($menuCode)) continue;
+        try {
+            \Illuminate\Support\Facades\DB::transaction(function () use ($items, $businessId, $user, &$importedMenuCount, &$totalItemsCount) {
+                // Group rows by menu identifier (menu_code or menu_name)
+                $groupedByMenu = [];
+                foreach ($items as $row) {
+                    $menuName = trim((string)($row['menu_name'] ?? $row['menu'] ?? $row['nama_menu'] ?? ''));
+                    $menuCode = trim((string)($row['menu_code'] ?? $row['kode_menu'] ?? ''));
+                    if (empty($menuName) && empty($menuCode)) continue;
 
-                $ingredientName = trim($row['ingredient_name'] ?? $row['bahan'] ?? $row['nama_bahan'] ?? $row['item_name'] ?? $row['nama_perlengkapan'] ?? '');
-                $ingredientCode = trim($row['ingredient_code'] ?? $row['kode_bahan'] ?? $row['kode_perlengkapan'] ?? '');
-                if (empty($ingredientName) && empty($ingredientCode)) continue;
-
-                // If ingredient name is missing but code is present, attempt to resolve from existing master
-                if (empty($ingredientName) && !empty($ingredientCode)) {
-                    $existIng = Ingredient::where('business_id', $businessId)->where('code', $ingredientCode)->first();
-                    if ($existIng) {
-                        $ingredientName = $existIng->name;
-                    }
-                }
-
-                $key = !empty($menuCode) ? "code:{$menuCode}" : "name:" . strtolower($menuName);
-                if (!isset($groupedByMenu[$key])) {
-                    $groupedByMenu[$key] = [
-                        'menu_code' => $menuCode,
-                        'menu_name' => $menuName,
-                        'recipe_items' => [],
-                    ];
-                }
-
-                $groupedByMenu[$key]['recipe_items'][] = $row;
-            }
-
-            foreach ($groupedByMenu as $group) {
-                $menuCode = $group['menu_code'];
-                $menuName = $group['menu_name'];
-                $recipeRows = $group['recipe_items'];
-
-                if (empty($recipeRows)) continue;
-
-                // 1. Find or create Menu
-                $menu = null;
-                if (!empty($menuCode)) {
-                    $menu = Menu::where('business_id', $businessId)->where('code', $menuCode)->first();
-                }
-                if (!$menu && !empty($menuName)) {
-                    $menu = Menu::where('business_id', $businessId)
-                        ->where(\Illuminate\Support\Facades\DB::raw('LOWER(name)'), strtolower($menuName))
-                        ->first();
-                }
-
-                if (!$menu) {
-                    if (empty($menuCode)) {
-                        $seq = Menu::where('business_id', $businessId)->count() + 1;
-                        do {
-                            $candidateCode = 'MNU-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                            $exists = Menu::where('business_id', $businessId)->where('code', $candidateCode)->exists();
-                            $seq++;
-                        } while ($exists);
-                        $menuCode = $candidateCode;
+                    // Filter out accidental header / banner rows
+                    $lowerMenu = strtolower($menuName);
+                    if (
+                        str_starts_with($menuName, '===') ||
+                        str_contains($lowerMenu, 'template import') ||
+                        str_contains($lowerMenu, 'petunjuk') ||
+                        str_contains($lowerMenu, 'daftar resep') ||
+                        in_array($lowerMenu, ['nama menu', 'nama menu*', 'kode menu', 'nama menu / produk', 'nama menu / produk (▼)*'])
+                    ) {
+                        continue;
                     }
 
-                    $cat = \App\Models\Category::firstOrCreate(
-                        ['business_id' => $businessId, 'name' => 'Minuman', 'type' => 'MENU'],
-                        ['slug' => 'minuman', 'color' => '#7C3AED', 'icon' => 'Utensils']
-                    );
+                    $ingredientName = trim((string)($row['ingredient_name'] ?? $row['bahan'] ?? $row['nama_bahan'] ?? $row['item_name'] ?? $row['nama_perlengkapan'] ?? ''));
+                    $ingredientCode = trim((string)($row['ingredient_code'] ?? $row['kode_bahan'] ?? $row['kode_perlengkapan'] ?? ''));
+                    if (empty($ingredientName) && empty($ingredientCode)) continue;
 
-                    $menu = Menu::create([
-                        'business_id'  => $businessId,
-                        'code'         => $menuCode,
-                        'name'         => $menuName ?: "Menu {$menuCode}",
-                        'category_id'  => $cat->id,
-                        'category'     => $cat->name,
-                        'item_type'    => 'RECIPE',
-                        'price'        => 15000,
-                        'cost_price'   => 0,
-                        'is_available' => true,
-                        'created_by'   => $user?->id,
-                        'updated_by'   => $user?->id,
-                    ]);
-                } else {
-                    if ($menu->item_type === 'DIRECT') {
-                        $menu->item_type = 'RECIPE';
-                        $menu->save();
+                    $lowerIng = strtolower($ingredientName);
+                    if (
+                        str_starts_with($ingredientName, '===') ||
+                        in_array($lowerIng, ['nama bahan', 'nama bahan*', 'nama perlengkapan', 'nama bahan / kemasan*', 'nama bahan / perlengkapan (▼)*'])
+                    ) {
+                        continue;
                     }
+
+                    // If ingredient name is missing but code is present, attempt to resolve from existing master
+                    if (empty($ingredientName) && !empty($ingredientCode)) {
+                        $existIng = Ingredient::where('business_id', $businessId)->where('code', $ingredientCode)->first();
+                        if ($existIng) {
+                            $ingredientName = $existIng->name;
+                        }
+                    }
+
+                    $key = !empty($menuCode) ? "code:{$menuCode}" : "name:" . strtolower($menuName);
+                    if (!isset($groupedByMenu[$key])) {
+                        $groupedByMenu[$key] = [
+                            'menu_code' => $menuCode,
+                            'menu_name' => $menuName,
+                            'recipe_items' => [],
+                        ];
+                    }
+
+                    $groupedByMenu[$key]['recipe_items'][] = $row;
                 }
 
-                $oldHpp = (float)$menu->calculateHpp();
-                $nextVersion = ($menu->recipes()->max('version') ?? 0) + 1;
+                foreach ($groupedByMenu as $group) {
+                    $menuCode = $group['menu_code'];
+                    $menuName = $group['menu_name'];
+                    $recipeRows = $group['recipe_items'];
 
-                $recipe = Recipe::create([
-                    'menu_id'    => $menu->id,
-                    'version'    => $nextVersion,
-                    'date'       => $recipeRows[0]['date'] ?? now()->toDateString(),
-                    'created_by' => $user?->id,
-                    'updated_by' => $user?->id,
-                ]);
+                    if (empty($recipeRows)) continue;
 
-                foreach ($recipeRows as $rRow) {
-                    $ingName = trim($rRow['ingredient_name'] ?? $rRow['bahan'] ?? $rRow['nama_bahan'] ?? $rRow['item_name'] ?? $rRow['nama_perlengkapan'] ?? '');
-                    $ingCode = trim($rRow['ingredient_code'] ?? $rRow['kode_bahan'] ?? '');
-                    $qty = (float)($rRow['qty'] ?? $rRow['gramasi'] ?? $rRow['jumlah'] ?? 1);
-                    $unit = trim($rRow['unit'] ?? $rRow['satuan'] ?? 'gram');
-                    $waste = (float)($rRow['waste_std'] ?? $rRow['waste'] ?? $rRow['susut'] ?? 0);
-
-                    // Match ingredient
-                    $ingredient = null;
-                    if (!empty($ingCode)) {
-                        $ingredient = Ingredient::where('business_id', $businessId)->where('code', $ingCode)->first();
+                    // 1. Find or create Menu
+                    $menu = null;
+                    if (!empty($menuCode)) {
+                        $menu = Menu::where('business_id', $businessId)->where('code', $menuCode)->first();
                     }
-                    if (!$ingredient && !empty($ingName)) {
-                        $ingredient = Ingredient::where('business_id', $businessId)
-                            ->where(\Illuminate\Support\Facades\DB::raw('LOWER(name)'), strtolower($ingName))
+                    if (!$menu && !empty($menuName)) {
+                        $menu = Menu::where('business_id', $businessId)
+                            ->where(\Illuminate\Support\Facades\DB::raw('LOWER(name)'), strtolower($menuName))
                             ->first();
                     }
 
-                    // Auto create ingredient if not exists
-                    if (!$ingredient) {
-                        $isPerl = in_array(strtolower($unit), ['pcs', 'lembar', 'slop', 'pack']) ||
-                            preg_match('/(cup|sedotan|pipet|tissue|tisu|kantong|kresek|box|lid|sealer)/i', $ingName);
-
-                        if (empty($ingCode)) {
-                            $prefix = $isPerl ? 'PLK-' : 'BHN-';
-                            $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                    if (!$menu) {
+                        if (empty($menuCode)) {
+                            $seq = Menu::where('business_id', $businessId)->count() + 1;
                             do {
-                                $candidateCode = $prefix . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                                $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                                $candidateCode = 'MNU-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                                $exists = Menu::where('business_id', $businessId)->where('code', $candidateCode)->exists();
                                 $seq++;
                             } while ($exists);
-                            $ingCode = $candidateCode;
+                            $menuCode = $candidateCode;
                         }
 
-                        $ingCatName = $isPerl ? 'Perlengkapan' : 'BAHAN_BAKU';
-                        $ingCat = \App\Models\Category::firstOrCreate(
-                            ['business_id' => $businessId, 'name' => $ingCatName, 'type' => 'INGREDIENT'],
-                            ['slug' => \Illuminate\Support\Str::slug($ingCatName), 'color' => '#00B14F', 'icon' => 'Package']
+                        $cat = \App\Models\Category::firstOrCreate(
+                            ['business_id' => $businessId, 'name' => 'Minuman', 'type' => 'MENU'],
+                            ['slug' => 'minuman', 'color' => '#7C3AED', 'icon' => 'Utensils']
                         );
 
-                        $unitBeli = $isPerl ? 'slop' : (in_array(strtolower($unit), ['ml', 'liter']) ? 'liter' : 'kg');
-                        $unitPakai = $unit ?: ($isPerl ? 'pcs' : (in_array(strtolower($unit), ['ml', 'liter']) ? 'ml' : 'gram'));
-
-                        $konversi = 1.0;
-                        if ($unitBeli === 'kg' && $unitPakai === 'gram') $konversi = 1000.0;
-                        elseif ($unitBeli === 'liter' && $unitPakai === 'ml') $konversi = 1000.0;
-                        elseif ($unitBeli === 'slop' && $unitPakai === 'pcs') $konversi = 50.0;
-                        elseif ($unitBeli === 'pack') $konversi = 100.0;
-
-                        $ingredient = Ingredient::create([
-                            'business_id'   => $businessId,
-                            'code'          => $ingCode,
-                            'name'          => $ingName ?: "Bahan {$ingCode}",
-                            'category_id'   => $ingCat->id,
-                            'category'      => $ingCat->name,
-                            'type'          => 'RAW',
-                            'unit_beli'     => $unitBeli,
-                            'unit_pakai'    => $unitPakai,
-                            'konversi'      => $konversi,
-                            'harga'         => 0,
-                            'stok_min'      => 0,
-                            'stok_awal'     => 0,
-                            'created_by'    => $user?->id,
-                            'updated_by'    => $user?->id,
+                        $menu = Menu::create([
+                            'business_id'  => $businessId,
+                            'code'         => substr($menuCode, 0, 20),
+                            'name'         => $menuName ?: "Menu {$menuCode}",
+                            'category_id'  => $cat->id,
+                            'category'     => $cat->name,
+                            'item_type'    => 'RECIPE',
+                            'price'        => 15000,
+                            'cost_price'   => 0,
+                            'is_available' => true,
+                            'created_by'   => $user?->id,
+                            'updated_by'   => $user?->id,
                         ]);
+                    } else {
+                        if ($menu->item_type === 'DIRECT') {
+                            $menu->item_type = 'RECIPE';
+                            $menu->save();
+                        }
                     }
 
-                    // Kunci otomatis ke Satuan Pakai Master Bahan (Auto-bind to Master unit_pakai)
-                    $finalUnit = $ingredient->unit_pakai ?: ($unit ?: 'gram');
-                    if (!empty($unit) && strtolower($unit) === strtolower($ingredient->unit_beli) && strtolower($ingredient->unit_beli) !== strtolower($ingredient->unit_pakai) && (float)$ingredient->konversi > 1) {
-                        $qty = $qty * (float)$ingredient->konversi;
-                        $finalUnit = $ingredient->unit_pakai;
+                    $oldHpp = (float)$menu->calculateHpp();
+                    $nextVersion = ((int)$menu->recipes()->max('version') ?: 0) + 1;
+
+                    // Parse date safely
+                    $rawDate = $recipeRows[0]['date'] ?? null;
+                    $recipeDate = now()->toDateString();
+                    if (!empty($rawDate)) {
+                        $parsedTime = strtotime((string)$rawDate);
+                        if ($parsedTime !== false && $parsedTime > 0) {
+                            $recipeDate = date('Y-m-d', $parsedTime);
+                        }
                     }
 
-                    RecipeItem::create([
-                        'recipe_id'     => $recipe->id,
-                        'ingredient_id' => $ingredient->id,
-                        'qty'           => $qty,
-                        'unit'          => $finalUnit,
-                        'waste_std'     => $waste,
+                    $recipe = Recipe::create([
+                        'menu_id'    => $menu->id,
+                        'version'    => $nextVersion,
+                        'date'       => $recipeDate,
+                        'created_by' => $user?->id,
+                        'updated_by' => $user?->id,
                     ]);
 
-                    $totalItemsCount++;
+                    foreach ($recipeRows as $rRow) {
+                        $ingName = trim((string)($rRow['ingredient_name'] ?? $rRow['bahan'] ?? $rRow['nama_bahan'] ?? $rRow['item_name'] ?? $rRow['nama_perlengkapan'] ?? ''));
+                        $ingCode = trim((string)($rRow['ingredient_code'] ?? $rRow['kode_bahan'] ?? ''));
+                        $qty = (float)($rRow['qty'] ?? $rRow['gramasi'] ?? $rRow['jumlah'] ?? 1);
+                        if ($qty <= 0) $qty = 1;
+                        $unit = trim((string)($rRow['unit'] ?? $rRow['satuan'] ?? 'gram'));
+                        $waste = (float)($rRow['waste_std'] ?? $rRow['waste'] ?? $rRow['susut'] ?? 0);
+                        if ($waste < 0) $waste = 0;
+                        if ($waste > 100) $waste = 100;
+
+                        // Match ingredient
+                        $ingredient = null;
+                        if (!empty($ingCode)) {
+                            $ingredient = Ingredient::where('business_id', $businessId)->where('code', $ingCode)->first();
+                        }
+                        if (!$ingredient && !empty($ingName)) {
+                            $ingredient = Ingredient::where('business_id', $businessId)
+                                ->where(\Illuminate\Support\Facades\DB::raw('LOWER(name)'), strtolower($ingName))
+                                ->first();
+                        }
+
+                        // Auto create ingredient if not exists
+                        if (!$ingredient) {
+                            $isPerl = in_array(strtolower($unit), ['pcs', 'lembar', 'slop', 'pack']) ||
+                                preg_match('/(cup|sedotan|pipet|tissue|tisu|kantong|kresek|box|lid|sealer)/i', $ingName);
+
+                            if (empty($ingCode)) {
+                                $prefix = $isPerl ? 'PLK-' : 'BHN-';
+                                $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                                do {
+                                    $candidateCode = $prefix . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                                    $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                                    $seq++;
+                                } while ($exists);
+                                $ingCode = $candidateCode;
+                            }
+
+                            $ingCatName = $isPerl ? 'Perlengkapan' : 'BAHAN_BAKU';
+                            $ingCat = \App\Models\Category::firstOrCreate(
+                                ['business_id' => $businessId, 'name' => $ingCatName, 'type' => 'INGREDIENT'],
+                                ['slug' => \Illuminate\Support\Str::slug($ingCatName), 'color' => '#00B14F', 'icon' => 'Package']
+                            );
+
+                            $unitBeli = $isPerl ? 'slop' : (in_array(strtolower($unit), ['ml', 'liter']) ? 'liter' : 'kg');
+                            $unitPakai = $unit ?: ($isPerl ? 'pcs' : (in_array(strtolower($unit), ['ml', 'liter']) ? 'ml' : 'gram'));
+
+                            $konversi = 1.0;
+                            if ($unitBeli === 'kg' && $unitPakai === 'gram') $konversi = 1000.0;
+                            elseif ($unitBeli === 'liter' && $unitPakai === 'ml') $konversi = 1000.0;
+                            elseif ($unitBeli === 'slop' && $unitPakai === 'pcs') $konversi = 50.0;
+                            elseif ($unitBeli === 'pack') $konversi = 100.0;
+
+                            $ingredient = Ingredient::create([
+                                'business_id'   => $businessId,
+                                'code'          => substr($ingCode, 0, 20),
+                                'name'          => $ingName ?: "Bahan {$ingCode}",
+                                'category_id'   => $ingCat->id,
+                                'category'      => $ingCat->name,
+                                'type'          => 'RAW',
+                                'unit_beli'     => substr($unitBeli, 0, 20),
+                                'unit_pakai'    => substr($unitPakai, 0, 20),
+                                'konversi'      => $konversi,
+                                'harga'         => 0,
+                                'stok_min'      => 0,
+                                'stok_awal'     => 0,
+                                'created_by'    => $user?->id,
+                                'updated_by'    => $user?->id,
+                            ]);
+                        }
+
+                        // Kunci otomatis ke Satuan Pakai Master Bahan (Auto-bind to Master unit_pakai)
+                        $finalUnit = $ingredient->unit_pakai ?: ($unit ?: 'gram');
+                        if (!empty($unit) && strtolower($unit) === strtolower($ingredient->unit_beli) && strtolower($ingredient->unit_beli) !== strtolower($ingredient->unit_pakai) && (float)$ingredient->konversi > 1) {
+                            $qty = $qty * (float)$ingredient->konversi;
+                            $finalUnit = $ingredient->unit_pakai;
+                        }
+
+                        RecipeItem::create([
+                            'recipe_id'     => $recipe->id,
+                            'ingredient_id' => $ingredient->id,
+                            'qty'           => $qty,
+                            'unit'          => substr($finalUnit, 0, 20),
+                            'waste_std'     => $waste,
+                        ]);
+
+                        $totalItemsCount++;
+                    }
+
+                    $newHpp = (float)$menu->calculateHpp();
+                    $menu->cost_price = $newHpp;
+                    $menu->save();
+
+                    try {
+                        \App\Services\MenuHppService::recordForRecipeUpdate(
+                            $menu,
+                            $oldHpp,
+                            $newHpp,
+                            $user?->id,
+                            "Import resep Excel ke Versi {$nextVersion}"
+                        );
+                    } catch (\Throwable $e) {}
+
+                    $importedMenuCount++;
                 }
+            });
+        } catch (\Throwable $e) {
+            try {
+                \Illuminate\Support\Facades\Log::error("bulkImportRecipes error: " . $e->getMessage(), ['trace' => $e->getTraceAsString()]);
+            } catch (\Throwable $logEx) {}
 
-                $newHpp = (float)$menu->calculateHpp();
-                $menu->cost_price = $newHpp;
-                $menu->save();
-
-                try {
-                    \App\Services\MenuHppService::recordForRecipeUpdate(
-                        $menu,
-                        $oldHpp,
-                        $newHpp,
-                        $user?->id,
-                        "Import resep Excel ke Versi {$nextVersion}"
-                    );
-                } catch (\Throwable $e) {}
-
-                $importedMenuCount++;
-            }
-        });
+            return response()->json([
+                'message' => 'Gagal meng-import resep: ' . $e->getMessage(),
+                'error'   => $e->getMessage(),
+            ], 422);
+        }
 
         return response()->json([
             'message'             => "Berhasil meng-import resep untuk {$importedMenuCount} menu ({$totalItemsCount} rincian bahan/gramasi terpasang).",

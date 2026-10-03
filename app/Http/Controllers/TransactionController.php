@@ -526,19 +526,63 @@ class TransactionController extends Controller
                 $options = $this->resolveModifierOptions($it);
                 $modifierUnitPrice = (float)$options->sum('price');
                 $itemUnitPrice = (float)$menu->price + $modifierUnitPrice;
-                $itemTotal = $itemUnitPrice * (int)$it['qty'];
-                $orderTotal += $itemTotal;
+                $reqQty = (int)$it['qty'];
 
-                $preparedItems[] = [
-                    'menu'           => $menu,
-                    'recipe'         => $recipe,
-                    'qty'            => (int)$it['qty'],
-                    'item_notes'     => $it['notes'] ?? null,
-                    'is_urgent'      => !empty($it['is_urgent']) || $isUrgentOrder,
-                    'item_total'     => $itemTotal,
-                    'options'        => $options,
-                    'modifier_extra' => $modifierUnitPrice,
-                ];
+                $isExplicitUrgent = isset($it['is_urgent']) ? (bool)$it['is_urgent'] : false;
+
+                // Check stock for DIRECT products if not explicitly marked urgent
+                $avail = null;
+                if (!$isExplicitUrgent && $menu->item_type === 'DIRECT' && $menu->track_stock) {
+                    $avail = (int)$menu->stockForOutlet($outletId);
+                }
+
+                if ($avail !== null && $avail > 0 && $reqQty > $avail) {
+                    // Auto-split: available portions are normal, excess portions are urgent
+                    $normalQty = $avail;
+                    $urgentQty = $reqQty - $avail;
+
+                    // 1. Normal portion
+                    $itemTotalNormal = $itemUnitPrice * $normalQty;
+                    $orderTotal += $itemTotalNormal;
+                    $preparedItems[] = [
+                        'menu'           => $menu,
+                        'recipe'         => $recipe,
+                        'qty'            => $normalQty,
+                        'item_notes'     => $it['notes'] ?? null,
+                        'is_urgent'      => false,
+                        'item_total'     => $itemTotalNormal,
+                        'options'        => $options,
+                        'modifier_extra' => $modifierUnitPrice,
+                    ];
+
+                    // 2. Urgent portion
+                    $itemTotalUrgent = $itemUnitPrice * $urgentQty;
+                    $orderTotal += $itemTotalUrgent;
+                    $preparedItems[] = [
+                        'menu'           => $menu,
+                        'recipe'         => $recipe,
+                        'qty'            => $urgentQty,
+                        'item_notes'     => !empty($it['notes']) ? ($it['notes'] . ' (Urgent Defisit)') : 'Urgent Defisit',
+                        'is_urgent'      => true,
+                        'item_total'     => $itemTotalUrgent,
+                        'options'        => $options,
+                        'modifier_extra' => $modifierUnitPrice,
+                    ];
+                } else {
+                    $itemTotal = $itemUnitPrice * $reqQty;
+                    $orderTotal += $itemTotal;
+
+                    $preparedItems[] = [
+                        'menu'           => $menu,
+                        'recipe'         => $recipe,
+                        'qty'            => $reqQty,
+                        'item_notes'     => $it['notes'] ?? null,
+                        'is_urgent'      => isset($it['is_urgent']) ? (bool)$it['is_urgent'] : $isUrgentOrder,
+                        'item_total'     => $itemTotal,
+                        'options'        => $options,
+                        'modifier_extra' => $modifierUnitPrice,
+                    ];
+                }
             }
 
             // Calculate Gross Subtotal & Resolve Discount
@@ -608,8 +652,8 @@ class TransactionController extends Controller
                         'payment_method'  => $data['payment_method'] ?? 'CASH',
                         'dp_payment_method'=> in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_payment_method'] ?? 'CASH') : null,
                         'dp_reference_no'  => in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_reference_no'] ?? null) : null,
-                        'is_urgent_note'  => $isUrgentOrder || $prep['is_urgent'],
-                        'urgent_status'   => ($isUrgentOrder || $prep['is_urgent']) ? 'PENDING' : 'NONE',
+                        'is_urgent_note'  => !empty($prep['is_urgent']),
+                        'urgent_status'   => !empty($prep['is_urgent']) ? 'PENDING' : 'NONE',
                         'notes'           => $prep['item_notes'] ?: ($data['notes'] ?? null),
                         'user_id'         => $request->user()->id,
                         'created_by'      => $request->user()->id,
@@ -813,6 +857,7 @@ class TransactionController extends Controller
                         'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
                         'business_id'      => $businessId,
                         'outlet_id'        => $outletId,
+                        'shift_id'         => $shiftId,
                         'transaction_id'   => $results[0]->id ?? null,
                         'customer_id'      => $customerId,
                         'order_number'     => $orderNumber,
@@ -837,6 +882,7 @@ class TransactionController extends Controller
                             'receivable_id'  => $rec->id,
                             'business_id'    => $businessId,
                             'outlet_id'      => $outletId,
+                            'shift_id'       => $shiftId,
                             'payment_date'   => $data['date'],
                             'amount'         => $amountPaidNow,
                             'payment_method' => $dpMethod,
@@ -1509,6 +1555,7 @@ class TransactionController extends Controller
                     'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $date),
                     'business_id'      => $businessId,
                     'outlet_id'        => $outletId,
+                    'shift_id'         => $shiftId,
                     'transaction_id'   => $firstTrx->id ?? null,
                     'customer_id'      => $customerId,
                     'order_number'     => $orderNumber,
@@ -1533,6 +1580,7 @@ class TransactionController extends Controller
                         'receivable_id'  => $rec->id,
                         'business_id'    => $businessId,
                         'outlet_id'      => $outletId,
+                        'shift_id'       => $shiftId,
                         'payment_date'   => $date,
                         'amount'         => $amountPaidNow,
                         'payment_method' => $dpMethod,
@@ -1857,59 +1905,61 @@ class TransactionController extends Controller
             }
 
             // 2. Ingredient Stock Movements Management
-            $saleMovements = StockMovement::whereIn('transaction_id', $trxIds)
-                ->where('type', 'SALE_USAGE')
-                ->get();
+            $saleMovements = StockMovement::where(function ($q) use ($trxIds, $orderNum) {
+                $q->whereIn('transaction_id', $trxIds)
+                  ->orWhere('note', 'like', "{$orderNum} – %")
+                  ->orWhere('note', 'like', "{$orderNum}%");
+            })->get();
 
             if (!$isWasted) {
-                // If WRONG_INPUT: Revert Ingredient Stock Movements with explicit Audit Trail in Kartu Stok (ADJUSTMENT_IN)
-                foreach ($saleMovements as $mov) {
-                    StockMovement::create([
-                        'business_id'    => $mov->business_id,
-                        'outlet_id'      => $mov->outlet_id,
-                        'ingredient_id'  => $mov->ingredient_id,
-                        'date'           => $now->toDateString(),
-                        'type'           => 'ADJUSTMENT_IN',
-                        'qty'            => $mov->qty,
-                        'unit_price'     => $mov->unit_price,
-                        'total_price'    => $mov->total_price,
-                        'cost_before'    => $mov->cost_after ?? $mov->cost_before,
-                        'cost_after'     => $mov->cost_before,
-                        'note'           => "Pengembalian Stok: Void Salah Input Disetujui oleh {$approver->name} - Nota #{$orderNum} [Alasan: {$reason}]",
-                        'transaction_id' => $mov->transaction_id,
-                        'shift_id'       => $mov->shift_id,
-                        'user_id'        => $approver->id,
-                        'created_by'     => $approver->id,
-                        'updated_by'     => $approver->id,
-                    ]);
-
-                    // Annotate the original SALE_USAGE row
-                    $mov->update([
-                        'note'       => trim(($mov->note ?? '') . " [VOID SALAH INPUT / Dikembalikan: {$reason}]"),
-                        'updated_by' => $approver->id,
-                    ]);
-                }
+                // If WRONG_INPUT: Hapus total riwayat mutasi dari Kartu Stok (stock_movements)
+                // sesuai permintaan: "klau dia pilih void karna salah input dia harusnya menghapus juga riwayat di kartu stock dan hpp di laba rugi"
+                StockMovement::where(function ($q) use ($trxIds, $orderNum) {
+                    $q->whereIn('transaction_id', $trxIds)
+                      ->orWhere('note', 'like', "{$orderNum} – %")
+                      ->orWhere('note', 'like', "{$orderNum}%");
+                })->delete();
             } else {
                 // If WASTED: Stock is NOT returned (tetap dianggap barang keluar).
-                // Annotate original SALE_USAGE rows as Wasted so audit trail clearly reflects food loss
+                // Change movement type to 'WASTE' so that it is NOT counted in SALE_USAGE (HPP Riil becomes 0),
+                // but correctly recorded under WASTE in Kartu Stok & Laba Rugi.
                 foreach ($saleMovements as $mov) {
                     $mov->update([
-                        'note'       => trim(($mov->note ?? '') . " [VOID WASTED / Barang Terbuang: {$reason}]"),
-                        'updated_by' => $approver->id,
+                        'type'         => 'WASTE',
+                        'waste_reason' => 'CUSTOMER_COMPLAINT',
+                        'note'         => trim(($mov->note ?? '') . " [VOID WASTED / Barang Terbuang: {$reason}]"),
+                        'updated_by'   => $approver->id,
                     ]);
                 }
 
-                // Automatically create WasteLog records for each wasted menu item so it integrates into Waste Tracking
+                // Automatically create WasteLog records for each wasted menu item with real ingredient cost
                 $datePrefix = $now->format('Ymd');
                 foreach ($transactions as $t) {
                     $menu = $t->menu;
-                    $costPrice = (float)($menu?->cost_price ?: 0);
-                    if ($costPrice <= 0 && $menu && method_exists($menu, 'calculateHpp')) {
+
+                    // ⚡ Calculate actual real ingredient cost from the stock movements of this transaction item
+                    $itemMovements = $saleMovements->where('transaction_id', $t->id);
+                    $realCost = (float)$itemMovements->sum('total_price');
+
+                    if ($realCost <= 0) {
+                        $realCost = (float)$saleMovements->filter(function ($m) use ($orderNum, $menu) {
+                            return str_contains($m->note ?? '', $orderNum) && ($menu ? str_contains($m->note ?? '', $menu->name) : true);
+                        })->sum('total_price');
+                    }
+
+                    if ($realCost <= 0 && $menu && method_exists($menu, 'calculateHpp')) {
                         try {
-                            $costPrice = (float)$menu->calculateHpp($t->outlet_id, $t->date ?: $now->toDateString());
+                            $hppPerUnit = (float)$menu->calculateHpp($t->date ?: $now->toDateString(), $t->outlet_id);
+                            $realCost = round($hppPerUnit * (float)$t->qty, 2);
                         } catch (\Throwable $e) {}
                     }
-                    $lossCost = round($costPrice * (float)$t->qty, 2);
+
+                    if ($realCost <= 0 && $menu && (float)$menu->cost_price > 0) {
+                        $realCost = round((float)$menu->cost_price * (float)$t->qty, 2);
+                    }
+
+                    $costPerUnit = (float)$t->qty > 0 ? round($realCost / (float)$t->qty, 2) : $realCost;
+                    $lossCost = round($realCost, 2);
 
                     $latestWaste = WasteLog::where('waste_no', 'like', "WST-{$datePrefix}-%")->orderBy('id', 'desc')->first();
                     $nextSeq = 1;
@@ -1929,7 +1979,7 @@ class TransactionController extends Controller
                         'qty'             => (float)$t->qty,
                         'unit_type'       => $menu?->unit ?: 'porsi',
                         'qty_pakai'       => (float)$t->qty,
-                        'cost_per_unit'   => $costPrice,
+                        'cost_per_unit'   => $costPerUnit,
                         'loss_cost'       => $lossCost,
                         'reason_category' => 'CUSTOMER_COMPLAINT',
                         'notes'           => "Void Wasted (Makanan Batal/Terbuang) Nota #{$orderNum}: {$reason}",
@@ -2074,8 +2124,8 @@ class TransactionController extends Controller
             $this->executeVoidApproval($transactions, $orderNum, $reason, $user, $user, $voidType);
 
             $succMsg = $isWasted
-                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / Batal Terbuang) oleh Manajer/Owner ({$user->name}). Bahan tetap tercatat keluar (tidak dikembalikan) dan masuk ke Laporan Waste."
-                : "Nota transaksi '{$orderNum}' berhasil di-void (Salah Input) oleh Manajer/Owner ({$user->name}). Stok bahan baku telah dikembalikan ke Kartu Stok.";
+                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / Makanan Terbuang) oleh Manajer/Owner ({$user->name}). Bahan tetap tercatat keluar (tidak dikembalikan) dan dicatat ke Laporan Waste & Laba Rugi."
+                : "Nota transaksi '{$orderNum}' berhasil di-void (Salah Input) oleh Manajer/Owner ({$user->name}). Riwayat di Kartu Stok & HPP Laba Rugi telah dihapus bersih.";
 
             return response()->json([
                 'message'             => $succMsg,
@@ -2112,8 +2162,8 @@ class TransactionController extends Controller
             $this->executeVoidApproval($transactions, $orderNum, $reason, $supervisor, $user, $voidType);
 
             $succMsg = $isWasted
-                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / Batal Terbuang) via otorisasi Manajer ({$supervisor->name}). Bahan tetap tercatat keluar dan dicatat ke Laporan Waste."
-                : "Nota transaksi '{$orderNum}' berhasil di-void (Salah Input) via otorisasi Manajer ({$supervisor->name}). Stok bahan baku telah dikembalikan ke Kartu Stok.";
+                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / Makanan Terbuang) via otorisasi Manajer ({$supervisor->name}). Bahan tetap tercatat keluar dan dicatat ke Laporan Waste & Laba Rugi."
+                : "Nota transaksi '{$orderNum}' berhasil di-void (Salah Input) via otorisasi Manajer ({$supervisor->name}). Riwayat di Kartu Stok & HPP Laba Rugi telah dihapus bersih.";
 
             return response()->json([
                 'message'             => $succMsg,
@@ -2130,7 +2180,7 @@ class TransactionController extends Controller
 
         // SCENARIO 3: Current user is Pegawai/Kasir requesting void asynchronously (Pending Approval)
         $now = now();
-        $typeStr = $isWasted ? 'WASTED (Terbuang)' : 'SALAH INPUT';
+        $typeStr = $isWasted ? 'WASTED (Makanan Terbuang)' : 'SALAH INPUT';
         foreach ($transactions as $t) {
             $t->update([
                 'status'              => 'VOID_PENDING',
@@ -2144,8 +2194,8 @@ class TransactionController extends Controller
         }
 
         $pendingMsg = $isWasted
-            ? "Permohonan void nota (Wasted / Batal Terbuang) '{$orderNum}' berhasil diajukan ke Manajer/Owner. Bahan tetap tercatat keluar setelah disetujui."
-            : "Permohonan void nota (Salah Input) '{$orderNum}' berhasil diajukan ke Manajer/Owner. Stok bahan baku akan dikembalikan setelah permohonan disetujui.";
+            ? "Permohonan void nota (Wasted / Makanan Terbuang) '{$orderNum}' berhasil diajukan ke Manajer/Owner. Bahan tetap tercatat keluar setelah disetujui."
+            : "Permohonan void nota (Salah Input) '{$orderNum}' berhasil diajukan ke Manajer/Owner. Riwayat di Kartu Stok & HPP akan dibersihkan setelah permohonan disetujui.";
 
         return response()->json([
             'message'             => $pendingMsg,
@@ -2200,8 +2250,8 @@ class TransactionController extends Controller
         $this->executeVoidApproval($transactions, $orderNumber, $reason, $user, $requester, $voidType);
 
         $succMsg = strtoupper($voidType) === 'WASTED'
-            ? "Permohonan void nota '{$orderNumber}' (Wasted / Batal Terbuang) telah disetujui. Bahan tetap tercatat keluar dan dicatat ke Laporan Waste."
-            : "Permohonan void nota '{$orderNumber}' (Salah Input) telah disetujui. Transaksi dibatalkan dan seluruh stok bahan baku telah dikembalikan ke Kartu Stok.";
+            ? "Permohonan void nota '{$orderNumber}' (Wasted / Makanan Terbuang) telah disetujui. Bahan tetap tercatat keluar dan dicatat ke Laporan Waste."
+            : "Permohonan void nota '{$orderNumber}' (Salah Input) telah disetujui. Transaksi dibatalkan dan seluruh riwayat mutasi telah dihapus dari Kartu Stok.";
 
         return response()->json([
             'message'             => $succMsg,
@@ -2292,7 +2342,7 @@ class TransactionController extends Controller
 
         // Query base
         $baseQuery = Transaction::with([
-            'menu.recipe.items.ingredient',
+            'menu.recipes.items.ingredient',
             'modifiers.ingredient',
             'voidRequestedByUser',
             'voidApprovedByUser',

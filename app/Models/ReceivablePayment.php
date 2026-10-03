@@ -14,6 +14,7 @@ class ReceivablePayment extends Model
         'receivable_id',
         'business_id',
         'outlet_id',
+        'shift_id',
         'payment_date',
         'amount',
         'payment_method',
@@ -30,6 +31,7 @@ class ReceivablePayment extends Model
     protected $appends = [
         'received_by_name',
         'outlet_name',
+        'shift_name',
     ];
 
     public static function generatePaymentNo(?int $businessId, string $date): string
@@ -61,6 +63,11 @@ class ReceivablePayment extends Model
         return $this->belongsTo(Outlet::class);
     }
 
+    public function shift()
+    {
+        return $this->belongsTo(Shift::class);
+    }
+
     public function receiver()
     {
         return $this->belongsTo(User::class, 'received_by');
@@ -74,5 +81,49 @@ class ReceivablePayment extends Model
     public function getOutletNameAttribute(): string
     {
         return $this->outlet?->name ?? 'Pusat';
+    }
+
+    public function getShiftNameAttribute(): ?string
+    {
+        // 1. Direct loaded relationship
+        if ($this->relationLoaded('shift') && $this->shift) {
+            return $this->shift->shift_name ?: "Shift #{$this->shift->id}";
+        }
+        // 2. Direct shift_id lookup
+        if ($this->shift_id) {
+            $s = Shift::find($this->shift_id);
+            if ($s) {
+                return $s->shift_name ?: "Shift #{$s->id}";
+            }
+        }
+        // 3. Fallback to parent receivable's shift
+        if ($this->relationLoaded('receivable') && $this->receivable?->shift) {
+            return $this->receivable->shift->shift_name ?: "Shift #{$this->receivable->shift->id}";
+        }
+        if ($this->receivable_id) {
+            $recShiftId = Receivable::where('id', $this->receivable_id)->value('shift_id');
+            if ($recShiftId) {
+                $s = Shift::find($recShiftId);
+                if ($s) {
+                    return $s->shift_name ?: "Shift #{$s->id}";
+                }
+            }
+        }
+        // 4. Fallback: match by outlet and created_at against shift hours
+        if ($this->created_at && $this->outlet_id) {
+            $matched = Shift::withoutGlobalScopes()
+                ->where('outlet_id', $this->outlet_id)
+                ->where('opened_at', '<=', $this->created_at)
+                ->where(function ($q) {
+                    $q->where('closed_at', '>=', $this->created_at)
+                      ->orWhereNull('closed_at');
+                })
+                ->orderByDesc('opened_at')
+                ->first();
+            if ($matched) {
+                return $matched->shift_name ?: "Shift #{$matched->id}";
+            }
+        }
+        return null;
     }
 }

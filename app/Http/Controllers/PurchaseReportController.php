@@ -779,57 +779,6 @@ class PurchaseReportController extends Controller
             }
         }
 
-        // Also if there are directly received purchases that had courier/shipping in note
-        if (empty($rows)) {
-            $mvtQuery = StockMovement::with(['ingredient', 'outlet', 'user'])
-                ->where('type', 'PURCHASE')
-                ->whereBetween('date', [$from, $to])
-                ->orderBy('date', 'desc');
-
-            if ($outletId) {
-                $mvtQuery->where('outlet_id', $outletId);
-            } elseif ($scope === 'HOLDING') {
-                $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-                if (empty($holdingIds)) $holdingIds = [1];
-                $mvtQuery->whereIn('outlet_id', $holdingIds);
-            } elseif ($scope === 'OUTLET') {
-                $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-                if (empty($holdingIds)) $holdingIds = [1];
-                $mvtQuery->whereNotIn('outlet_id', $holdingIds);
-            }
-
-            $movements = $mvtQuery->limit(50)->get();
-            foreach ($movements as $m) {
-                $ing = $m->ingredient;
-                $konversi = max((float)($ing?->konversi ?? 1), 1);
-                $qty = round((float)$m->qty / $konversi, 4);
-                $satuan = $ing?->unit_beli ?: ($ing?->unit_pakai ?: 'Unit');
-                $subtotal = (float)$m->total_price;
-
-                $totalJumlahAll += $subtotal;
-                $totalQtyAll    += $qty;
-
-                $supplier = $m->supplier_name ?: 'Supplier Umum';
-                $rows[] = [
-                    'no'               => $no++,
-                    'supplier_tanggal' => "{$supplier} / " . Carbon::parse($m->date)->format('d/m/Y'),
-                    'supplier_name'    => $supplier,
-                    'tgl_dibuat'       => $m->created_at ? $m->created_at->format('d/m/Y H:i') : Carbon::parse($m->date)->format('d/m/Y'),
-                    'dibuat_oleh'      => $m->user?->name ?: 'Staff Pengadaan',
-                    'no_ref'           => $m->purchase_no ?: ('SMV-' . str_pad($m->id, 5, '0', STR_PAD_LEFT)),
-                    'kode_produk'      => $ing?->code ?: ('ING-' . $m->ingredient_id),
-                    'nama_produk'      => $ing?->name ?: 'Item #' . $m->ingredient_id,
-                    'qty'              => $qty,
-                    'satuan'           => $satuan,
-                    'jumlah'           => $subtotal,
-                    'status'           => 'Diterima',
-                    'ekspedisi'        => 'Pengiriman Langsung',
-                    'no_resi'          => '-',
-                    'warehouse'        => $m->outlet?->name ?: 'Warehouse',
-                ];
-            }
-        }
-
         return response()->json([
             'business_name' => $businessName,
             'report_title'  => 'LAPORAN PENGIRIMAN PEMBELIAN',

@@ -68,6 +68,11 @@ class Menu extends Model
         return $this->hasMany(Recipe::class);
     }
 
+    public function recipe()
+    {
+        return $this->hasOne(Recipe::class)->latestOfMany('version');
+    }
+
     public function bundleItems()
     {
         return $this->hasMany(BundleItem::class, 'menu_id')->with(['bundledMenu', 'ingredient']);

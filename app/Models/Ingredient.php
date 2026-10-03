@@ -14,7 +14,7 @@ class Ingredient extends Model
         'business_id',
         'code', 'name', 'category', 'category_id', 'type',
         'unit_beli', 'unit_beli_id', 'unit_pakai', 'unit_pakai_id',
-        'konversi', 'harga', 'last_purchase_price', 'stok_awal', 'stok_min', 'tolerance',
+        'konversi', 'harga', 'last_purchase_price', 'stok_awal', 'saldo_awal_nominal', 'tanggal_saldo_awal', 'stok_min', 'tolerance',
         'yield_qty', 'yield_unit', 'active',
         'created_by', 'updated_by',
     ];
@@ -33,6 +33,8 @@ class Ingredient extends Model
         'harga'               => 'float',
         'last_purchase_price' => 'float',
         'stok_awal'           => 'float',
+        'saldo_awal_nominal'  => 'float',
+        'tanggal_saldo_awal'  => 'string',
         'stok_min'            => 'float',
         'tolerance'           => 'float',
         'yield_qty'           => 'float',
@@ -99,25 +101,18 @@ class Ingredient extends Model
 
     public function stockForOutlet(int $outletId): float
     {
-        $hasInitialMov = StockMovement::where('ingredient_id', $this->id)
-            ->where('outlet_id', $outletId)
-            ->where('type', 'INITIAL')
-            ->exists();
+        $outletRow = $this->relationLoaded('outletIngredients')
+            ? $this->outletIngredients->firstWhere('outlet_id', $outletId)
+            : $this->outletIngredients()->where('outlet_id', $outletId)->first();
 
         $stokAwal = 0.0;
-        if (!$hasInitialMov) {
-            $outletRow = $this->relationLoaded('outletIngredients')
-                ? $this->outletIngredients->firstWhere('outlet_id', $outletId)
-                : $this->outletIngredients()->where('outlet_id', $outletId)->first();
-
-            if ($outletRow && (float)$outletRow->stok_awal > 0) {
-                $stokAwal = (float)$outletRow->stok_awal;
-            } else {
-                $ot = $outletRow?->outlet ?? \App\Models\Outlet::find($outletId);
-                $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
-                if ($isHolding) {
-                    $stokAwal = (float)$this->stok_awal;
-                }
+        if ($outletRow && (float)$outletRow->stok_awal > 0) {
+            $stokAwal = (float)$outletRow->stok_awal;
+        } else {
+            $ot = $outletRow?->outlet ?? \App\Models\Outlet::find($outletId);
+            $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
+            if ($isHolding) {
+                $stokAwal = (float)$this->stok_awal;
             }
         }
 
@@ -126,11 +121,13 @@ class Ingredient extends Model
         } elseif ($this->relationLoaded('movements')) {
             $movSum = (float) $this->movements
                 ->where('outlet_id', $outletId)
+                ->where('type', '!=', 'INITIAL')
                 ->sum(fn($m) => $m->signedQty());
         } else {
             $movSum = (float) $this->movements()
                 ->where('outlet_id', $outletId)
-                ->selectRaw("SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->where('type', '!=', 'INITIAL')
+                ->selectRaw("SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
                 ->value('net_qty') ?? 0.0;
         }
 
@@ -139,29 +136,23 @@ class Ingredient extends Model
 
     public function consolidatedStock(): float
     {
-        $hasInitialMov = StockMovement::where('ingredient_id', $this->id)
-            ->where('type', 'INITIAL')
-            ->exists();
-
         if ($this->precomputedMovements !== null) {
             $movSum = (float) array_sum($this->precomputedMovements);
         } elseif ($this->relationLoaded('movements')) {
-            $movSum = (float) $this->movements->sum(fn($m) => $m->signedQty());
+            $movSum = (float) $this->movements->where('type', '!=', 'INITIAL')->sum(fn($m) => $m->signedQty());
         } else {
             $movSum = (float) $this->movements()
-                ->selectRaw("SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->where('type', '!=', 'INITIAL')
+                ->selectRaw("SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
                 ->value('net_qty') ?? 0.0;
         }
 
-        $initialSum = 0.0;
-        if (!$hasInitialMov) {
-            $initialSum = $this->relationLoaded('outletIngredients')
-                ? (float) $this->outletIngredients->sum('stok_awal')
-                : (float) $this->outletIngredients()->sum('stok_awal');
+        $initialSum = $this->relationLoaded('outletIngredients')
+            ? (float) $this->outletIngredients->sum('stok_awal')
+            : (float) $this->outletIngredients()->sum('stok_awal');
 
-            if ($initialSum <= 0) {
-                $initialSum = (float) $this->stok_awal;
-            }
+        if ($initialSum <= 0) {
+            $initialSum = (float) $this->stok_awal;
         }
         return round($initialSum + $movSum, 3);
     }
@@ -226,12 +217,14 @@ class Ingredient extends Model
         } elseif ($this->relationLoaded('movements')) {
             $movementsGrouped = [];
             foreach ($this->movements as $m) {
+                if ($m->type === 'INITIAL') continue;
                 $oid = $m->outlet_id;
                 $movementsGrouped[$oid] = ($movementsGrouped[$oid] ?? 0.0) + $m->signedQty();
             }
         } else {
             $movementsGrouped = $this->movements()
-                ->selectRaw("outlet_id, SUM(CASE WHEN type IN ('INITIAL','PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                ->where('type', '!=', 'INITIAL')
+                ->selectRaw("outlet_id, SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
                 ->groupBy('outlet_id')
                 ->pluck('net_qty', 'outlet_id')
                 ->all();
@@ -242,21 +235,13 @@ class Ingredient extends Model
             ? $this->outletIngredients->keyBy('outlet_id')
             : $this->outletIngredients()->get()->keyBy('outlet_id');
 
-        $initialMovOids = StockMovement::where('ingredient_id', $this->id)
-            ->where('type', 'INITIAL')
-            ->pluck('outlet_id')
-            ->all();
-
         foreach ($outlets as $outlet) {
             $outletRow = $outletIngs[$outlet->id] ?? null;
-            $hasInitMov = in_array($outlet->id, $initialMovOids);
             $initial = 0.0;
-            if (!$hasInitMov) {
-                if ($outletRow && (float)$outletRow->stok_awal > 0) {
-                    $initial = (float)$outletRow->stok_awal;
-                } elseif ($outlet->is_main || (int)$outlet->id === 1) {
-                    $initial = (float)$this->stok_awal;
-                }
+            if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                $initial = (float)$outletRow->stok_awal;
+            } elseif ($outlet->is_main || (int)$outlet->id === 1) {
+                $initial = (float)$this->stok_awal;
             }
 
             $netMov = isset($movementsGrouped[$outlet->id]) ? (float) $movementsGrouped[$outlet->id] : 0.0;
@@ -432,18 +417,11 @@ class Ingredient extends Model
         $ot = \App\Models\Outlet::find($outletId);
         $isHolding = $ot ? (bool)$ot->is_main : ((int)$outletId === 1);
 
-        $hasInitialMov = StockMovement::where('ingredient_id', $this->id)
-            ->where('outlet_id', $outletId)
-            ->where('type', 'INITIAL')
-            ->exists();
-
         $initialStock = 0.0;
-        if (!$hasInitialMov) {
-            if ($outletRow && (float)$outletRow->stok_awal > 0) {
-                $initialStock = (float)$outletRow->stok_awal;
-            } elseif ($isHolding) {
-                $initialStock = (float)$this->stok_awal;
-            }
+        if ($outletRow && (float)$outletRow->stok_awal > 0) {
+            $initialStock = (float)$outletRow->stok_awal;
+        } elseif ($isHolding) {
+            $initialStock = (float)$this->stok_awal;
         }
         $initialHarga = $outletRow && $outletRow->harga !== null ? (float)$outletRow->harga : (float)$this->harga;
         $initialCostPerPakai = $initialHarga / $konversi;
@@ -456,6 +434,7 @@ class Ingredient extends Model
         // Ambil seluruh pergerakan stok untuk bahan dan outlet ini secara kronologis
         $movements = StockMovement::where('ingredient_id', $this->id)
             ->where('outlet_id', $outletId)
+            ->where('type', '!=', 'INITIAL')
             ->orderBy('date', 'asc')
             ->orderBy('id', 'asc')
             ->get();
@@ -464,7 +443,7 @@ class Ingredient extends Model
 
         foreach ($movements as $m) {
             $qty = (float)$m->qty;
-            if (in_array($m->type, ['PURCHASE', 'TRANSFER_IN', 'PREP_OUTPUT', 'INITIAL'])) {
+            if (in_array($m->type, ['PURCHASE', 'TRANSFER_IN', 'PREP_OUTPUT'])) {
                 // Mutasi masuk yang mempengaruhi moving average
                 $incomingPricePerBeli = (float)($m->unit_price ?: ($m->total_price > 0 && $qty > 0 ? $m->total_price / ($qty / $konversi) : $runningCostPerPakai * $konversi));
                 $incomingPricePerPakai = $incomingPricePerBeli / $konversi;

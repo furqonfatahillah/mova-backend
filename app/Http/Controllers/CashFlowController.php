@@ -82,30 +82,82 @@ class CashFlowController extends Controller
             $isShiftFiltered = count($shiftFilterIds) > 0;
         }
 
+        // Chronological shifts for inter-shift handover discrepancies (selisih antar kasir / shift)
+        $chronologicalShifts = \App\Models\Shift::with('user')
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->whereDate('opened_at', '<=', $to)
+            ->orderBy('opened_at', 'asc')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        $interShiftDiffMap = [];
+        $prevClosed = null;
+        foreach ($chronologicalShifts as $cs) {
+            $diffAntar = 0.0;
+            $prevClosing = null;
+            $prevName = null;
+            if ($prevClosed && $prevClosed->closing_cash !== null) {
+                $prevClosing = (float)$prevClosed->closing_cash;
+                $prevName = $prevClosed->shift_name;
+                $diffAntar = round((float)$cs->initial_cash - $prevClosing, 2);
+            }
+            $interShiftDiffMap[$cs->id] = [
+                'inter_shift_diff'    => $diffAntar,
+                'prev_shift_name'     => $prevName,
+                'prev_closing_cash'   => $prevClosing,
+            ];
+            if ($cs->status === 'CLOSED' && $cs->closing_cash !== null) {
+                $prevClosed = $cs;
+            }
+        }
+
         // Available shifts in this period & outlet for frontend filter selection
         $availableShiftsQuery = \App\Models\Shift::with('user')
             ->where(function($q) use ($from, $to) {
-                $q->whereBetween('opened_at', ["{$from} 00:00:00", "{$to} 23:59:59"])
-                  ->orWhere(function($sub) use ($from, $to) {
-                      $sub->whereDate('opened_at', '>=', $from)
-                          ->whereDate('opened_at', '<=', $to);
-                  });
+                $q->where(function ($sub) use ($from, $to) {
+                    $sub->whereDate('opened_at', '>=', $from)
+                        ->whereDate('opened_at', '<=', $to);
+                })->orWhere(function ($sub) use ($from, $to) {
+                    $sub->whereDate('closed_at', '>=', $from)
+                        ->whereDate('closed_at', '<=', $to);
+                });
             })
             ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
             ->orderBy('opened_at', 'desc');
 
-        $availableShifts = $availableShiftsQuery->get()->map(function($s) {
+        $availableShifts = $availableShiftsQuery->get()->map(function($s) use ($interShiftDiffMap) {
+            $discrepancy = $s->cash_difference !== null 
+                ? (float)$s->cash_difference 
+                : ($s->closing_cash !== null && $s->system_cash !== null ? round((float)$s->closing_cash - (float)$s->system_cash, 2) : 0);
+            $interData = $interShiftDiffMap[$s->id] ?? [
+                'inter_shift_diff'  => 0.0,
+                'prev_shift_name'   => null,
+                'prev_closing_cash' => null,
+            ];
+
+            $sysSalesRaw = (float)$s->system_cash;
+            // Expected drawer cash: if closed with discrepancy recorded, expected cash = closing_cash - discrepancy; otherwise initial + sales
+            $expectedCash = ($s->status === 'CLOSED' && $s->closing_cash !== null && $s->cash_difference !== null)
+                ? round((float)$s->closing_cash - (float)$s->cash_difference, 2)
+                : ((float)$s->initial_cash + $sysSalesRaw);
+
             return [
-                'id'           => $s->id,
-                'shift_name'   => $s->shift_name,
-                'opened_at'    => $s->opened_at,
-                'closed_at'    => $s->closed_at,
-                'status'       => $s->status,
-                'cashier_name' => $s->user?->name ?: 'Kasir',
-                'initial_cash' => (float)$s->initial_cash,
-                'closing_cash' => (float)$s->closing_cash,
-                'system_cash'  => (float)$s->system_cash,
-                'date'         => $s->opened_at ? substr($s->opened_at, 0, 10) : null,
+                'id'                 => $s->id,
+                'shift_name'         => $s->shift_name,
+                'opened_at'          => $s->opened_at,
+                'closed_at'          => $s->closed_at,
+                'status'             => $s->status,
+                'cashier_name'       => $s->user?->name ?: 'Kasir',
+                'initial_cash'       => (float)$s->initial_cash,
+                'closing_cash'       => (float)$s->closing_cash,
+                'system_cash'        => (float)$expectedCash,
+                'system_sales'       => $sysSalesRaw,
+                'cash_difference'    => $discrepancy,
+                'inter_shift_diff'   => $interData['inter_shift_diff'],
+                'prev_shift_name'    => $interData['prev_shift_name'],
+                'prev_closing_cash'  => $interData['prev_closing_cash'],
+                'notes'              => $s->notes,
+                'date'               => $s->opened_at ? substr($s->opened_at, 0, 10) : null,
             ];
         })->values();
 
@@ -247,12 +299,14 @@ class CashFlowController extends Controller
         $totalDirectSalesReceipts = $cashSales + $qrisSales + $grabSales + $transferSales + $debitSales + $otherSales;
 
         // B. Penerimaan Kas dari Pembayaran Kasbon Pelanggan (Receivable Collections)
-        $recPayQuery = ReceivablePayment::whereBetween('payment_date', [$from, $to])
-            ->select(['amount', 'payment_method', 'id', 'payment_no', 'receivable_id', 'notes', 'outlet_id', 'receiver_id']);
+        $recPayQuery = ReceivablePayment::with(['receivable', 'outlet', 'receiver'])
+            ->whereBetween('payment_date', [$from, $to])
+            ->select(['id', 'payment_no', 'receivable_id', 'business_id', 'outlet_id', 'shift_id', 'payment_date', 'amount', 'payment_method', 'reference_no', 'notes', 'received_by']);
         if ($outletId) {
             $recPayQuery->where('outlet_id', $outletId);
         }
         $applyPmFilter($recPayQuery, 'payment_method');
+        $applyShiftFilter($recPayQuery, 'shift_id');
         $receivablePayments = $recPayQuery->get();
 
         $receivableCashIn = 0.0;
@@ -584,35 +638,48 @@ class CashFlowController extends Controller
             ? $availableShifts->whereIn('id', $shiftFilterIds)->values()
             : $availableShifts->values();
         $selectedShiftsInitialCashTotal = (float)$selectedShifts->sum('initial_cash');
-        $selectedShiftsClosingCashTotal = (float)$selectedShifts->sum('closing_cash');
+        $closedShifts = $selectedShifts->where('status', 'CLOSED');
+        $selectedShiftsClosingCashTotal = (float)$closedShifts->sum('closing_cash');
+        $selectedShiftsSystemCashTotal = (float)$closedShifts->sum('system_cash');
+        $selectedShiftsCashDifferenceTotal = (float)$closedShifts->sum('cash_difference');
+        $selectedShiftsInterShiftDiffTotal = (float)$selectedShifts->sum('inter_shift_diff');
+        $closedShiftsCount = $closedShifts->count();
 
         return response()->json([
             'period' => [
-                'from'                   => $from,
-                'to'                     => $to,
-                'outlet_id'              => $outletId,
-                'selected_payment_method'=> $pmFilter,
-                'selected_shift_ids'     => $shiftFilterIds,
-                'is_shift_filtered'      => $isShiftFiltered,
-                'is_pm_filtered'         => $isPmFiltered,
-                'initial_cash_total'     => $selectedShiftsInitialCashTotal,
-                'closing_cash_total'     => $selectedShiftsClosingCashTotal,
-                'selected_shifts_count'  => $selectedShifts->count(),
+                'from'                          => $from,
+                'to'                            => $to,
+                'outlet_id'                     => $outletId,
+                'selected_payment_method'       => $pmFilter,
+                'selected_shift_ids'            => $shiftFilterIds,
+                'is_shift_filtered'             => $isShiftFiltered,
+                'is_pm_filtered'                => $isPmFiltered,
+                'initial_cash_total'            => $selectedShiftsInitialCashTotal,
+                'closing_cash_total'            => $selectedShiftsClosingCashTotal,
+                'system_cash_total'             => $selectedShiftsSystemCashTotal,
+                'cash_difference_total'         => $selectedShiftsCashDifferenceTotal,
+                'inter_shift_difference_total'  => $selectedShiftsInterShiftDiffTotal,
+                'closed_shifts_count'           => $closedShiftsCount,
+                'selected_shifts_count'         => $selectedShifts->count(),
             ],
             'available_shifts' => $availableShifts,
             'summary' => [
-                'initial_cash_total'      => $selectedShiftsInitialCashTotal,
-                'closing_cash_total'      => $selectedShiftsClosingCashTotal,
-                'selected_shifts_count'   => $selectedShifts->count(),
-                'net_operating_cash_flow' => $netOperatingCashFlow,
-                'net_investing_cash_flow' => $netInvestingCashFlow,
-                'net_financing_cash_flow' => $netFinancingCashFlow,
-                'net_cash_flow'           => $netCashFlow,
-                'accrual_net_profit'      => $accrualNetProfit,
-                'inventory_cash_trapped'  => $inventoryCapitalChange,
-                'liquidity_status'        => $netCashFlow >= 0 ? 'SURPLUS' : 'DEFICIT',
-                'liquidity_label'         => $netCashFlow >= 0 ? 'Kas Surplus (Likuid Prima)' : 'Kas Defisit (Ketat / Waspada)',
-                'liquidity_color'         => $netCashFlow >= 0 ? '#10B981' : '#EF4444',
+                'initial_cash_total'             => $selectedShiftsInitialCashTotal,
+                'closing_cash_total'             => $selectedShiftsClosingCashTotal,
+                'system_cash_total'              => $selectedShiftsSystemCashTotal,
+                'cash_difference_total'          => $selectedShiftsCashDifferenceTotal,
+                'inter_shift_difference_total'   => $selectedShiftsInterShiftDiffTotal,
+                'closed_shifts_count'            => $closedShiftsCount,
+                'selected_shifts_count'          => $selectedShifts->count(),
+                'net_operating_cash_flow'        => $netOperatingCashFlow,
+                'net_investing_cash_flow'        => $netInvestingCashFlow,
+                'net_financing_cash_flow'        => $netFinancingCashFlow,
+                'net_cash_flow'                  => $netCashFlow,
+                'accrual_net_profit'             => $accrualNetProfit,
+                'inventory_cash_trapped'         => $inventoryCapitalChange,
+                'liquidity_status'               => $netCashFlow >= 0 ? 'SURPLUS' : 'DEFICIT',
+                'liquidity_label'                => $netCashFlow >= 0 ? 'Kas Surplus (Likuid Prima)' : 'Kas Defisit (Ketat / Waspada)',
+                'liquidity_color'                => $netCashFlow >= 0 ? '#10B981' : '#EF4444',
             ],
             'operating' => [
                 'inflows' => [
@@ -631,6 +698,15 @@ class CashFlowController extends Controller
                         'debit'    => round($recPayDebit, 2),
                         'other'    => round($recPayOther, 2),
                         'count'    => $receivablePayments->count(),
+                    ],
+                    'combined_breakdown'     => [
+                        'cash'     => round($cashSales + $recPayCash, 2),
+                        'qris'     => round($qrisSales + $recPayQris, 2),
+                        'grab'     => round($grabSales, 2),
+                        'transfer' => round($transferSales + $recPayTransfer, 2),
+                        'debit'    => round($debitSales + $recPayDebit, 2),
+                        'other'    => round($otherSales + $recPayOther, 2),
+                        'total'    => round($totalOperatingInflows, 2),
                     ],
                     'receivable_payments'    => $receivablePayments->map(fn($rp) => [
                         'id'             => $rp->id,

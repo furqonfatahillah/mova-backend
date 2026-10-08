@@ -15,8 +15,15 @@ class ModifierController extends Controller
      */
     public function index(Request $request)
     {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         $query = ModifierGroup::with(['options.ingredient', 'menus'])
             ->orderBy('name');
+
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
 
         if ($request->filled('menu_id')) {
             $query->whereHas('menus', function ($q) use ($request) {
@@ -57,8 +64,12 @@ class ModifierController extends Controller
             'options.*.sort_order'    => 'nullable|integer',
         ]);
 
-        return DB::transaction(function () use ($data, $request) {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
+        return DB::transaction(function () use ($data, $request, $businessId) {
             $group = ModifierGroup::create([
+                'business_id'    => $businessId,
                 'name'           => $data['name'],
                 'selection_type' => $data['selection_type'],
                 'is_required'    => $data['is_required'] ?? false,

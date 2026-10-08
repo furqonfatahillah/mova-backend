@@ -21,7 +21,12 @@ class UrgentNoteController extends Controller
         $user = $request->user();
         $businessId = $user->business_id ?: 1;
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->query('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $query = UrgentNote::with([
             'outlet',
@@ -84,7 +89,12 @@ class UrgentNoteController extends Controller
         $user = $request->user();
         $businessId = $user->business_id ?: 1;
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->query('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $baseQuery = UrgentNote::where('business_id', $businessId);
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
@@ -190,7 +200,12 @@ class UrgentNoteController extends Controller
         $user = $request->user();
         $businessId = $user->business_id ?: 1;
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->input('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
         $orderNumber = $request->input('order_number');
         $noteIds = $request->input('note_ids');
         $notes = $request->input('notes', 'Permohonan pelunasan stok diajukan');
@@ -363,7 +378,12 @@ class UrgentNoteController extends Controller
 
         $businessId = $user->business_id ?: 1;
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->input('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
         $ingredientId = $request->input('ingredient_id');
         $orderNumber = $request->input('order_number');
         $noteIds = $request->input('note_ids');
@@ -452,7 +472,12 @@ class UrgentNoteController extends Controller
 
         $businessId = $user->business_id ?: 1;
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->input('outlet_id') ?? $request->header('X-Outlet-Id') ?? $user->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
         $orderNumber = $request->input('order_number');
         $noteIds = $request->input('note_ids');
         $reason = $request->input('reason', 'Ditolak secara massal oleh Manager/Owner');

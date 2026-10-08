@@ -259,6 +259,11 @@ class User extends Authenticatable
         return in_array($name, [Role::PEGAWAI, Role::KASIR, Role::MANAGER]);
     }
 
+    public function isOwner(): bool
+    {
+        return $this->isOwnerBisnis() || $this->isOwnerWebsite() || $this->isPlatformAdmin() || $this->isOwnerOutlet();
+    }
+
     public function isOwnerOrManager(): bool
     {
         return Role::isOwnerOrManagerRole($this->role_id ?? $this->role);

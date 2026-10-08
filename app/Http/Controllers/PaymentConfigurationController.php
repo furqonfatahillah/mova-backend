@@ -57,13 +57,14 @@ class PaymentConfigurationController extends Controller
         $validated = $request->validate([
             'business_id'         => 'nullable|exists:businesses,id',
             'account_type'        => 'nullable|string|in:BANK,EWALLET',
-            'bank_name'           => 'required|string|max:100',
+            'bank_name'           => 'nullable|string|max:100',
             'bank_code'           => 'nullable|string|max:20',
-            'account_number'      => 'required|string|max:50',
-            'account_holder'      => 'required|string|max:255',
+            'account_number'      => 'nullable|string|max:50',
+            'account_holder'      => 'nullable|string|max:255',
             'branch'              => 'nullable|string|max:255',
             'outlet_id'           => 'nullable|exists:outlets,id',
             'qr_image_url'        => 'nullable|string',
+            'qr_image'            => 'nullable|image|mimes:jpeg,png,jpg,webp,gif|max:5120',
             'is_primary'          => 'nullable|boolean',
             'is_active'           => 'nullable|boolean',
             'verification_status' => 'nullable|string|in:VERIFIED,PENDING,REJECTED',
@@ -71,9 +72,32 @@ class PaymentConfigurationController extends Controller
             'notes'               => 'nullable|string|max:500',
         ]);
 
+        $validated['bank_name']      = !empty($validated['bank_name']) ? $validated['bank_name'] : 'QRIS Toko';
+        $validated['account_number'] = !empty($validated['account_number']) ? $validated['account_number'] : 'QRIS';
+        $validated['account_holder'] = !empty($validated['account_holder']) ? $validated['account_holder'] : 'QRIS Toko';
+
         $targetBusinessId = ($isPlatformAdmin && !empty($validated['business_id']))
             ? $validated['business_id']
             : $user->business_id;
+
+        if ($request->hasFile('qr_image')) {
+            $file = $request->file('qr_image');
+            $filename = 'qris_' . $targetBusinessId . '_' . time() . '.' . $file->getClientOriginalExtension();
+            $path = $file->storeAs('qris', $filename, 'public');
+            $validated['qr_image_url'] = '/storage/' . $path;
+        } elseif (!empty($validated['qr_image_url']) && str_starts_with($validated['qr_image_url'], 'data:image/')) {
+            if (preg_match('/^data:image\/(\w+);base64,/', $validated['qr_image_url'], $matches)) {
+                $ext = strtolower($matches[1]);
+                if ($ext === 'jpeg') $ext = 'jpg';
+                $data = substr($validated['qr_image_url'], strpos($validated['qr_image_url'], ',') + 1);
+                $decoded = base64_decode($data);
+                if ($decoded !== false) {
+                    $filename = 'qris_' . $targetBusinessId . '_' . time() . '_' . uniqid() . '.' . $ext;
+                    \Illuminate\Support\Facades\Storage::disk('public')->put('qris/' . $filename, $decoded);
+                    $validated['qr_image_url'] = '/storage/qris/' . $filename;
+                }
+            }
+        }
 
         $validated['business_id']         = $targetBusinessId;
         $validated['account_type']        = $validated['account_type'] ?? 'BANK';
@@ -97,7 +121,7 @@ class PaymentConfigurationController extends Controller
 
         return response()->json([
             'status'  => 'success',
-            'message' => ($account->account_type === 'EWALLET' ? 'E-Wallet' : 'Nomor rekening') . ' berhasil didaftarkan',
+            'message' => ($account->account_type === 'EWALLET' ? 'E-Wallet' : 'QRIS Toko') . ' berhasil didaftarkan',
             'data'    => $account,
         ], 201);
     }
@@ -115,19 +139,39 @@ class PaymentConfigurationController extends Controller
 
         $validated = $request->validate([
             'account_type'        => 'sometimes|string|in:BANK,EWALLET',
-            'bank_name'           => 'sometimes|required|string|max:100',
+            'bank_name'           => 'nullable|string|max:100',
             'bank_code'           => 'nullable|string|max:20',
-            'account_number'      => 'sometimes|required|string|max:50',
-            'account_holder'      => 'sometimes|required|string|max:255',
+            'account_number'      => 'nullable|string|max:50',
+            'account_holder'      => 'nullable|string|max:255',
             'branch'              => 'nullable|string|max:255',
             'outlet_id'           => 'nullable|exists:outlets,id',
             'qr_image_url'        => 'nullable|string',
+            'qr_image'            => 'nullable|image|mimes:jpeg,png,jpg,webp,gif|max:5120',
             'is_primary'          => 'nullable|boolean',
             'is_active'           => 'nullable|boolean',
             'verification_status' => 'nullable|string|in:VERIFIED,PENDING,REJECTED',
             'payout_schedule'     => 'nullable|string|in:INSTANT,DAILY,MANUAL',
             'notes'               => 'nullable|string|max:500',
         ]);
+
+        if ($request->hasFile('qr_image')) {
+            $file = $request->file('qr_image');
+            $filename = 'qris_' . $account->business_id . '_' . time() . '.' . $file->getClientOriginalExtension();
+            $path = $file->storeAs('qris', $filename, 'public');
+            $validated['qr_image_url'] = '/storage/' . $path;
+        } elseif (!empty($validated['qr_image_url']) && str_starts_with($validated['qr_image_url'], 'data:image/')) {
+            if (preg_match('/^data:image\/(\w+);base64,/', $validated['qr_image_url'], $matches)) {
+                $ext = strtolower($matches[1]);
+                if ($ext === 'jpeg') $ext = 'jpg';
+                $data = substr($validated['qr_image_url'], strpos($validated['qr_image_url'], ',') + 1);
+                $decoded = base64_decode($data);
+                if ($decoded !== false) {
+                    $filename = 'qris_' . $account->business_id . '_' . time() . '_' . uniqid() . '.' . $ext;
+                    \Illuminate\Support\Facades\Storage::disk('public')->put('qris/' . $filename, $decoded);
+                    $validated['qr_image_url'] = '/storage/qris/' . $filename;
+                }
+            }
+        }
 
         $validated['updated_by'] = $user->id;
 

@@ -48,15 +48,25 @@ class CoinService
     }
 
     /**
-     * Deduct coins when an order nota is completed (PAID) using atomic row lock.
+     * Deduct coins when an order nota is completed (PAID) or pre-bill printed using atomic row lock.
      */
-    public static function deductForOrder(int $businessId, string $orderNumber, ?int $outletId = null, ?int $userId = null): ?CoinTransaction
+    public static function deductForOrder(int $businessId, string $orderNumber, ?int $outletId = null, ?int $userId = null, ?string $customNotes = null): ?CoinTransaction
     {
         if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coin_balance')) {
             return null;
         }
 
-        return DB::transaction(function () use ($businessId, $orderNumber, $outletId, $userId) {
+        // Avoid duplicate deduction if already deducted for this exact order_number
+        $alreadyDeducted = CoinTransaction::where('business_id', $businessId)
+            ->where('order_number', $orderNumber)
+            ->where('type', 'USAGE')
+            ->exists();
+
+        if ($alreadyDeducted) {
+            return null;
+        }
+
+        return DB::transaction(function () use ($businessId, $orderNumber, $outletId, $userId, $customNotes) {
             $business = Business::where('id', $businessId)->lockForUpdate()->firstOrFail();
 
             $cost = (float)($business->coins_per_transaction ?: 1.00);
@@ -80,7 +90,7 @@ class CoinService
                 'payment_reference' => null,
                 'order_number'      => $orderNumber,
                 'outlet_id'         => $outletId,
-                'notes'             => "Pemotongan {$cost} koin untuk Nota #{$orderNumber}",
+                'notes'             => $customNotes ?: "Pemotongan {$cost} koin untuk Nota #{$orderNumber}",
                 'created_by'        => $userId,
             ]);
         });

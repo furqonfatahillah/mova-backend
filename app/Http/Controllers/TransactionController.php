@@ -15,6 +15,7 @@ use App\Models\PointRedemption;
 use App\Services\CoinService;
 use App\Models\User;
 use App\Models\WasteLog;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -42,22 +43,13 @@ class TransactionController extends Controller
         int $userId,
         ?string $unit = null
     ): array {
-        $currentStock = $ing->stockForOutlet($outletId);
         $unit = $unit ?: $ing->unit_pakai ?: 'satuan';
-        $isDeficit = $currentStock < $requiredQty;
-
-        $deductedQty = $isDeficit ? max(0.0, min($currentStock, $requiredQty)) : $requiredQty;
-        $pendingQty = $isDeficit ? round($requiredQty - $deductedQty, 3) : 0.0;
-
-        // 1. If PAID and available portion > 0, immediately deduct physical stock via StockMovement
+        $deductedQty = $requiredQty;
         $costPerPakai = $ing->costPerPakaiForOutlet($outletId);
         $totalCost = round($deductedQty * $costPerPakai, 2);
 
+        // Langsung potong stok fisik via StockMovement (stok minus langsung memotong sistem tanpa proses pelunasan)
         if ($isPaid && $deductedQty > 0) {
-            $noteText = $isDeficit
-                ? "{$orderNumber} – {$itemName} [Nota Urgent: Terpotong {$deductedQty} {$unit}, Tergantung {$pendingQty} {$unit}]"
-                : "{$orderNumber} – {$itemName}";
-
             StockMovement::create([
                 'business_id'    => $businessId,
                 'outlet_id'      => $outletId,
@@ -69,7 +61,7 @@ class TransactionController extends Controller
                 'total_price'    => $totalCost,
                 'cost_before'    => $costPerPakai,
                 'cost_after'     => $costPerPakai,
-                'note'           => $noteText,
+                'note'           => "{$orderNumber} – {$itemName}",
                 'transaction_id' => $trx->id,
                 'shift_id'       => $trx->shift_id,
                 'user_id'        => $userId,
@@ -77,35 +69,10 @@ class TransactionController extends Controller
             ]);
         }
 
-        // 2. If deficit, create UrgentNote record (Bahan Tergantung)
-        if ($isDeficit && $pendingQty > 0) {
-            UrgentNote::create([
-                'business_id'    => $businessId,
-                'outlet_id'      => $outletId,
-                'transaction_id' => $trx->id,
-                'order_number'   => $orderNumber,
-                'menu_id'        => $menuId,
-                'ingredient_id'  => $ing->id,
-                'item_type'      => $itemType,
-                'item_name'      => "{$ing->name} ({$itemName})",
-                'required_qty'   => $requiredQty,
-                'deducted_qty'   => $deductedQty,
-                'pending_qty'    => $pendingQty,
-                'unit'           => $unit,
-                'status'         => 'PENDING',
-                'notes'          => "Kebutuhan {$requiredQty} {$unit}, terpotong {$deductedQty} {$unit}, sisa kekurangan {$pendingQty} {$unit} tergantung.",
-                'created_by'     => $userId,
-            ]);
-
-            $trx->is_urgent_note = true;
-            $trx->urgent_status = 'PENDING';
-            $trx->save();
-        }
-
         return [
-            'is_deficit'   => $isDeficit,
+            'is_deficit'   => false,
             'deducted_qty' => $deductedQty,
-            'pending_qty'  => $pendingQty,
+            'pending_qty'  => 0.0,
         ];
     }
 
@@ -132,42 +99,12 @@ class TransactionController extends Controller
             } catch (\Throwable $e) {}
         }
 
-        $currentStock = $om ? (float)$om->stock : (float)$menu->stock;
-        $requiredQty = (float)$qty;
-        $isDeficit = $currentStock < $requiredQty;
-
-        $deductedQty = $isDeficit ? max(0.0, min($currentStock, $requiredQty)) : $requiredQty;
-        $pendingQty = $isDeficit ? round($requiredQty - $deductedQty, 3) : 0.0;
-
+        $deductedQty = (float)$qty;
         if ($deductedQty > 0) {
             $menu->decrement('stock', $deductedQty);
             if ($om) {
                 $om->decrement('stock', $deductedQty);
             }
-        }
-
-        if ($isDeficit && $pendingQty > 0) {
-            UrgentNote::create([
-                'business_id'    => $businessId,
-                'outlet_id'      => $outletId,
-                'transaction_id' => $trx->id,
-                'order_number'   => $orderNumber,
-                'menu_id'        => $menu->id,
-                'ingredient_id'  => null,
-                'item_type'      => 'DIRECT',
-                'item_name'      => "Produk {$menu->name} (x{$qty})",
-                'required_qty'   => $requiredQty,
-                'deducted_qty'   => $deductedQty,
-                'pending_qty'    => $pendingQty,
-                'unit'           => $menu->unit ?: 'pcs',
-                'status'         => 'PENDING',
-                'notes'          => "Stok produk hanya {$currentStock}, terpotong {$deductedQty}, kekurangan {$pendingQty} tergantung.",
-                'created_by'     => $userId,
-            ]);
-
-            $trx->is_urgent_note = true;
-            $trx->urgent_status = 'PENDING';
-            $trx->save();
         }
     }
 
@@ -446,8 +383,8 @@ class TransactionController extends Controller
                 'customer_id'                  => 'nullable|exists:customers,id',
                 'order_type'                   => 'nullable|string|in:DINE_IN,TAKEAWAY,DELIVERY',
                 'table_number'                 => 'nullable|string|max:50',
-                'payment_method'               => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
-                'dp_payment_method'            => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,OTHER',
+                'payment_method'               => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,KASBON,PIUTANG,OTHER,APLIKASI',
+                'dp_payment_method'            => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,OTHER',
                 'dp_reference_no'              => 'nullable|string|max:100',
                 'amount_paid'                  => 'nullable|numeric|min:0',
                 'change_amount'                => 'nullable|numeric|min:0',
@@ -490,9 +427,16 @@ class TransactionController extends Controller
                 }
             }
 
-            // Resolve Active Shift
+            // Resolve Active Shift & Effective Operational Date
+            $user = $request->user();
+            $isOwner = $user && ($user->isOwnerBisnis() || $user->isOwnerWebsite() || $user->isPlatformAdmin() || $user->isOwnerOutlet());
+
             $shiftId = $data['shift_id'] ?? null;
-            if (!$shiftId) {
+            $activeShift = null;
+            if ($shiftId) {
+                $activeShift = \App\Models\Shift::find($shiftId);
+            }
+            if (!$activeShift) {
                 $activeShift = \App\Models\Shift::where('status', 'OPEN')
                     ->where('outlet_id', $outletId)
                     ->orderByDesc('opened_at')
@@ -505,15 +449,21 @@ class TransactionController extends Controller
                 $shiftId = $activeShift?->id;
             }
 
-            if (!$shiftId) {
+            // Dilarang melakukan transaksi kalau belum buka shift (berlaku untuk semua pengguna termasuk Owner)
+            if (!$shiftId || !$activeShift) {
                 return response()->json([
                     'message' => 'Shift kasir belum dibuka untuk cabang ini. Silakan buka shift kasir terlebih dahulu sebelum memulai transaksi.',
                     'shift_error' => true,
                 ], 422);
             }
 
-            // Generate Unique Order Number: e.g. TRX-20260906-0001
-            $orderNumber = $this->generateOrderNumber($data['date']);
+            // Enforce Shift Operational Date: The recognition date follows the shift opening date (e.g. shift opened on date 2, transaction on date 3 -> recognized on date 2)
+            $shiftDate = ($activeShift && !empty($activeShift->opened_at))
+                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
+                : ($data['date'] ?? now()->toDateString());
+
+            // Generate Unique Order Number based on shift operational date: e.g. TRX-20260906-0001
+            $orderNumber = $this->generateOrderNumber($shiftDate);
 
             // Pre-validate recipes & resolve modifiers for all items
             $preparedItems = [];
@@ -521,7 +471,7 @@ class TransactionController extends Controller
 
             foreach ($data['items'] as $it) {
                 $menu = Menu::findOrFail($it['menu_id']);
-                $recipe = $menu->activeRecipe($data['date']);
+                $recipe = $menu->activeRecipe($shiftDate);
 
                 $options = $this->resolveModifierOptions($it);
                 $modifierUnitPrice = (float)$options->sum('price');
@@ -592,8 +542,8 @@ class TransactionController extends Controller
                 $data,
                 $orderGrossSubtotal,
                 $outletId,
-                $data['date'],
-                (int)($request->user()->business_id ?? 1),
+                $shiftDate,
+                (int)($request->user()->business_id ?: (Outlet::find($outletId)?->business_id ?: 1)),
                 $customerId
             );
             $totalDiscountAmount = $discInfo['discount_amount'];
@@ -620,7 +570,7 @@ class TransactionController extends Controller
             unset($prep);
 
             $createdTransactions = DB::transaction(function () use (
-                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $outletId, $businessId, $request, $discInfo, $isUrgentOrder, $customerId, $orderNetTotal
+                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $shiftDate, $outletId, $businessId, $request, $discInfo, $isUrgentOrder, $customerId, $orderNetTotal
             ) {
                 $results = [];
 
@@ -630,9 +580,10 @@ class TransactionController extends Controller
                     $qty    = $prep['qty'];
 
                     $trx = Transaction::create([
+                        'business_id'     => $businessId,
                         'order_number'    => $orderNumber,
                         'status'          => $orderStatus,
-                        'date'            => $data['date'],
+                        'date'            => $shiftDate,
                         'menu_id'         => $menu->id,
                         'qty'             => $qty,
                         'recipe_version'  => $recipe?->version ?? null,
@@ -682,22 +633,22 @@ class TransactionController extends Controller
                                 $outletId,
                                 $trx,
                                 $orderNumber,
-                                $data['date'],
+                                $shiftDate,
                                 $opt->ingredient,
                                 $requiredModQty,
                                 "Modifier {$opt->name} ({$menu->name} x{$qty})",
                                 'MODIFIER',
                                 $menu->id,
                                 !empty($shiftId),
-                                $orderStatus === 'PAID',
+                                in_array($orderStatus, ['PAID', 'HOLD']),
                                 $request->user()->id,
                                 $opt->unit
                             );
                         }
                     }
 
-                    // Deduct stock for DIRECT retail items
-                    if ($orderStatus === 'PAID') {
+                    // Deduct stock for DIRECT retail items (both PAID and Open Bill HOLD)
+                    if (in_array($orderStatus, ['PAID', 'HOLD'])) {
                         $this->processDirectProductStockDeduction(
                             $businessId,
                             $outletId,
@@ -709,7 +660,7 @@ class TransactionController extends Controller
                         );
                     }
 
-                    // Deduct recipe ingredients with Urgent Note support
+                    // Deduct recipe ingredients with Urgent Note support (both PAID and Open Bill HOLD)
                     if ($recipe) {
                         foreach ($recipe->items as $item) {
                             if ($item->ingredient) {
@@ -719,14 +670,14 @@ class TransactionController extends Controller
                                     $outletId,
                                     $trx,
                                     $orderNumber,
-                                    $data['date'],
+                                    $shiftDate,
                                     $item->ingredient,
                                     $requiredIngQty,
                                     "{$menu->name} (x{$qty})",
                                     'RECIPE',
                                     $menu->id,
                                     !empty($shiftId),
-                                    $orderStatus === 'PAID',
+                                    in_array($orderStatus, ['PAID', 'HOLD']),
                                     $request->user()->id,
                                     $item->unit
                                 );
@@ -742,7 +693,7 @@ class TransactionController extends Controller
                             // 1. Bundled Menu (Recipe or Direct)
                             if ($bi->bundledMenu) {
                                 $bm = $bi->bundledMenu;
-                                if ($bm->item_type === 'DIRECT' && $orderStatus === 'PAID') {
+                                if ($bm->item_type === 'DIRECT' && in_array($orderStatus, ['PAID', 'HOLD'])) {
                                     $this->processDirectProductStockDeduction(
                                         $businessId,
                                         $outletId,
@@ -754,7 +705,7 @@ class TransactionController extends Controller
                                     );
                                 }
 
-                                $bmRecipe = $bm->activeRecipe($data['date']);
+                                $bmRecipe = $bm->activeRecipe($shiftDate);
                                 if ($bmRecipe) {
                                     foreach ($bmRecipe->items as $item) {
                                         if ($item->ingredient) {
@@ -763,14 +714,14 @@ class TransactionController extends Controller
                                                 $outletId,
                                                 $trx,
                                                 $orderNumber,
-                                                $data['date'],
+                                                $shiftDate,
                                                 $item->ingredient,
                                                 (float)($item->qty * $bundledQty),
                                                 "Bundling {$menu->name} (x{$qty}) → {$bm->name}",
                                                 'BUNDLE',
                                                 $bm->id,
                                                 !empty($shiftId),
-                                                $orderStatus === 'PAID',
+                                                in_array($orderStatus, ['PAID', 'HOLD']),
                                                 $request->user()->id,
                                                 $item->unit
                                             );
@@ -786,14 +737,14 @@ class TransactionController extends Controller
                                     $outletId,
                                     $trx,
                                     $orderNumber,
-                                    $data['date'],
+                                    $shiftDate,
                                     $bi->ingredient,
                                     (float)($bi->qty * $qty),
                                     "Bundling {$menu->name} (x{$qty}) → {$bi->ingredient->name}",
                                     'BUNDLE',
                                     $menu->id,
                                     !empty($shiftId),
-                                    $orderStatus === 'PAID',
+                                    in_array($orderStatus, ['PAID', 'HOLD']),
                                     $request->user()->id,
                                     $bi->unit
                                 );
@@ -854,7 +805,7 @@ class TransactionController extends Controller
                     $recStatus = ($kasbonTotal <= 0) ? 'PAID' : (($amountPaidNow > 0) ? 'PARTIAL' : 'UNPAID');
 
                     $rec = \App\Models\Receivable::create([
-                        'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
+                        'receivable_no'    => \App\Models\Receivable::generateReceivableNo($businessId, $shiftDate),
                         'business_id'      => $businessId,
                         'outlet_id'        => $outletId,
                         'shift_id'         => $shiftId,
@@ -864,7 +815,7 @@ class TransactionController extends Controller
                         'customer_name'    => $custName,
                         'customer_phone'   => $custPhone,
                         'customer_address' => $custAddr,
-                        'issue_date'       => $data['date'],
+                        'issue_date'       => $shiftDate,
                         'due_date'         => $dueDate,
                         'total_amount'     => $orderNetTotal,
                         'paid_amount'      => $amountPaidNow,
@@ -877,19 +828,20 @@ class TransactionController extends Controller
                     if ($amountPaidNow > 0) {
                         $dpMethod = strtoupper(trim($data['dp_payment_method'] ?? 'CASH'));
                         $dpRefNo = $data['dp_reference_no'] ?? null;
-                        \App\Models\ReceivablePayment::create([
-                            'payment_no'     => \App\Models\ReceivablePayment::generatePaymentNo($businessId, $data['date']),
+                        $dpPay = \App\Models\ReceivablePayment::create([
+                            'payment_no'     => \App\Models\ReceivablePayment::generatePaymentNo($businessId, $shiftDate),
                             'receivable_id'  => $rec->id,
                             'business_id'    => $businessId,
                             'outlet_id'      => $outletId,
                             'shift_id'       => $shiftId,
-                            'payment_date'   => $data['date'],
+                            'payment_date'   => $shiftDate,
                             'amount'         => $amountPaidNow,
                             'payment_method' => $dpMethod,
                             'reference_no'   => $dpRefNo,
                             'notes'          => 'Uang Muka / DP Kasir Saat Checkout (' . $dpMethod . ($dpRefNo ? " - {$dpRefNo}" : '') . ')',
                             'received_by'    => $request->user()->id,
                         ]);
+                        \App\Services\AccountingService::postReceivablePayment($dpPay);
                     }
                 }
 
@@ -909,7 +861,7 @@ class TransactionController extends Controller
                     $netReceivable = round($orderNetTotal - $mdrFee, 2);
 
                     \App\Models\Receivable::create([
-                        'receivable_no'     => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
+                        'receivable_no'     => \App\Models\Receivable::generateReceivableNo($businessId, $shiftDate),
                         'business_id'       => $businessId,
                         'outlet_id'         => $outletId,
                         'transaction_id'    => $results[0]->id ?? null,
@@ -920,8 +872,8 @@ class TransactionController extends Controller
                         'customer_name'     => "AR Merchant - {$channelName}",
                         'customer_phone'    => null,
                         'customer_address'  => null,
-                        'issue_date'        => $data['date'],
-                        'due_date'          => $data['date'],
+                        'issue_date'        => $shiftDate,
+                        'due_date'          => $shiftDate,
                         'total_amount'      => $orderNetTotal,
                         'paid_amount'       => 0,
                         'remaining_amount'  => $netReceivable,
@@ -943,10 +895,15 @@ class TransactionController extends Controller
                 return $results;
             });
 
+            // Auto-post double-entry journal ledger
+            foreach ($createdTransactions as $cTrx) {
+                AccountingService::postTransaction($cTrx);
+            }
+
             return response()->json([
                 'order_number'    => $orderNumber,
                 'status'          => $orderStatus,
-                'date'            => $data['date'],
+                'date'            => $shiftDate,
                 'customer_name'   => $data['customer_name'] ?? null,
                 'customer_id'     => $customerId,
                 'customer'        => $customerId ? Customer::find($customerId) : null,
@@ -1013,8 +970,8 @@ class TransactionController extends Controller
             'customer_id'                 => 'nullable|exists:customers,id',
             'order_type'                  => 'nullable|string|in:DINE_IN,TAKEAWAY,DELIVERY',
             'table_number'                => 'nullable|string|max:50',
-            'payment_method'              => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
-            'dp_payment_method'           => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,OTHER',
+            'payment_method'              => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,KASBON,PIUTANG,OTHER,APLIKASI',
+            'dp_payment_method'           => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,OTHER',
             'dp_reference_no'             => 'nullable|string|max:100',
             'amount_paid'                 => 'nullable|numeric|min:0',
             'change_amount'               => 'nullable|numeric|min:0',
@@ -1055,9 +1012,16 @@ class TransactionController extends Controller
             }
         }
 
-        // Find active shift if not explicitly provided
+        // Resolve Active Shift & Effective Operational Date
+        $user = $request->user();
+        $isOwner = $user && ($user->isOwnerBisnis() || $user->isOwnerWebsite() || $user->isPlatformAdmin() || $user->isOwnerOutlet());
+
         $shiftId = $data['shift_id'] ?? null;
-        if (!$shiftId) {
+        $activeShift = null;
+        if ($shiftId) {
+            $activeShift = \App\Models\Shift::find($shiftId);
+        }
+        if (!$activeShift) {
             $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->first();
             if (!$activeShift) {
                 $activeShift = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->first();
@@ -1065,27 +1029,35 @@ class TransactionController extends Controller
             $shiftId = $activeShift?->id;
         }
 
-        if (!$shiftId) {
+        // Dilarang melakukan transaksi kalau belum buka shift, KECUALI Owner
+        if (!$isOwner && (!$shiftId || !$activeShift)) {
             return response()->json([
                 'message' => 'Shift kasir belum dibuka untuk cabang ini. Silakan buka shift kasir terlebih dahulu sebelum memulai transaksi.',
                 'shift_error' => true,
             ], 422);
         }
 
+        // Enforce Shift Operational Date: The recognition date follows the shift opening date
+        $shiftDate = ($activeShift && !empty($activeShift->opened_at))
+            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
+            : ($data['date'] ?? now()->toDateString());
+
         // Generate Unique Order Number: e.g. TRX-20260906-0001
-        $orderNumber = $this->generateOrderNumber($data['date']);
+        $orderNumber = $this->generateOrderNumber($shiftDate);
+        $recipe = $menu->activeRecipe($shiftDate);
 
         $options = $this->resolveModifierOptions($data);
         $modifierUnitPrice = (float)$options->sum('price');
         $itemUnitPrice = (float)$menu->price + $modifierUnitPrice;
         $totalItemPrice = $itemUnitPrice * (int)$data['qty'];
 
-        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $outletId, $businessId, $orderNumber, $orderStatus, $isUrgentOrder) {
+        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $shiftDate, $outletId, $businessId, $orderNumber, $orderStatus, $isUrgentOrder) {
             $qty = (int)$data['qty'];
             $trx = Transaction::create([
+                'business_id'    => $businessId,
                 'order_number'   => $orderNumber,
                 'status'         => $orderStatus,
-                'date'           => $data['date'],
+                'date'           => $shiftDate,
                 'menu_id'        => $menu->id,
                 'qty'            => $qty,
                 'recipe_version' => $recipe?->version ?? null,
@@ -1129,7 +1101,7 @@ class TransactionController extends Controller
                         $outletId,
                         $trx,
                         $orderNumber,
-                        $data['date'],
+                        $shiftDate,
                         $opt->ingredient,
                         $requiredModQty,
                         "Modifier {$opt->name} ({$menu->name} x{$qty})",
@@ -1166,7 +1138,7 @@ class TransactionController extends Controller
                             $outletId,
                             $trx,
                             $orderNumber,
-                            $data['date'],
+                            $shiftDate,
                             $item->ingredient,
                             $requiredIngQty,
                             "{$menu->name} (x{$qty})",
@@ -1198,6 +1170,8 @@ class TransactionController extends Controller
         });
 
         $trx->load(['menu', 'modifiers.ingredient', 'urgentNotes.ingredient']);
+        // Auto-post double-entry journal ledger
+        AccountingService::postTransaction($trx);
         return response()->json($trx, 201);
     }
 
@@ -1208,11 +1182,19 @@ class TransactionController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
         $query = Transaction::with(['menu', 'user', 'outlet', 'modifiers.ingredient', 'urgentNotes.ingredient'])
             ->where('status', 'HOLD')
             ->orderBy('created_at', 'asc');
+
+        if ($user && $user->business_id) {
+            $query->where('business_id', $user->business_id);
+        }
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
@@ -1325,8 +1307,8 @@ class TransactionController extends Controller
     public function payOpenBill(Request $request, $orderNumber)
     {
         $data = $request->validate([
-            'payment_method'    => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
-            'dp_payment_method' => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,OTHER',
+            'payment_method'    => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,KASBON,PIUTANG,OTHER,APLIKASI',
+            'dp_payment_method' => 'nullable|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,OTHER',
             'dp_reference_no'   => 'nullable|string|max:100',
             'amount_paid'       => 'required|numeric|min:0',
             'change_amount'   => 'nullable|numeric|min:0',
@@ -1375,18 +1357,27 @@ class TransactionController extends Controller
             ], 402);
         }
 
-        $date = now()->toDateString();
-        $shiftId = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->value('id');
-        if (!$shiftId) {
-            $shiftId = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->value('id');
-        }
+        $user = $request->user();
+        $isOwner = $user && ($user->isOwnerBisnis() || $user->isOwnerWebsite() || $user->isPlatformAdmin() || $user->isOwnerOutlet());
 
-        if (!$shiftId) {
+        $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->first();
+        if (!$activeShift) {
+            $activeShift = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->first();
+        }
+        $shiftId = $activeShift?->id;
+
+        // Dilarang melakukan transaksi kalau belum buka shift, KECUALI Owner
+        if (!$isOwner && (!$shiftId || !$activeShift)) {
             return response()->json([
                 'message' => 'Shift kasir belum dibuka untuk cabang ini. Silakan buka shift kasir terlebih dahulu sebelum memproses pembayaran.',
                 'shift_error' => true,
             ], 422);
         }
+
+        // Enforce Shift Operational Date: All transactions settled under this shift belong to the shift opening date
+        $date = ($activeShift && !empty($activeShift->opened_at))
+            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
+            : ($first->date ?: now()->toDateString());
 
         $customerId = !empty($data['customer_id']) ? (int)$data['customer_id'] : ($first->customer_id ?? null);
         $grossSubtotal = (float)$transactions->sum(fn($t) => (float)($t->subtotal ?: $t->total_price));
@@ -1428,6 +1419,7 @@ class TransactionController extends Controller
                 }
 
                 $t->shift_id = $shiftId;
+                $t->date = $date;
                 $t->user_id = $request->user()->id;
                 $t->status = 'PAID';
                 $t->customer_id = $customerId;
@@ -1441,66 +1433,70 @@ class TransactionController extends Controller
                 $t->updated_by = $request->user()->id;
                 $t->save();
 
-                // Deduct stock for DIRECT retail items
-                $menu = $t->menu;
-                if ($menu) {
-                    $this->processDirectProductStockDeduction(
-                        $businessId,
-                        $outletId,
-                        $t,
-                        $orderNumber,
-                        $menu,
-                        $t->qty,
-                        $request->user()->id
-                    );
-                }
+                // Only deduct stock if not already deducted at open bill creation (prevents double stock deduction)
+                $alreadyDeducted = StockMovement::where('transaction_id', $t->id)->exists();
+                if (!$alreadyDeducted) {
+                    // Deduct stock for DIRECT retail items
+                    $menu = $t->menu;
+                    if ($menu) {
+                        $this->processDirectProductStockDeduction(
+                            $businessId,
+                            $outletId,
+                            $t,
+                            $orderNumber,
+                            $menu,
+                            $t->qty,
+                            $request->user()->id
+                        );
+                    }
 
-                // Deduct recipe ingredients with Urgent Note support
-                $recipe = $menu?->activeRecipe($date);
-                if ($recipe) {
-                    foreach ($recipe->items as $item) {
-                        if ($item->ingredient) {
-                            $requiredIngQty = (float)($item->qty * $t->qty);
+                    // Deduct recipe ingredients with Urgent Note support
+                    $recipe = $menu?->activeRecipe($date);
+                    if ($recipe) {
+                        foreach ($recipe->items as $item) {
+                            if ($item->ingredient) {
+                                $requiredIngQty = (float)($item->qty * $t->qty);
+                                $this->processIngredientStockDeduction(
+                                    $businessId,
+                                    $outletId,
+                                    $t,
+                                    $orderNumber,
+                                    $date,
+                                    $item->ingredient,
+                                    $requiredIngQty,
+                                    "{$menu->name} (x{$t->qty}) [Pelunasan Open Bill]",
+                                    'RECIPE',
+                                    $menu->id,
+                                    !empty($shiftId),
+                                    true,
+                                    $request->user()->id,
+                                    $item->unit
+                                );
+                            }
+                        }
+                    }
+
+                    // Deduct modifier ingredients
+                    foreach ($t->modifiers as $mod) {
+                        if ($mod->ingredient_id && $mod->qty > 0 && $mod->ingredient) {
+                            $requiredModQty = (float)($mod->qty * $t->qty);
                             $this->processIngredientStockDeduction(
                                 $businessId,
                                 $outletId,
                                 $t,
                                 $orderNumber,
                                 $date,
-                                $item->ingredient,
-                                $requiredIngQty,
-                                "{$menu->name} (x{$t->qty}) [Pelunasan Open Bill]",
-                                'RECIPE',
+                                $mod->ingredient,
+                                $requiredModQty,
+                                "Modifier {$mod->name} ({$menu->name} x{$t->qty}) [Pelunasan Open Bill]",
+                                'MODIFIER',
                                 $menu->id,
                                 !empty($shiftId),
                                 true,
                                 $request->user()->id,
-                                $item->unit
+                                $mod->unit
                             );
                         }
-                    }
-                }
-
-                // Deduct modifier ingredients
-                foreach ($t->modifiers as $mod) {
-                    if ($mod->ingredient_id && $mod->qty > 0 && $mod->ingredient) {
-                        $requiredModQty = (float)($mod->qty * $t->qty);
-                        $this->processIngredientStockDeduction(
-                            $businessId,
-                            $outletId,
-                            $t,
-                            $orderNumber,
-                            $date,
-                            $mod->ingredient,
-                            $requiredModQty,
-                            "Modifier {$mod->name} ({$menu->name} x{$t->qty}) [Pelunasan Open Bill]",
-                            'MODIFIER',
-                            $menu->id,
-                            !empty($shiftId),
-                            true,
-                            $request->user()->id,
-                            $mod->unit
-                        );
                     }
                 }
             }
@@ -1575,7 +1571,7 @@ class TransactionController extends Controller
                 if ($amountPaidNow > 0) {
                     $dpMethod = strtoupper(trim($data['dp_payment_method'] ?? 'CASH'));
                     $dpRefNo = $data['dp_reference_no'] ?? null;
-                    \App\Models\ReceivablePayment::create([
+                    $dpPay = \App\Models\ReceivablePayment::create([
                         'payment_no'     => \App\Models\ReceivablePayment::generatePaymentNo($businessId, $date),
                         'receivable_id'  => $rec->id,
                         'business_id'    => $businessId,
@@ -1588,6 +1584,7 @@ class TransactionController extends Controller
                         'notes'          => 'Uang Muka / DP Kasir Saat Checkout (' . $dpMethod . ($dpRefNo ? " - {$dpRefNo}" : '') . ')',
                         'received_by'    => $request->user()->id,
                     ]);
+                    \App\Services\AccountingService::postReceivablePayment($dpPay);
                 }
             }
 
@@ -1599,18 +1596,19 @@ class TransactionController extends Controller
                            str_contains($pmUpper, 'GOFOOD') ||
                            str_contains($pmUpper, 'SHOPEE');
 
-            if ($orderStatus === 'PAID' && ($isQris || $isEcommerce)) {
+            if ($isQris || $isEcommerce) {
+                $firstTrx = $transactions->first();
                 $arType = $isQris ? 'MERCHANT_QRIS' : 'MERCHANT_ECOMMERCE';
                 $channelName = $isQris ? 'QRIS' : ($pmUpper ?: 'E-COMMERCE');
                 $mdrRate = $isQris ? 0.7 : 20.0;
-                $mdrFee = round(($orderNetTotal * $mdrRate) / 100, 2);
-                $netReceivable = round($orderNetTotal - $mdrFee, 2);
+                $mdrFee = round(($totalOrder * $mdrRate) / 100, 2);
+                $netReceivable = round($totalOrder - $mdrFee, 2);
 
                 \App\Models\Receivable::create([
-                    'receivable_no'     => \App\Models\Receivable::generateReceivableNo($businessId, $data['date']),
+                    'receivable_no'     => \App\Models\Receivable::generateReceivableNo($businessId, $date),
                     'business_id'       => $businessId,
                     'outlet_id'         => $outletId,
-                    'transaction_id'    => $results[0]->id ?? null,
+                    'transaction_id'    => $firstTrx->id ?? null,
                     'customer_id'       => $customerId,
                     'ar_type'           => $arType,
                     'merchant_channel'  => $channelName,
@@ -1618,9 +1616,9 @@ class TransactionController extends Controller
                     'customer_name'     => "AR Merchant - {$channelName}",
                     'customer_phone'    => null,
                     'customer_address'  => null,
-                    'issue_date'        => $data['date'],
-                    'due_date'          => $data['date'],
-                    'total_amount'      => $orderNetTotal,
+                    'issue_date'        => $date,
+                    'due_date'          => $date,
+                    'total_amount'      => $totalOrder,
                     'paid_amount'       => 0,
                     'remaining_amount'  => $netReceivable,
                     'mdr_rate'          => $mdrRate,
@@ -1636,6 +1634,11 @@ class TransactionController extends Controller
             // Deduct SaaS platform coins for completed nota
             CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
         });
+
+        // Auto-post double-entry journal ledger for settled open bill
+        foreach ($transactions as $t) {
+            AccountingService::postTransaction($t);
+        }
 
         $first = $transactions->first();
         return response()->json([
@@ -1711,15 +1714,22 @@ class TransactionController extends Controller
             }
         }
 
-        $date = $existing->date;
-        $shiftId = $existing->shift_id;
         $outletId = $existing->outlet_id;
+        $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->first();
+        if (!$activeShift) {
+            $activeShift = \App\Models\Shift::find($existing->shift_id);
+        }
+        $shiftId = $activeShift ? $activeShift->id : $existing->shift_id;
+        $date = $activeShift && !empty($activeShift->opened_at)
+            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
+            : ($existing->date ?: now()->toDateString());
         $tableNumber = $existing->table_number;
         $customerName = $existing->customer_name;
         $orderType = $existing->order_type;
 
+        $businessId = (int)($request->user()->business_id ?: ($existing->business_id ?: ($existing->outlet?->business_id ?: 1)));
         $addedTransactions = DB::transaction(function () use (
-            $data, $orderNumber, $date, $shiftId, $outletId, $tableNumber, $customerName, $orderType, $request
+            $data, $orderNumber, $date, $shiftId, $outletId, $businessId, $tableNumber, $customerName, $orderType, $request
         ) {
             $created = [];
             foreach ($data['items'] as $it) {
@@ -1732,6 +1742,7 @@ class TransactionController extends Controller
                 $price = (float)$menu->price + $modifierUnitPrice;
 
                 $trx = Transaction::create([
+                    'business_id'    => $businessId,
                     'order_number'   => $orderNumber,
                     'status'         => 'HOLD',
                     'date'           => $date,
@@ -1750,7 +1761,7 @@ class TransactionController extends Controller
                     'outlet_id'      => $outletId,
                 ]);
 
-                // Save selected modifiers
+                // Save selected modifiers & deduct modifier ingredients
                 foreach ($options as $opt) {
                     TransactionModifier::create([
                         'transaction_id'     => $trx->id,
@@ -1763,6 +1774,64 @@ class TransactionController extends Controller
                         'unit'               => $opt->unit,
                         'total_price'        => (float)($opt->price * $qty),
                     ]);
+
+                    if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient) {
+                        $requiredModQty = (float)($opt->qty * $qty);
+                        $this->processIngredientStockDeduction(
+                            $businessId,
+                            $outletId,
+                            $trx,
+                            $orderNumber,
+                            $date,
+                            $opt->ingredient,
+                            $requiredModQty,
+                            "Modifier {$opt->name} ({$menu->name} x{$qty}) [Item Tambahan Open Bill]",
+                            'MODIFIER',
+                            $menu->id,
+                            !empty($shiftId),
+                            true,
+                            $request->user()->id,
+                            $opt->unit
+                        );
+                    }
+                }
+
+                // Deduct stock for DIRECT retail items
+                if ($menu->item_type === 'DIRECT') {
+                    $this->processDirectProductStockDeduction(
+                        $businessId,
+                        $outletId,
+                        $trx,
+                        $orderNumber,
+                        $menu,
+                        $qty,
+                        $request->user()->id
+                    );
+                }
+
+                // Deduct recipe ingredients
+                if ($recipe) {
+                    foreach ($recipe->items as $item) {
+                        if ($item->ingredient) {
+                            $requiredIngQty = (float)($item->qty * $qty);
+                            $this->processIngredientStockDeduction(
+                                $businessId,
+                                $outletId,
+                                $trx,
+                                $orderNumber,
+                                $date,
+                                $item->ingredient,
+                                $requiredIngQty,
+                                "{$menu->name} (x{$qty}) [Item Tambahan Open Bill]",
+                                'RECIPE',
+                                $menu->id,
+                                !empty($shiftId),
+                                true,
+                                $request->user()->id,
+                                $item->unit
+                            );
+                        }
+                    }
                 }
 
                 $trx->load(['menu', 'modifiers.ingredient']);
@@ -1770,6 +1839,11 @@ class TransactionController extends Controller
             }
             return $created;
         });
+
+        // Auto-post double-entry journal ledger for newly added open bill items
+        foreach ($addedTransactions as $aTrx) {
+            AccountingService::postTransaction($aTrx);
+        }
 
         return response()->json([
             'message'      => 'Item tambahan berhasil ditambahkan ke tagihan terbuka.',
@@ -1797,15 +1871,24 @@ class TransactionController extends Controller
     }
 
     /**
-     * Cancel an open bill.
+     * Void an entire open bill (Batalkan 1 Nota Open Bill).
+     * Supports:
+     * - WRONG_INPUT (Salah Input): All items cancelled before cooking/production. No waste recorded.
+     * - WASTED (Wasted / Rusak / Terbuang): Items were already prepared and wasted. Deducts ingredients/stock as WASTE and creates WasteLog.
      */
     public function cancelOpenBill(Request $request, $orderNumber)
     {
         $data = $request->validate([
-            'reason' => 'nullable|string|max:255',
+            'void_type'           => 'nullable|string|in:WRONG_INPUT,WASTED',
+            'waste_category'      => 'nullable|string|max:50',
+            'reason'              => 'nullable|string|max:255',
+            'supervisor_id'       => 'nullable|integer',
+            'supervisor_password' => 'nullable|string|max:255',
+            'supervisor_pin'      => 'nullable|string|max:50',
         ]);
 
-        $transactions = Transaction::where('order_number', $orderNumber)
+        $transactions = Transaction::with(['menu', 'modifiers.ingredient', 'outlet'])
+            ->where('order_number', $orderNumber)
             ->where('status', 'HOLD')
             ->get();
 
@@ -1816,8 +1899,8 @@ class TransactionController extends Controller
         }
 
         $user = $request->user();
+        $firstTrx = $transactions->first();
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
-            $firstTrx = $transactions->first();
             if ($firstTrx && (int)$firstTrx->outlet_id !== (int)$user->outlet_id) {
                 return response()->json([
                     'message' => 'Anda tidak memiliki hak akses untuk membatalkan tagihan di cabang outlet lain.'
@@ -1825,19 +1908,506 @@ class TransactionController extends Controller
             }
         }
 
-        DB::transaction(function () use ($transactions, $data, $request) {
-            $reasonText = $data['reason'] ? " [Dibatalkan: {$data['reason']}]" : " [Dibatalkan]";
+        $isManagerOrOwner = $user->isOwnerOrManager();
+        $approver = $user;
+
+        // If user is cashier/pegawai without owner/manager role, verify supervisor approval if provided
+        if (!$isManagerOrOwner) {
+            if (!empty($data['supervisor_id']) && (!empty($data['supervisor_password']) || !empty($data['supervisor_pin']))) {
+                $supervisor = User::where('id', $data['supervisor_id'])
+                    ->where('business_id', $firstTrx->business_id)
+                    ->first();
+                if (!$supervisor || !$supervisor->isOwnerOrManager()) {
+                    return response()->json(['message' => 'Supervisor tidak valid atau tidak memiliki hak akses.'], 422);
+                }
+                $validPass = false;
+                if (!empty($data['supervisor_password']) && Hash::check($data['supervisor_password'], $supervisor->password)) {
+                    $validPass = true;
+                }
+                if (!$validPass && !empty($data['supervisor_pin']) && !empty($supervisor->pin) && Hash::check($data['supervisor_pin'], $supervisor->pin)) {
+                    $validPass = true;
+                }
+                if (!$validPass) {
+                    return response()->json(['message' => 'Password / PIN Supervisor tidak sesuai.'], 422);
+                }
+                $approver = $supervisor;
+            }
+        }
+
+        $voidType = strtoupper($data['void_type'] ?? 'WRONG_INPUT') === 'WASTED' ? 'WASTED' : 'WRONG_INPUT';
+        $isWasted = $voidType === 'WASTED';
+        $wasteCategory = !empty($data['waste_category']) ? $data['waste_category'] : 'CUSTOMER_COMPLAINT';
+        $reason = trim($data['reason'] ?? ($isWasted ? 'Pesanan Terbuang (Wasted)' : 'Salah Input / Batal'));
+        $now = now();
+        $dateStr = $firstTrx->date ?: $now->toDateString();
+        $outletId = $firstTrx->outlet_id;
+        $businessId = $firstTrx->business_id ?: $approver->business_id;
+
+        $createdWasteLogs = [];
+
+        DB::transaction(function () use ($transactions, $voidType, $isWasted, $wasteCategory, $reason, $approver, $user, $now, $dateStr, $outletId, $businessId, $orderNumber, &$createdWasteLogs) {
             foreach ($transactions as $t) {
+                $menu = $t->menu;
+                $itemQty = (int)$t->qty;
+
+                // 1. If WASTED: deduct ingredients / stock as WASTE and create WasteLog
+                if ($isWasted && $itemQty > 0) {
+                    $realCost = 0.0;
+                    if ($menu && $menu->item_type === 'RECIPE') {
+                        $recipe = $menu->activeRecipe($dateStr);
+                        if ($recipe && $recipe->items) {
+                            foreach ($recipe->items as $rItem) {
+                                $ing = $rItem->ingredient;
+                                if (!$ing) continue;
+                                $neededQty = (float)$rItem->qty * $itemQty;
+                                $ingCost = (float)($ing->cost_per_unit ?: $ing->price ?: 0);
+                                $itemTotalCost = round($neededQty * $ingCost, 2);
+                                $realCost += $itemTotalCost;
+
+                                StockMovement::create([
+                                    'business_id'    => $businessId,
+                                    'ingredient_id'  => $ing->id,
+                                    'outlet_id'      => $outletId,
+                                    'type'           => 'WASTE',
+                                    'waste_reason'   => $wasteCategory,
+                                    'qty'            => -$neededQty,
+                                    'unit_price'     => $ingCost,
+                                    'total_price'    => $itemTotalCost,
+                                    'date'           => $dateStr,
+                                    'note'           => "Void Wasted Open Bill #{$orderNumber} ({$menu->name} {$itemQty}x) [{$wasteCategory}]: {$reason}",
+                                    'created_by'     => $approver->id,
+                                    'user_id'        => $approver->id,
+                                ]);
+                            }
+                        }
+                    } elseif ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
+                        $menu->decrement('stock', $itemQty);
+                        if ($outletId) {
+                            try {
+                                $om = OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                                if ($om) $om->decrement('stock', $itemQty);
+                            } catch (\Throwable $e) {}
+                        }
+                        $realCost = round((float)($menu->cost_price ?: $menu->price) * $itemQty, 2);
+                    }
+
+                    if ($realCost <= 0 && $menu && method_exists($menu, 'calculateHpp')) {
+                        try {
+                            $realCost = round((float)$menu->calculateHpp() * $itemQty, 2);
+                        } catch (\Throwable $e) {}
+                    }
+                    if ($realCost <= 0 && $menu) {
+                        $realCost = round((float)($menu->cost_price ?: ($menu->price * 0.4)) * $itemQty, 2);
+                    }
+
+                    $datePrefix = $now->format('Ymd');
+                    $latestWaste = WasteLog::where('waste_no', 'like', "WST-{$datePrefix}-%")->orderBy('id', 'desc')->first();
+                    $nextSeq = 1;
+                    if ($latestWaste && preg_match('/WST-\d+-(\d+)/', $latestWaste->waste_no, $m)) {
+                        $nextSeq = intval($m[1]) + 1;
+                    }
+                    $wasteNo = "WST-{$datePrefix}-" . str_pad($nextSeq, 4, '0', STR_PAD_LEFT);
+
+                    $costPerUnit = $itemQty > 0 ? ($realCost / $itemQty) : $realCost;
+                    $wasteLog = WasteLog::create([
+                        'business_id'     => $businessId,
+                        'outlet_id'       => $outletId,
+                        'shift_id'        => $t->shift_id,
+                        'date'            => $dateStr,
+                        'waste_no'        => $wasteNo,
+                        'item_type'       => $menu?->item_type ?: 'RECIPE',
+                        'menu_id'         => $menu?->id,
+                        'qty'             => (float)$itemQty,
+                        'unit_type'       => $menu?->unit ?: 'porsi',
+                        'qty_pakai'       => (float)$itemQty,
+                        'cost_per_unit'   => $costPerUnit,
+                        'loss_cost'       => $realCost,
+                        'reason_category' => $wasteCategory,
+                        'notes'           => "Void Open Bill Wasted ({$menu?->name} {$itemQty}x) Nota #{$orderNumber}: {$reason}",
+                        'user_id'         => $approver->id,
+                        'created_by'      => $approver->id,
+                        'updated_by'      => $approver->id,
+                    ]);
+                    $createdWasteLogs[] = $wasteLog;
+                }
+
+                // Clean up previous SALE_USAGE stock movements
+                if ($isWasted) {
+                    // Delete previous SALE_USAGE so it is replaced cleanly by the WASTE movement above
+                    StockMovement::where('transaction_id', $t->id)->where('type', 'SALE_USAGE')->delete();
+                } else {
+                    // WRONG_INPUT: Revert ingredient stock movements and restore direct retail product stock
+                    StockMovement::where('transaction_id', $t->id)->where('type', 'SALE_USAGE')->delete();
+                    if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock && $itemQty > 0) {
+                        $menu->increment('stock', $itemQty);
+                        if ($outletId) {
+                            try {
+                                $om = OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                                if ($om) $om->increment('stock', $itemQty);
+                            } catch (\Throwable $e) {}
+                        }
+                    }
+                }
+
                 $t->update([
-                    'status'     => 'CANCELLED',
-                    'notes'      => ($t->notes ?? '') . $reasonText,
-                    'updated_by' => $request->user()->id,
+                    'status'              => 'CANCELLED',
+                    'void_type'           => $voidType,
+                    'cancellation_reason' => $reason,
+                    'notes'               => ($t->notes ? $t->notes . ' | ' : '') . "[VOID: {$voidType} - {$reason} (Oleh: {$approver->name})]",
+                    'updated_by'          => $user->id,
                 ]);
             }
         });
 
+        // Auto-post double-entry journal reverse/cleanup for cancelled transactions
+        foreach ($transactions as $t) {
+            AccountingService::postTransaction($t);
+        }
+
+        // Post accounting journal for waste if any
+        foreach ($createdWasteLogs as $wl) {
+            try {
+                AccountingService::postWaste($wl);
+            } catch (\Throwable $e) {}
+        }
+
+        $typeLabel = $isWasted ? 'Wasted (Bahan baku dicatat terbuang)' : 'Salah Input (Bahan baku aman/tidak berkurang)';
+
         return response()->json([
-            'message' => "Tagihan terbuka '{$orderNumber}' berhasil dibatalkan."
+            'success'       => true,
+            'message'       => "Tagihan terbuka '{$orderNumber}' berhasil dibatalkan [Tipe: {$typeLabel}].",
+            'order_number'  => $orderNumber,
+            'void_type'     => $voidType,
+            'reason'        => $reason,
+        ]);
+    }
+
+    /**
+     * Void a single item or partial quantity in an open bill.
+     * Supports:
+     * - WRONG_INPUT (Salah Input): Item cancelled before cooking/production. No waste recorded.
+     * - WASTED (Wasted / Rusak / Terbuang): Item was already prepared and wasted. Deducts ingredients/stock as WASTE and creates WasteLog.
+     */
+    public function voidOpenBillItem(Request $request, $orderNumber)
+    {
+        $data = $request->validate([
+            'item_id'             => 'required|integer',
+            'qty'                 => 'nullable|integer|min:1',
+            'void_type'           => 'required|string|in:WRONG_INPUT,WASTED',
+            'waste_category'      => 'nullable|string|max:50',
+            'reason'              => 'required|string|max:255',
+            'supervisor_id'       => 'nullable|integer',
+            'supervisor_password' => 'nullable|string|max:255',
+            'supervisor_pin'      => 'nullable|string|max:50',
+        ]);
+
+        $user = $request->user();
+        $targetTrx = Transaction::with(['menu', 'modifiers.ingredient'])
+            ->where('id', $data['item_id'])
+            ->where('order_number', $orderNumber)
+            ->where('status', 'HOLD')
+            ->first();
+
+        if (!$targetTrx) {
+            return response()->json([
+                'message' => "Item tagihan terbuka tidak ditemukan atau sudah diselesaikan."
+            ], 404);
+        }
+
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            if ((int)$targetTrx->outlet_id !== (int)$user->outlet_id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk membatalkan item tagihan di cabang outlet lain.'
+                ], 403);
+            }
+        }
+
+        $isManagerOrOwner = $user->isOwnerOrManager();
+        $approver = $user;
+
+        // If user is cashier/pegawai without owner/manager role, verify supervisor approval if provided
+        if (!$isManagerOrOwner) {
+            if (!empty($data['supervisor_id']) && (!empty($data['supervisor_password']) || !empty($data['supervisor_pin']))) {
+                $supervisor = User::where('id', $data['supervisor_id'])
+                    ->where('business_id', $targetTrx->business_id)
+                    ->first();
+                if (!$supervisor || !$supervisor->isOwnerOrManager()) {
+                    return response()->json(['message' => 'Supervisor tidak valid atau tidak memiliki hak akses.'], 422);
+                }
+                $validPass = false;
+                if (!empty($data['supervisor_password']) && Hash::check($data['supervisor_password'], $supervisor->password)) {
+                    $validPass = true;
+                }
+                if (!$validPass && !empty($data['supervisor_pin']) && !empty($supervisor->pin) && Hash::check($data['supervisor_pin'], $supervisor->pin)) {
+                    $validPass = true;
+                }
+                if (!$validPass) {
+                    return response()->json(['message' => 'Password / PIN Supervisor tidak sesuai.'], 422);
+                }
+                $approver = $supervisor;
+            }
+        }
+
+        $voidQty = !empty($data['qty']) ? min((int)$data['qty'], (int)$targetTrx->qty) : (int)$targetTrx->qty;
+        $voidType = strtoupper($data['void_type']) === 'WASTED' ? 'WASTED' : 'WRONG_INPUT';
+        $isWasted = $voidType === 'WASTED';
+        $wasteCategory = !empty($data['waste_category']) ? $data['waste_category'] : 'CUSTOMER_COMPLAINT';
+        $reason = trim($data['reason']);
+        $now = now();
+
+        $createdWasteLogs = [];
+
+        DB::transaction(function () use ($targetTrx, $voidQty, $voidType, $isWasted, $wasteCategory, $reason, $approver, $user, $now, &$createdWasteLogs) {
+            $menu = $targetTrx->menu;
+            $unitPrice = (float)$targetTrx->qty > 0 ? ((float)$targetTrx->total_price / (float)$targetTrx->qty) : (float)($menu?->price ?? 0);
+            $unitSubtotal = (float)$targetTrx->qty > 0 ? ((float)$targetTrx->subtotal / (float)$targetTrx->qty) : $unitPrice;
+            $unitDiscount = (float)$targetTrx->qty > 0 ? ((float)$targetTrx->discount_amount / (float)$targetTrx->qty) : 0;
+
+            // 1. If WASTED: deduct ingredients / stock and record to WasteLog
+            if ($isWasted) {
+                $datePrefix = $now->format('Ymd');
+                $dateStr = $targetTrx->date ?: $now->toDateString();
+                $outletId = $targetTrx->outlet_id;
+                $businessId = $targetTrx->business_id ?: $approver->business_id;
+
+                $realCost = 0.0;
+                // If Recipe Menu, deduct ingredients from StockMovement as WASTE
+                if ($menu && $menu->item_type === 'RECIPE') {
+                    $recipe = $menu->activeRecipe($dateStr);
+                    if ($recipe && $recipe->items) {
+                        foreach ($recipe->items as $rItem) {
+                            $ing = $rItem->ingredient;
+                            if (!$ing) continue;
+                            $neededQty = (float)$rItem->qty * $voidQty;
+                            $ingCost = (float)($ing->cost_per_unit ?: $ing->price ?: 0);
+                            $itemTotalCost = round($neededQty * $ingCost, 2);
+                            $realCost += $itemTotalCost;
+
+                            // Create StockMovement for ingredient as WASTE
+                            StockMovement::create([
+                                'business_id'    => $businessId,
+                                'ingredient_id'  => $ing->id,
+                                'outlet_id'      => $outletId,
+                                'type'           => 'WASTE',
+                                'waste_reason'   => $wasteCategory,
+                                'qty'            => -$neededQty,
+                                'unit_price'     => $ingCost,
+                                'total_price'    => $itemTotalCost,
+                                'date'           => $dateStr,
+                                'note'           => "Void Wasted Open Bill #{$targetTrx->order_number} ({$menu->name} {$voidQty}x) [{$wasteCategory}]: {$reason}",
+                                'created_by'     => $approver->id,
+                                'user_id'        => $approver->id,
+                            ]);
+                        }
+                    }
+                } elseif ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock) {
+                    // For Direct Product: decrement stock and record cost
+                    $menu->decrement('stock', $voidQty);
+                    if ($outletId) {
+                        try {
+                            $om = OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                            if ($om) $om->decrement('stock', $voidQty);
+                        } catch (\Throwable $e) {}
+                    }
+                    $realCost = round((float)($menu->cost_price ?: $menu->price) * $voidQty, 2);
+                }
+
+                if ($realCost <= 0 && $menu && method_exists($menu, 'calculateHpp')) {
+                    try {
+                        $hppPerUnit = (float)$menu->calculateHpp($dateStr, $outletId);
+                        $realCost = round($hppPerUnit * $voidQty, 2);
+                    } catch (\Throwable $e) {}
+                }
+                if ($realCost <= 0 && $menu && (float)$menu->cost_price > 0) {
+                    $realCost = round((float)$menu->cost_price * $voidQty, 2);
+                }
+
+                $costPerUnit = $voidQty > 0 ? round($realCost / $voidQty, 2) : $realCost;
+                $lossCost = round($realCost, 2);
+
+                $latestWaste = WasteLog::where('waste_no', 'like', "WST-{$datePrefix}-%")->orderBy('id', 'desc')->first();
+                $nextSeq = 1;
+                if ($latestWaste && preg_match('/WST-\d+-(\d+)/', $latestWaste->waste_no, $m)) {
+                    $nextSeq = intval($m[1]) + 1;
+                }
+                $wasteNo = "WST-{$datePrefix}-" . str_pad($nextSeq, 4, '0', STR_PAD_LEFT);
+
+                $wl = WasteLog::create([
+                    'business_id'     => $businessId,
+                    'waste_no'        => $wasteNo,
+                    'date'            => $dateStr,
+                    'item_type'       => $menu?->item_type ?: 'RECIPE',
+                    'menu_id'         => $targetTrx->menu_id,
+                    'outlet_id'       => $outletId,
+                    'shift_id'        => $targetTrx->shift_id,
+                    'qty'             => (float)$voidQty,
+                    'unit_type'       => $menu?->unit ?: 'porsi',
+                    'qty_pakai'       => (float)$voidQty,
+                    'cost_per_unit'   => $costPerUnit,
+                    'loss_cost'       => $lossCost,
+                    'reason_category' => $wasteCategory,
+                    'notes'           => "Void Wasted Open Bill #{$targetTrx->order_number} ({$menu?->name} {$voidQty}x): {$reason}",
+                    'user_id'         => $approver->id,
+                    'created_by'      => $approver->id,
+                    'updated_by'      => $approver->id,
+                ]);
+                $createdWasteLogs[] = $wl;
+            }
+
+            // 2. Adjust or cancel the transaction row
+            $typeLabel = $isWasted ? 'WASTED (Barang Terbuang)' : 'SALAH INPUT (Batal Pesan)';
+
+            if ($voidQty >= (int)$targetTrx->qty) {
+                // Entire row voided: Clean up SALE_USAGE stock movements
+                if ($isWasted) {
+                    StockMovement::where('transaction_id', $targetTrx->id)->where('type', 'SALE_USAGE')->delete();
+                } else {
+                    StockMovement::where('transaction_id', $targetTrx->id)->where('type', 'SALE_USAGE')->delete();
+                    if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock && $voidQty > 0) {
+                        $menu->increment('stock', $voidQty);
+                        if ($targetTrx->outlet_id) {
+                            try {
+                                $om = OutletMenu::where('outlet_id', $targetTrx->outlet_id)->where('menu_id', $menu->id)->first();
+                                if ($om) $om->increment('stock', $voidQty);
+                            } catch (\Throwable $e) {}
+                        }
+                    }
+                }
+
+                $targetTrx->update([
+                    'status'              => 'CANCELLED',
+                    'void_type'           => $voidType,
+                    'cancellation_reason' => $reason,
+                    'cancelled_at'        => $now,
+                    'cancelled_by'        => $approver->id,
+                    'void_approved_by'    => $approver->id,
+                    'void_approved_at'    => $now,
+                    'notes'               => trim(($targetTrx->notes ?? '') . " [VOID ITEM {$typeLabel} ({$approver->name}): {$reason}]"),
+                    'updated_by'          => $approver->id,
+                ]);
+            } else {
+                // Partial void: reduce qty on original HOLD row, create CANCELLED row for audit trail
+                $remainingQty = (int)$targetTrx->qty - $voidQty;
+                $originalQty = (int)$targetTrx->qty;
+
+                // Adjust SALE_USAGE stock movements proportionally
+                $movements = StockMovement::where('transaction_id', $targetTrx->id)->where('type', 'SALE_USAGE')->get();
+                foreach ($movements as $sm) {
+                    if ($originalQty > 0) {
+                        $newQty = round(((float)$sm->qty / $originalQty) * $remainingQty, 4);
+                        $sm->update([
+                            'qty'         => $newQty,
+                            'total_price' => round($newQty * (float)$sm->unit_price, 2),
+                        ]);
+                    }
+                }
+
+                if (!$isWasted && $menu && $menu->item_type === 'DIRECT' && $menu->track_stock && $voidQty > 0) {
+                    $menu->increment('stock', $voidQty);
+                    if ($targetTrx->outlet_id) {
+                        try {
+                            $om = OutletMenu::where('outlet_id', $targetTrx->outlet_id)->where('menu_id', $menu->id)->first();
+                            if ($om) $om->increment('stock', $voidQty);
+                        } catch (\Throwable $e) {}
+                    }
+                }
+
+                $targetTrx->update([
+                    'qty'             => $remainingQty,
+                    'subtotal'        => round($unitSubtotal * $remainingQty, 2),
+                    'discount_amount' => round($unitDiscount * $remainingQty, 2),
+                    'total_price'     => round($unitPrice * $remainingQty, 2),
+                    'notes'           => trim(($targetTrx->notes ?? '') . " [Item di-void {$voidQty}x ({$typeLabel})]"),
+                    'updated_by'      => $approver->id,
+                ]);
+
+                // Create audit cancelled record
+                $cancelledTrx = $targetTrx->replicate();
+                $cancelledTrx->qty = $voidQty;
+                $cancelledTrx->subtotal = round($unitSubtotal * $voidQty, 2);
+                $cancelledTrx->discount_amount = round($unitDiscount * $voidQty, 2);
+                $cancelledTrx->total_price = round($unitPrice * $voidQty, 2);
+                $cancelledTrx->status = 'CANCELLED';
+                $cancelledTrx->void_type = $voidType;
+                $cancelledTrx->cancellation_reason = $reason;
+                $cancelledTrx->cancelled_at = $now;
+                $cancelledTrx->cancelled_by = $approver->id;
+                $cancelledTrx->void_approved_by = $approver->id;
+                $cancelledTrx->void_approved_at = $now;
+                $cancelledTrx->notes = "Void Sebagian Open Bill ({$voidQty}x dari {$targetTrx->qty}x) [{$typeLabel}]: {$reason}";
+                $cancelledTrx->save();
+            }
+        });
+
+        // Auto-post / update double-entry journal for voided item
+        AccountingService::postTransaction($targetTrx);
+
+        // Auto-post waste loss journals if void type is WASTED
+        foreach ($createdWasteLogs as $wl) {
+            AccountingService::postWaste($wl);
+        }
+
+        $menuName = $targetTrx->menu?->name ?? 'Menu';
+        $succMsg = $isWasted
+            ? "Item '{$menuName}' ({$voidQty}x) berhasil di-void (WASTED). Bahan baku terpakai dicatat sebagai kerugian waste & stok terpotong."
+            : "Item '{$menuName}' ({$voidQty}x) berhasil di-void (Salah Input) dari tagihan {$orderNumber}.";
+
+        return response()->json([
+            'status'        => 'success',
+            'message'       => $succMsg,
+            'order_number'  => $orderNumber,
+            'voided_item'   => $menuName,
+            'voided_qty'    => $voidQty,
+            'void_type'     => $voidType,
+        ]);
+    }
+
+    /**
+     * Deduct coin and record when printing Pre-Bill for an Open Bill.
+     */
+    public function printPrebill(Request $request, $orderNumber)
+    {
+        $transactions = Transaction::where('order_number', $orderNumber)
+            ->where('status', 'HOLD')
+            ->get();
+
+        if ($transactions->isEmpty()) {
+            return response()->json([
+                'message' => "Tagihan terbuka dengan nomor '{$orderNumber}' tidak ditemukan atau sudah diselesaikan."
+            ], 404);
+        }
+
+        $first = $transactions->first();
+        $businessId = (int)($request->user()->business_id ?: ($first->business_id ?: ($first->outlet?->business_id ?: 1)));
+        $outletId = $first->outlet_id;
+
+        // Check SaaS platform coin balance
+        $coinCheck = CoinService::canTransact($businessId);
+        if (!$coinCheck['allowed']) {
+            return response()->json([
+                'message'    => $coinCheck['message'],
+                'coin_error' => true,
+                'coin_data'  => $coinCheck,
+            ], 402);
+        }
+
+        // Deduct coin if not already deducted for this order_number
+        $coinTx = CoinService::deductForOrder(
+            $businessId,
+            $orderNumber,
+            $outletId,
+            $request->user()->id,
+            "Pemotongan koin untuk Cetak Pre-Bill Nota #{$orderNumber}"
+        );
+
+        $business = \App\Models\Business::find($businessId);
+
+        return response()->json([
+            'success'       => true,
+            'message'       => 'Koin transaksi berhasil dipotong untuk cetak Pre-Bill.',
+            'deducted'      => (bool)$coinTx,
+            'coin_balance'  => (float)($business?->coin_balance ?? 0),
+            'cost'          => (float)($business?->coins_per_transaction ?? 1.0),
         ]);
     }
 
@@ -1874,13 +2444,14 @@ class TransactionController extends Controller
     /**
      * Execute full cancellation, stock management, waste recording, and audit logging for an approved void transaction.
      */
-    private function executeVoidApproval($transactions, string $orderNum, string $reason, User $approver, ?User $requester = null, string $voidType = 'WRONG_INPUT')
+    private function executeVoidApproval($transactions, string $orderNum, string $reason, User $approver, ?User $requester = null, string $voidType = 'WRONG_INPUT', string $wasteCategory = 'CUSTOMER_COMPLAINT')
     {
         $now = now();
         $firstTrx = $transactions->first();
         $isWasted = strtoupper($voidType) === 'WASTED';
 
-        DB::transaction(function () use ($transactions, $orderNum, $reason, $now, $approver, $requester, $firstTrx, $isWasted, $voidType) {
+        $createdWasteLogs = [];
+        DB::transaction(function () use ($transactions, $orderNum, $reason, $now, $approver, $requester, $firstTrx, $isWasted, $voidType, $wasteCategory, &$createdWasteLogs) {
             $trxIds = $transactions->pluck('id')->toArray();
 
             // 1. Direct Product Stock Management
@@ -1926,8 +2497,8 @@ class TransactionController extends Controller
                 foreach ($saleMovements as $mov) {
                     $mov->update([
                         'type'         => 'WASTE',
-                        'waste_reason' => 'CUSTOMER_COMPLAINT',
-                        'note'         => trim(($mov->note ?? '') . " [VOID WASTED / Barang Terbuang: {$reason}]"),
+                        'waste_reason' => $wasteCategory,
+                        'note'         => trim(($mov->note ?? '') . " [VOID WASTED / {$wasteCategory}: {$reason}]"),
                         'updated_by'   => $approver->id,
                     ]);
                 }
@@ -1968,7 +2539,7 @@ class TransactionController extends Controller
                     }
                     $wasteNo = "WST-{$datePrefix}-" . str_pad($nextSeq, 4, '0', STR_PAD_LEFT);
 
-                    WasteLog::create([
+                    $wl = WasteLog::create([
                         'business_id'     => $t->business_id ?: $approver->business_id,
                         'waste_no'        => $wasteNo,
                         'date'            => $now->toDateString(),
@@ -1981,12 +2552,13 @@ class TransactionController extends Controller
                         'qty_pakai'       => (float)$t->qty,
                         'cost_per_unit'   => $costPerUnit,
                         'loss_cost'       => $lossCost,
-                        'reason_category' => 'CUSTOMER_COMPLAINT',
+                        'reason_category' => $wasteCategory,
                         'notes'           => "Void Wasted (Makanan Batal/Terbuang) Nota #{$orderNum}: {$reason}",
                         'user_id'         => $approver->id,
                         'created_by'      => $approver->id,
                         'updated_by'      => $approver->id,
                     ]);
+                    $createdWasteLogs[] = $wl;
                 }
             }
 
@@ -2050,6 +2622,16 @@ class TransactionController extends Controller
                 ]);
             }
         });
+
+        // Auto-post / reverse double-entry journal entries for voided transactions
+        foreach ($transactions as $t) {
+            AccountingService::postTransaction($t);
+        }
+
+        // Auto-post waste loss journals if void type is WASTED
+        foreach ($createdWasteLogs as $wl) {
+            AccountingService::postWaste($wl);
+        }
     }
 
     /**
@@ -2064,6 +2646,7 @@ class TransactionController extends Controller
             'order_number'        => 'nullable|string|max:100',
             'reason'              => 'required|string|max:255',
             'void_type'           => 'nullable|string|in:WRONG_INPUT,WASTED',
+            'waste_category'      => 'nullable|string|max:50',
             'supervisor_id'       => 'nullable|integer',
             'supervisor_password' => 'nullable|string|max:255',
             'supervisor_pin'      => 'nullable|string|max:50',
@@ -2117,14 +2700,15 @@ class TransactionController extends Controller
         $reason = trim($data['reason']);
         $voidType = !empty($data['void_type']) && strtoupper($data['void_type']) === 'WASTED' ? 'WASTED' : 'WRONG_INPUT';
         $isWasted = $voidType === 'WASTED';
+        $wasteCategory = !empty($data['waste_category']) ? $data['waste_category'] : 'CUSTOMER_COMPLAINT';
         $isManagerOrOwner = $user->isOwnerOrManager();
 
         // SCENARIO 1: Current logged-in user IS Manager/Owner
         if ($isManagerOrOwner) {
-            $this->executeVoidApproval($transactions, $orderNum, $reason, $user, $user, $voidType);
+            $this->executeVoidApproval($transactions, $orderNum, $reason, $user, $user, $voidType, $wasteCategory);
 
             $succMsg = $isWasted
-                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / Makanan Terbuang) oleh Manajer/Owner ({$user->name}). Bahan tetap tercatat keluar (tidak dikembalikan) dan dicatat ke Laporan Waste & Laba Rugi."
+                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / {$wasteCategory}) oleh Manajer/Owner ({$user->name}). Bahan tetap tercatat keluar dan dicatat ke Laporan Waste."
                 : "Nota transaksi '{$orderNum}' berhasil di-void (Salah Input) oleh Manajer/Owner ({$user->name}). Riwayat di Kartu Stok & HPP Laba Rugi telah dihapus bersih.";
 
             return response()->json([
@@ -2132,6 +2716,7 @@ class TransactionController extends Controller
                 'order_number'        => $orderNum,
                 'cancellation_reason' => $reason,
                 'void_type'           => $voidType,
+                'waste_category'      => $wasteCategory,
                 'cancelled_at'        => now()->toDateTimeString(),
                 'cancelled_by_name'   => $user->name,
                 'void_approved_by'    => $user->name,
@@ -2159,10 +2744,10 @@ class TransactionController extends Controller
             }
 
             // Execute instant void approval authorized by this supervisor
-            $this->executeVoidApproval($transactions, $orderNum, $reason, $supervisor, $user, $voidType);
+            $this->executeVoidApproval($transactions, $orderNum, $reason, $supervisor, $user, $voidType, $wasteCategory);
 
             $succMsg = $isWasted
-                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / Makanan Terbuang) via otorisasi Manajer ({$supervisor->name}). Bahan tetap tercatat keluar dan dicatat ke Laporan Waste & Laba Rugi."
+                ? "Nota transaksi '{$orderNum}' berhasil di-void (Wasted / {$wasteCategory}) via otorisasi Manajer ({$supervisor->name}). Bahan tetap tercatat keluar dan dicatat ke Laporan Waste."
                 : "Nota transaksi '{$orderNum}' berhasil di-void (Salah Input) via otorisasi Manajer ({$supervisor->name}). Riwayat di Kartu Stok & HPP Laba Rugi telah dihapus bersih.";
 
             return response()->json([
@@ -2170,6 +2755,7 @@ class TransactionController extends Controller
                 'order_number'        => $orderNum,
                 'cancellation_reason' => $reason,
                 'void_type'           => $voidType,
+                'waste_category'      => $wasteCategory,
                 'cancelled_at'        => now()->toDateTimeString(),
                 'cancelled_by_name'   => $user->name,
                 'void_approved_by'    => $supervisor->name,
@@ -2180,7 +2766,7 @@ class TransactionController extends Controller
 
         // SCENARIO 3: Current user is Pegawai/Kasir requesting void asynchronously (Pending Approval)
         $now = now();
-        $typeStr = $isWasted ? 'WASTED (Makanan Terbuang)' : 'SALAH INPUT';
+        $typeStr = $isWasted ? "WASTED [{$wasteCategory}]" : 'SALAH INPUT';
         foreach ($transactions as $t) {
             $t->update([
                 'status'              => 'VOID_PENDING',
@@ -2194,7 +2780,7 @@ class TransactionController extends Controller
         }
 
         $pendingMsg = $isWasted
-            ? "Permohonan void nota (Wasted / Makanan Terbuang) '{$orderNum}' berhasil diajukan ke Manajer/Owner. Bahan tetap tercatat keluar setelah disetujui."
+            ? "Permohonan void nota (Wasted / {$wasteCategory}) '{$orderNum}' berhasil diajukan ke Manajer/Owner. Bahan tetap tercatat keluar setelah disetujui."
             : "Permohonan void nota (Salah Input) '{$orderNum}' berhasil diajukan ke Manajer/Owner. Riwayat di Kartu Stok & HPP akan dibersihkan setelah permohonan disetujui.";
 
         return response()->json([
@@ -2202,6 +2788,7 @@ class TransactionController extends Controller
             'order_number'        => $orderNum,
             'cancellation_reason' => $reason,
             'void_type'           => $voidType,
+            'waste_category'      => $wasteCategory,
             'void_requested_at'   => $now->toDateTimeString(),
             'void_requested_by'   => $user->name,
             'status'              => 'VOID_PENDING',
@@ -2245,18 +2832,20 @@ class TransactionController extends Controller
 
         $reason = $request->input('reason') ?: ($firstTrx->cancellation_reason ?: 'Disetujui Manajer/Owner');
         $voidType = $request->input('void_type') ?: ($firstTrx->void_type ?: 'WRONG_INPUT');
+        $wasteCategory = $request->input('waste_category') ?: 'CUSTOMER_COMPLAINT';
         $requester = $firstTrx->voidRequestedByUser;
 
-        $this->executeVoidApproval($transactions, $orderNumber, $reason, $user, $requester, $voidType);
+        $this->executeVoidApproval($transactions, $orderNumber, $reason, $user, $requester, $voidType, $wasteCategory);
 
         $succMsg = strtoupper($voidType) === 'WASTED'
-            ? "Permohonan void nota '{$orderNumber}' (Wasted / Makanan Terbuang) telah disetujui. Bahan tetap tercatat keluar dan dicatat ke Laporan Waste."
+            ? "Permohonan void nota '{$orderNumber}' (Wasted / {$wasteCategory}) telah disetujui. Bahan tetap tercatat keluar dan dicatat ke Laporan Waste."
             : "Permohonan void nota '{$orderNumber}' (Salah Input) telah disetujui. Transaksi dibatalkan dan seluruh riwayat mutasi telah dihapus dari Kartu Stok.";
 
         return response()->json([
             'message'             => $succMsg,
             'order_number'        => $orderNumber,
             'void_type'           => $voidType,
+            'waste_category'      => $wasteCategory,
             'status'              => 'CANCELLED',
             'void_approved_by'    => $user->name,
             'void_approved_at'    => now()->toDateTimeString(),
@@ -2670,7 +3259,7 @@ class TransactionController extends Controller
             'items'           => 'required|array|min:1',
             'items.*.id'      => 'required|integer|exists:transactions,id',
             'items.*.qty'     => 'required|integer|min:1',
-            'payment_method'  => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
+            'payment_method'  => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,KASBON,PIUTANG,OTHER,APLIKASI',
             'amount_paid'     => 'required|numeric|min:0',
             'change_amount'   => 'nullable|numeric|min:0',
             'customer_name'   => 'nullable|string|max:100',
@@ -2759,10 +3348,27 @@ class TransactionController extends Controller
         $splitIndex = ($lastSplit ? (int)$lastSplit : 0) + 1;
         $subOrderNumber = sprintf("%s-S%d", $orderNumber, $splitIndex);
 
+        $user = $request->user();
+        $isOwner = $user && ($user->isOwnerBisnis() || $user->isOwnerWebsite() || $user->isPlatformAdmin() || $user->isOwnerOutlet());
+
         $first = $transactions->first();
-        $date = $first->date;
         $outletId = $first->outlet_id;
-        $shiftId = $first->shift_id;
+        $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->first();
+        if (!$activeShift) {
+            $activeShift = \App\Models\Shift::find($first->shift_id);
+        }
+        $shiftId = $activeShift ? $activeShift->id : $first->shift_id;
+
+        if (!$isOwner && (!$shiftId || !$activeShift)) {
+            return response()->json([
+                'message' => 'Shift kasir belum dibuka untuk cabang ini. Silakan buka shift kasir terlebih dahulu sebelum memproses pembayaran.',
+                'shift_error' => true,
+            ], 422);
+        }
+
+        $date = ($activeShift && !empty($activeShift->opened_at))
+            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
+            : ($first->date ?: now()->toDateString());
         $tableNumber = $first->table_number;
         $customerName = !empty($data['customer_name']) ? trim($data['customer_name']) : ($first->customer_name ? "{$first->customer_name} (Bagian {$splitIndex})" : "Tamu {$splitIndex}");
         $businessId = (int)($request->user()->business_id ?: ($first->business_id ?: ($first->outlet?->business_id ?: 1)));
@@ -2796,6 +3402,8 @@ class TransactionController extends Controller
                         'split_index'         => $splitIndex,
                         'split_type'          => 'BY_ITEM',
                         'status'              => 'PAID',
+                        'shift_id'            => $shiftId,
+                        'date'                => $date,
                         'payment_method'      => $data['payment_method'],
                         'amount_paid'         => $amountPaid,
                         'change_amount'       => $changeAmount,
@@ -2879,6 +3487,11 @@ class TransactionController extends Controller
             return $paidRows;
         });
 
+        // Auto-post double-entry journal ledger for split items
+        foreach ($paidResult as $pTrx) {
+            AccountingService::postTransaction($pTrx);
+        }
+
         // Check remaining items on the table
         $remainingHold = Transaction::where('order_number', $orderNumber)
             ->where('status', 'HOLD')
@@ -2939,7 +3552,7 @@ class TransactionController extends Controller
             'total_splits'   => 'required|integer|min:2|max:20',
             'split_index'    => 'required|integer|min:1',
             'split_amount'   => 'required|numeric|min:1',
-            'payment_method' => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,KASBON,PIUTANG',
+            'payment_method' => 'required|string|in:CASH,QRIS,TRANSFER,DEBIT,GRAB,GRABFOOD,GOFOOD,GOJEK,SHOPEEFOOD,SHOPEE,KASBON,PIUTANG,OTHER,APLIKASI',
             'amount_paid'    => 'required|numeric|min:0',
             'change_amount'  => 'nullable|numeric|min:0',
             'customer_name'  => 'nullable|string|max:100',
@@ -3004,15 +3617,30 @@ class TransactionController extends Controller
         $newPaidSplitsCount = $previousPaidSplits + 1;
         $isTableClosed = ($newPaidSplitsCount >= $totalSplits);
 
+        $user = $request->user();
+        $isOwner = $user && ($user->isOwnerBisnis() || $user->isOwnerWebsite() || $user->isPlatformAdmin() || $user->isOwnerOutlet());
+
         DB::transaction(function () use (
             $transactions, $first, $orderNumber, $subOrderNumber, $splitIndex, $totalSplits, $splitAmount,
-            $amountPaid, $changeAmount, $data, $customerName, $isTableClosed, $businessId, $request
+            $amountPaid, $changeAmount, $data, $customerName, $isTableClosed, $businessId, $request, $isOwner
         ) {
-            $activeShift = \App\Models\Shift::where('outlet_id', $first->outlet_id)
+            $outletId = $first->outlet_id;
+            $activeShift = \App\Models\Shift::where('outlet_id', $outletId)
                 ->where('status', 'OPEN')
-                ->latest()
+                ->orderByDesc('opened_at')
                 ->first();
+            if (!$activeShift) {
+                $activeShift = \App\Models\Shift::find($first->shift_id);
+            }
             $splitShiftId = $activeShift ? $activeShift->id : $first->shift_id;
+
+            if (!$isOwner && (!$splitShiftId || !$activeShift)) {
+                throw new \Exception('Shift kasir belum dibuka untuk cabang ini. Silakan buka shift kasir terlebih dahulu sebelum memproses pembayaran.');
+            }
+
+            $date = ($activeShift && !empty($activeShift->opened_at))
+                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
+                : ($first->date ?: now()->toDateString());
 
             // Create a payment record for this equal split installment
             Transaction::create([
@@ -3023,7 +3651,7 @@ class TransactionController extends Controller
                 'split_type'          => 'EQUAL',
                 'status'              => 'PAID',
                 'business_id'         => $first->business_id,
-                'date'                => $first->date,
+                'date'                => $date,
                 'menu_id'             => $first->menu_id,
                 'qty'                 => 1,
                 'recipe_version'      => $first->recipe_version,
@@ -3057,6 +3685,12 @@ class TransactionController extends Controller
             // Deduct SaaS platform coins for completed split sub-nota
             CoinService::deductForOrder($businessId, $subOrderNumber, $first->outlet_id, $request->user()->id);
         });
+
+        // Auto-post double-entry journal ledger for split evenly
+        $splitTrxs = Transaction::where('order_number', $subOrderNumber)->get();
+        foreach ($splitTrxs as $st) {
+            AccountingService::postTransaction($st);
+        }
 
         $remainingTotal = max(0, $tableTotal - ($splitAmount * $newPaidSplitsCount));
 
@@ -3097,6 +3731,7 @@ class TransactionController extends Controller
     {
         DB::transaction(function () use ($transaction) {
             $transaction->stockMovements()->delete();
+            AccountingService::postTransaction($transaction);
             $transaction->delete();
         });
 

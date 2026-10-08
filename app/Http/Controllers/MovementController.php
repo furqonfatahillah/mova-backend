@@ -13,6 +13,7 @@ use App\Models\PayablePayment;
 use App\Models\Supplier;
 use App\Models\UrgentNote;
 use App\Models\WasteLog;
+use App\Services\AccountingService;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -107,32 +108,34 @@ class MovementController extends Controller
     public function store(Request $request)
     {
         $data = $request->validate([
-            'date'           => 'required|date',
-            'ingredient_id'  => 'required|exists:ingredients,id',
-            'type'           => 'required|in:PURCHASE,WASTE,ADJUSTMENT_IN,ADJUSTMENT_OUT,TRANSFER_IN,TRANSFER_OUT,PREP_USAGE,PREP_OUTPUT',
-            'waste_reason'   => 'nullable|string|max:50',
-            'qty'            => 'required|numeric|min:0.001',
-            'unit_price'     => 'nullable|numeric|min:0',
-            'total_price'    => 'nullable|numeric|min:0',
-            'unit_type'      => 'nullable|in:BELI,PAKAI',
-            'note'           => 'nullable|string|max:255',
-            'outlet_id'      => 'nullable|exists:outlets,id',
+            'date'              => 'required|date',
+            'ingredient_id'     => 'required|exists:ingredients,id',
+            'type'              => 'required|in:PURCHASE,WASTE,ADJUSTMENT_IN,ADJUSTMENT_OUT,TRANSFER_IN,TRANSFER_OUT,PREP_USAGE,PREP_OUTPUT',
+            'waste_reason'      => 'nullable|string|max:50',
+            'qty'               => 'required|numeric|min:0.001',
+            'unit_price'        => 'nullable|numeric|min:0',
+            'total_price'       => 'nullable|numeric|min:0',
+            'unit_type'         => 'nullable|in:BELI,PAKAI',
+            'note'              => 'nullable|string|max:255',
+            'outlet_id'         => 'nullable|exists:outlets,id',
+            'negative_handling' => 'nullable|string|in:RESET_TO_ZERO,OFFSET_NEGATIVE,BARANG_BARU,LUPA_TERINPUT',
             // Payment / Hutang fields
-            'payment_type'   => 'nullable|string|max:50',
-            'supplier_name'  => 'nullable|string|max:150',
-            'supplier_phone' => 'nullable|string|max:50',
-            'supplier_id'    => 'nullable|integer',
-            'purchase_no'    => 'nullable|string|max:100',
-            'due_date'       => 'nullable|date',
-            'initial_paid'   => 'nullable|numeric|min:0',
-            'payment_method' => 'nullable|string|max:50',
+            'payment_type'      => 'nullable|string|max:50',
+            'supplier_name'     => 'nullable|string|max:150',
+            'supplier_phone'    => 'nullable|string|max:50',
+            'supplier_id'       => 'nullable|integer',
+            'purchase_no'       => 'nullable|string|max:100',
+            'due_date'          => 'nullable|date',
+            'initial_paid'      => 'nullable|numeric|min:0',
+            'payment_method'    => 'nullable|string|max:50',
         ]);
 
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         } else {
-            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
+            $outletId = (int)($data['outlet_id'] ?? $user?->outlet_id ?? Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->value('id'));
         }
         $ingredient = Ingredient::findOrFail($data['ingredient_id']);
         $konversi = max((float)$ingredient->konversi, 1);
@@ -163,16 +166,7 @@ class MovementController extends Controller
 
         if ($data['type'] === 'PURCHASE') {
             $currentStock = $ingredient->stockForOutlet($outletId);
-            if ($currentStock < -0.0001) {
-                return response()->json([
-                    'message' => "Stok bahan baku '{$ingredient->name}' di cabang ini saat ini berstatus MINUS (" . round($currentStock, 3) . " {$ingredient->unit_pakai}). Anda harus melakukan Penyesuaian Stok (Adjust Stock / Opname) terlebih dahulu untuk menormalkan saldo minus sebelum mencatat transaksi pembelian baru.",
-                    'error_code' => 'STOCK_NEGATIVE_ADJUSTMENT_REQUIRED',
-                    'ingredient_id' => $ingredient->id,
-                    'ingredient_name' => $ingredient->name,
-                    'current_stock' => $currentStock,
-                    'unit' => $ingredient->unit_pakai,
-                ], 422);
-            }
+            $negHandling = strtoupper(trim($request->negative_handling ?? 'RESET_TO_ZERO'));
 
             // Determine price per unit pakai and per unit beli
             if ($request->filled('unit_price') && (float)$request->unit_price > 0) {
@@ -187,6 +181,26 @@ class MovementController extends Controller
             } else {
                 $pricePerBeli  = $ingredient->hargaForOutlet($outletId);
                 $pricePerPakai = $pricePerBeli / $konversi;
+            }
+
+            // Kategori: Pembelian / Transfer Masuk (Barang Baru) -> Reset stok minus ke 0 via penyesuaian di kartu stok
+            if ($currentStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                $minusQty = abs((float)$currentStock);
+                StockMovement::create([
+                    'business_id'    => $user?->business_id,
+                    'outlet_id'      => $outletId,
+                    'ingredient_id'  => $ingredient->id,
+                    'date'           => $data['date'],
+                    'type'           => 'ADJUSTMENT_IN',
+                    'qty'            => $minusQty,
+                    'unit_price'     => $pricePerBeli,
+                    'total_price'    => 0,
+                    'cost_before'    => $costBefore,
+                    'cost_after'     => $costBefore,
+                    'note'           => "Reset Stok Minus (Barang Baru Masuk) – Normalisasi ke 0 sebelum Pembelian" . (!empty($data['purchase_no']) ? " #{$data['purchase_no']}" : ""),
+                    'user_id'        => $user?->id,
+                    'created_by'     => $user?->id,
+                ]);
             }
 
             $unitPrice  = $pricePerBeli;
@@ -281,6 +295,11 @@ class MovementController extends Controller
             $payable->update(['stock_movement_id' => $movement->id]);
         }
 
+        // Auto-post double-entry journal for purchase
+        if (in_array($movement->type, ['PURCHASE', 'RESTOCK', 'IN']) && (float)$movement->total_price > 0) {
+            AccountingService::postStockMovementPurchase($movement);
+        }
+
         $movement->load(['ingredient', 'user', 'creator', 'updater', 'outlet', 'payable']);
         return response()->json($movement, 201);
     }
@@ -294,6 +313,7 @@ class MovementController extends Controller
             'date'                  => 'required|date',
             'outlet_id'             => 'nullable|exists:outlets,id',
             'type'                  => 'required|in:PURCHASE,WASTE,ADJUSTMENT_IN,ADJUSTMENT_OUT,TRANSFER_IN,TRANSFER_OUT,PREP_USAGE,PREP_OUTPUT',
+            'negative_handling'     => 'nullable|string|in:RESET_TO_ZERO,OFFSET_NEGATIVE,BARANG_BARU,LUPA_TERINPUT',
             'payment_type'          => 'nullable|string|max:50', // CASH, BANK, TRANSFER, QRIS, HUTANG
             'supplier_name'         => 'nullable|string|max:150',
             'supplier_phone'        => 'nullable|string|max:50',
@@ -311,6 +331,7 @@ class MovementController extends Controller
             'items.*.total_price'   => 'nullable|numeric|min:0',
             'items.*.waste_reason'  => 'nullable|string|max:50',
             'items.*.note'          => 'nullable|string|max:255',
+            'items.*.negative_handling' => 'nullable|string|in:RESET_TO_ZERO,OFFSET_NEGATIVE,BARANG_BARU,LUPA_TERINPUT',
         ]);
 
         $user = $request->user();
@@ -334,26 +355,6 @@ class MovementController extends Controller
             $paymentType = $isHutang ? 'HUTANG' : (in_array($rawPaymentType, ['BANK', 'TRANSFER', 'QRIS']) ? $rawPaymentType : 'CASH');
         }
 
-        if ($validated['type'] === 'PURCHASE') {
-            $negativeItems = [];
-            foreach ($validated['items'] as $item) {
-                $ing = Ingredient::find($item['ingredient_id']);
-                if ($ing) {
-                    $cStock = $ing->stockForOutlet($outletId);
-                    if ($cStock < -0.0001) {
-                        $negativeItems[] = "{$ing->name} (Stok: " . round($cStock, 3) . " {$ing->unit_pakai})";
-                    }
-                }
-            }
-            if (!empty($negativeItems)) {
-                return response()->json([
-                    'message' => "Terdapat bahan baku dengan stok MINUS: " . implode(', ', $negativeItems) . ". Anda harus melakukan Penyesuaian Stok (Adjust Stock / Opname) terlebih dahulu kepada bahan tersebut sebelum mencatat transaksi pembelian baru.",
-                    'error_code' => 'STOCK_NEGATIVE_ADJUSTMENT_REQUIRED',
-                    'negative_items' => $negativeItems,
-                ], 422);
-            }
-        }
-
         $result = DB::transaction(function () use ($validated, $user, $outletId, $businessId, $isHutang, $paymentType) {
             $itemsData = [];
             $grandTotal = 0.0;
@@ -373,6 +374,9 @@ class MovementController extends Controller
                 $totalPrice = round(($qtyPakai / $konversi) * $sourcePricePerBeli, 2);
 
                 if ($validated['type'] === 'PURCHASE') {
+                    $cStock = $ingredient->stockForOutlet($outletId);
+                    $negHandling = strtoupper(trim($item['negative_handling'] ?? ($validated['negative_handling'] ?? 'RESET_TO_ZERO')));
+
                     if (isset($item['unit_price']) && (float)$item['unit_price'] > 0) {
                         $inputPrice = (float)$item['unit_price'];
                         $pricePerPakai = $isUnitBeli ? ($inputPrice / $konversi) : $inputPrice;
@@ -385,6 +389,26 @@ class MovementController extends Controller
                     } else {
                         $pricePerBeli  = $ingredient->hargaForOutlet($outletId);
                         $pricePerPakai = $pricePerBeli / $konversi;
+                    }
+
+                    // Kategori: Pembelian / Transfer Masuk (Barang Baru) -> Reset saldo minus ke 0 via penyesuaian di kartu stok
+                    if ($cStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                        $minusQty = abs((float)$cStock);
+                        StockMovement::create([
+                            'business_id'    => $businessId,
+                            'outlet_id'      => $outletId,
+                            'ingredient_id'  => $ingredient->id,
+                            'date'           => $validated['date'],
+                            'type'           => 'ADJUSTMENT_IN',
+                            'qty'            => $minusQty,
+                            'unit_price'     => $pricePerBeli,
+                            'total_price'    => 0,
+                            'cost_before'    => $costBefore,
+                            'cost_after'     => $costBefore,
+                            'note'           => "Reset Stok Minus (Barang Baru Masuk) – Normalisasi ke 0 sebelum Pembelian" . (!empty($validated['purchase_no']) ? " #{$validated['purchase_no']}" : ""),
+                            'user_id'        => $user?->id,
+                            'created_by'     => $user?->id,
+                        ]);
                     }
 
                     $unitPrice = $pricePerBeli;
@@ -502,6 +526,13 @@ class MovementController extends Controller
                 $payable->update(['stock_movement_id' => $movements[0]->id]);
             }
 
+            // Auto-post double-entry journal for purchases
+            foreach ($movements as $m) {
+                if (in_array($m->type, ['PURCHASE', 'RESTOCK', 'IN']) && (float)$m->total_price > 0) {
+                    AccountingService::postStockMovementPurchase($m);
+                }
+            }
+
             return [
                 'movements'    => $movements,
                 'payable'      => $payable,
@@ -520,49 +551,84 @@ class MovementController extends Controller
     }
 
     /**
-     * Generate Stock Card Summary list for all ingredients in an outlet within a date range
+     * Generate Stock Card Summary list for all ingredients in an outlet or consolidated business within a date range
      */
     public function stockCardSummary(Request $request)
     {
         $request->validate([
             'from'      => 'required|date',
             'to'        => 'required|date|after_or_equal:from',
-            'outlet_id' => 'nullable|exists:outlets,id',
+            'outlet_id' => 'nullable',
         ]);
 
         $from     = $request->from;
         $to       = $request->to;
         $user     = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
+        $outletId = null;
+        $outlet = null;
+        $isConsolidated = false;
+
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
+            $outlet = \App\Models\Outlet::find($outletId);
         } else {
-            $outletId = $request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id ?? 1);
+            $rawOutletId = $request->outlet_id;
+            if ($rawOutletId === 'ALL' || $rawOutletId === 'all' || empty($rawOutletId)) {
+                $isConsolidated = true;
+                $outletId = null;
+            } else {
+                $outletId = (int)$rawOutletId;
+                $outlet = \App\Models\Outlet::find($outletId);
+                if (!$outlet) {
+                    $isConsolidated = true;
+                    $outletId = null;
+                }
+            }
         }
 
-        $outlet = \App\Models\Outlet::findOrFail($outletId);
-
         // Fetch all ingredients of the current business
-        $ingredients = Ingredient::with(['outletIngredients' => function($q) use ($outletId) {
-            $q->where('outlet_id', $outletId);
-        }])->get();
+        $ingQuery = Ingredient::query();
+        if ($businessId) {
+            $ingQuery->where('business_id', $businessId);
+        }
+        if ($outletId) {
+            $ingQuery->with(['outletIngredients' => function($q) use ($outletId) {
+                $q->where('outlet_id', $outletId);
+            }]);
+        } else {
+            $ingQuery->with(['outletIngredients']);
+        }
+        $ingredients = $ingQuery->get();
 
         $ingIds = $ingredients->pluck('id')->all();
 
-        // 1. Group movements strictly before $from for this outlet
-        $priorMovements = StockMovement::whereIn('ingredient_id', $ingIds)
-            ->where('outlet_id', $outletId)
+        // 1. Group movements strictly before $from
+        $priorQuery = StockMovement::whereIn('ingredient_id', $ingIds)
             ->where('type', '!=', 'INITIAL')
-            ->where('date', '<', $from)
+            ->where('date', '<', $from);
+        if ($outletId) {
+            $priorQuery->where('outlet_id', $outletId);
+        } elseif ($businessId) {
+            $priorQuery->where('business_id', $businessId);
+        }
+        $priorMovements = $priorQuery
             ->selectRaw("ingredient_id, SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as prior_sum")
             ->groupBy('ingredient_id')
             ->pluck('prior_sum', 'ingredient_id')
             ->all();
 
-        // 2. Group movements between $from and $to for this outlet
-        $periodMovements = StockMovement::whereIn('ingredient_id', $ingIds)
-            ->where('outlet_id', $outletId)
+        // 2. Group movements between $from and $to
+        $periodQuery = StockMovement::whereIn('ingredient_id', $ingIds)
             ->where('type', '!=', 'INITIAL')
-            ->whereBetween('date', [$from, $to])
+            ->whereBetween('date', [$from, $to]);
+        if ($outletId) {
+            $periodQuery->where('outlet_id', $outletId);
+        } elseif ($businessId) {
+            $periodQuery->where('business_id', $businessId);
+        }
+        $periodMovements = $periodQuery
             ->selectRaw("
                 ingredient_id,
                 SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE 0 END) as total_masuk,
@@ -575,8 +641,11 @@ class MovementController extends Controller
             ->get()
             ->keyBy('ingredient_id');
 
-        // Fetch urgent note summaries for this outlet to detect pending and resolved stock deficits
-        $urgentQuery = UrgentNote::where('business_id', $outlet->business_id ?: 1);
+        // Fetch urgent note summaries
+        $urgentQuery = UrgentNote::query();
+        if ($businessId) {
+            $urgentQuery->where('business_id', $businessId);
+        }
         if ($outletId) {
             $urgentQuery->where('outlet_id', $outletId);
         }
@@ -592,11 +661,15 @@ class MovementController extends Controller
             ->all();
 
         // Calculate global period movement metrics (HPP, Transfers, Purchases, Waste)
-        $periodMovementsRaw = StockMovement::whereIn('ingredient_id', $ingIds)
-            ->where('outlet_id', $outletId)
+        $rawQuery = StockMovement::whereIn('ingredient_id', $ingIds)
             ->where('type', '!=', 'INITIAL')
-            ->whereBetween('date', [$from, $to])
-            ->get(['id', 'ingredient_id', 'type', 'qty', 'unit_price', 'total_price', 'cost_before', 'cost_after']);
+            ->whereBetween('date', [$from, $to]);
+        if ($outletId) {
+            $rawQuery->where('outlet_id', $outletId);
+        } elseif ($businessId) {
+            $rawQuery->where('business_id', $businessId);
+        }
+        $periodMovementsRaw = $rawQuery->get(['id', 'ingredient_id', 'outlet_id', 'type', 'qty', 'unit_price', 'total_price', 'cost_before', 'cost_after']);
 
         $ingLookup = $ingredients->keyBy('id');
         $totalHppRp = 0.0;
@@ -619,7 +692,8 @@ class MovementController extends Controller
         foreach ($periodMovementsRaw as $m) {
             $ing = $ingLookup->get($m->ingredient_id);
             $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
-            $hargaBeliOutlet = $ing ? (float)$ing->hargaForOutlet($outletId) : 0;
+            $targetOutId = $outletId ?: $m->outlet_id;
+            $hargaBeliOutlet = $ing ? (float)$ing->hargaForOutlet($targetOutId) : 0;
             $costPerPakai = $hargaBeliOutlet / $konversi;
             $qty = (float)$m->qty;
             $unitPriceMov = (float)($m->unit_price > 0 ? ($m->unit_price > 1000 && $konversi > 1 ? $m->unit_price / $konversi : $m->unit_price) : ($m->cost_after > 0 ? $m->cost_after : ($m->cost_before > 0 ? $m->cost_before : $costPerPakai)));
@@ -653,6 +727,7 @@ class MovementController extends Controller
         // Include any menu waste logs or direct waste logs not linked to a movement
         $menuWasteLogs = WasteLog::whereBetween('date', [$from, $to])
             ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->when(!$outletId && $businessId, fn($q) => $q->where('business_id', $businessId))
             ->whereNull('stock_movement_id')
             ->get();
 
@@ -670,23 +745,35 @@ class MovementController extends Controller
         $totalEmptyStock = 0;
         $totalLowStock = 0;
 
-        $isHoldingOutlet = (bool)$outlet->is_main || ((int)$outletId === 1);
+        $isHoldingOutlet = $outlet ? ((bool)$outlet->is_main || ((int)$outletId === 1)) : false;
 
         foreach ($ingredients as $ing) {
-            $outletRow = $ing->outletIngredients->first();
-            $stokAwalMaster = 0.0;
-            $saldoAwalNominalMaster = 0.0;
-            if ($outletRow && (float)$outletRow->stok_awal > 0) {
-                $stokAwalMaster = (float)$outletRow->stok_awal;
-                $saldoAwalNominalMaster = (float)($outletRow->saldo_awal_nominal ?? 0);
-            } elseif ($isHoldingOutlet) {
-                $stokAwalMaster = (float)$ing->stok_awal;
-                $saldoAwalNominalMaster = (float)($ing->saldo_awal_nominal ?? 0);
+            if ($isConsolidated) {
+                // Consolidated: sum all initial stocks across branch setups
+                $sumInit = (float)$ing->outletIngredients->sum('stok_awal');
+                $stokAwalMaster = $sumInit > 0 ? $sumInit : (float)$ing->stok_awal;
+                $sumNominal = (float)$ing->outletIngredients->sum('saldo_awal_nominal');
+                $saldoAwalNominalMaster = $sumNominal > 0 ? $sumNominal : (float)($ing->saldo_awal_nominal ?? 0);
+                $stokMinOutlet = (float)$ing->stok_min;
+                $hargaBeliOutlet = (float)$ing->harga;
+                $tanggalSaldoAwalItem = $ing->outletIngredients->firstWhere('tanggal_saldo_awal', '!=', null)?->tanggal_saldo_awal ?? $ing->tanggal_saldo_awal;
+            } else {
+                $outletRow = $ing->outletIngredients->first();
+                $stokAwalMaster = 0.0;
+                $saldoAwalNominalMaster = 0.0;
+                if ($outletRow && (float)$outletRow->stok_awal > 0) {
+                    $stokAwalMaster = (float)$outletRow->stok_awal;
+                    $saldoAwalNominalMaster = (float)($outletRow->saldo_awal_nominal ?? 0);
+                } elseif ($isHoldingOutlet) {
+                    $stokAwalMaster = (float)$ing->stok_awal;
+                    $saldoAwalNominalMaster = (float)($ing->saldo_awal_nominal ?? 0);
+                }
+                $stokMinOutlet  = $outletRow && $outletRow->stok_min !== null ? (float) $outletRow->stok_min : (float) $ing->stok_min;
+                $hargaBeliOutlet = $ing->hargaForOutlet($outletId);
+                $tanggalSaldoAwalItem = $outletRow?->tanggal_saldo_awal ?? $ing->tanggal_saldo_awal;
             }
-            $stokMinOutlet  = $outletRow && $outletRow->stok_min !== null ? (float) $outletRow->stok_min : (float) $ing->stok_min;
 
-            $hargaBeliOutlet = $ing->hargaForOutlet($outletId);
-            $hargaPerPakai = $hargaBeliOutlet / max($ing->konversi, 1);
+            $hargaPerPakai = $hargaBeliOutlet / max((float)$ing->konversi, 1);
 
             if ($saldoAwalNominalMaster <= 0 && $stokAwalMaster > 0) {
                 $saldoAwalNominalMaster = round($stokAwalMaster * $hargaPerPakai, 2);
@@ -750,9 +837,6 @@ class MovementController extends Controller
                 $totalLowStock++;
             }
 
-            $outletRow = $ing->outletIngredients->first();
-            $tanggalSaldoAwalItem = $outletRow?->tanggal_saldo_awal ?? $ing->tanggal_saldo_awal;
-
             $items[] = [
                 'id'                     => $ing->id,
                 'code'                   => $ing->code,
@@ -791,10 +875,16 @@ class MovementController extends Controller
         }
 
         return response()->json([
-            'outlet' => [
+            'outlet' => $outlet ? [
                 'id'      => $outlet->id,
                 'name'    => $outlet->name,
                 'is_main' => (bool)$outlet->is_main,
+                'is_all'  => false,
+            ] : [
+                'id'      => 'ALL',
+                'name'    => 'Semua Cabang (Konsolidasi Usaha)',
+                'is_main' => false,
+                'is_all'  => true,
             ],
             'period' => [
                 'from' => $from,
@@ -838,7 +928,7 @@ class MovementController extends Controller
             'ingredient_id' => 'required|exists:ingredients,id',
             'from'          => 'required|date',
             'to'            => 'required|date|after_or_equal:from',
-            'outlet_id'     => 'nullable|exists:outlets,id',
+            'outlet_id'     => 'nullable',
         ]);
 
         $ingId    = (int) $request->ingredient_id;
@@ -848,7 +938,8 @@ class MovementController extends Controller
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         } else {
-            $outletId = $request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id);
+            $rawOut = $request->outlet_id;
+            $outletId = ($rawOut && $rawOut !== 'ALL' && $rawOut !== 'all') ? (int)$rawOut : null;
         }
 
         $ingredient = Ingredient::with(['creator', 'updater', 'outletIngredients.outlet'])->findOrFail($ingId);
@@ -911,6 +1002,7 @@ class MovementController extends Controller
             ->where('date', '<', $from)
             ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
             ->orderBy('date', 'asc')
+            ->orderBy('created_at', 'asc')
             ->orderBy('id', 'asc')
             ->get();
 
@@ -959,6 +1051,7 @@ class MovementController extends Controller
         }
 
         $movements = $movQuery->orderBy('date', 'asc')
+            ->orderBy('created_at', 'asc')
             ->orderBy('id', 'asc')
             ->get();
 
@@ -1357,6 +1450,19 @@ class MovementController extends Controller
                 $importedCount++;
             }
         });
+
+        if ($businessId && $importedCount > 0) {
+            try {
+                $biz = \App\Models\Business::find($businessId);
+                if ($biz) {
+                    AccountingService::postInitialBalance($biz);
+                }
+            } catch (\Throwable $accEx) {
+                try {
+                    \Illuminate\Support\Facades\Log::error("postInitialBalance after import error: " . $accEx->getMessage());
+                } catch (\Throwable $lEx) {}
+            }
+        }
         } catch (\Throwable $e) {
             try {
                 \Illuminate\Support\Facades\Log::error("bulkImportInitial error: " . $e->getMessage());

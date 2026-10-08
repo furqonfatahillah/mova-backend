@@ -436,6 +436,7 @@ class Ingredient extends Model
             ->where('outlet_id', $outletId)
             ->where('type', '!=', 'INITIAL')
             ->orderBy('date', 'asc')
+            ->orderBy('created_at', 'asc')
             ->orderBy('id', 'asc')
             ->get();
 

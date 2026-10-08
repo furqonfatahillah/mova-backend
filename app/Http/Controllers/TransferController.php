@@ -13,6 +13,8 @@ use App\Models\WasteLog;
 use App\Models\Payable;
 use App\Models\PayablePayment;
 use App\Models\Supplier;
+use App\Models\JournalEntry;
+use App\Services\AccountingService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -489,10 +491,35 @@ class TransferController extends Controller
 
                     // 2. Mutasi TRANSFER_IN ke outlet tujuan (hanya jika langsung status COMPLETED)
                     if ($initialStatus === 'COMPLETED' && $destOutlet) {
+                        $destStock = $ingredient->stockForOutlet($destOutlet->id);
+                        $negHandling = strtoupper(trim($validated['negative_handling'] ?? 'RESET_TO_ZERO'));
+
+                        // Kategori: Transfer Masuk (Barang Baru) -> Reset minus ke 0 via penyesuaian di kartu stok
+                        if ($destStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                            $minusQty = abs((float)$destStock);
+                            StockMovement::create([
+                                'business_id'   => $transfer->business_id,
+                                'date'          => $date,
+                                'ingredient_id' => $ingredient->id,
+                                'outlet_id'     => $destOutlet->id,
+                                'type'          => 'ADJUSTMENT_IN',
+                                'qty'           => $minusQty,
+                                'unit_price'    => $sourcePricePerBeli,
+                                'total_price'   => 0,
+                                'cost_before'   => $ingredient->costPerPakaiForOutlet($destOutlet->id),
+                                'cost_after'    => $ingredient->costPerPakaiForOutlet($destOutlet->id),
+                                'note'          => "Reset Stok Minus (Transfer Masuk Barang Baru) – Normalisasi ke 0 ({$transferNo})",
+                                'transfer_id'   => $transfer->id,
+                                'user_id'       => $userId,
+                                'created_by'    => $userId,
+                            ]);
+                        }
+
                         // Cabang penerima menyerap stok masuk dengan harga transfer dari cabang asal
                         $destAvg = $ingredient->recalculateMovingAverage($baseQty, $sourcePricePerPakai, $destOutlet->id);
 
                         StockMovement::create([
+                            'business_id'   => $transfer->business_id,
                             'date'          => $date,
                             'ingredient_id' => $ingredient->id,
                             'type'          => 'TRANSFER_IN',
@@ -590,6 +617,9 @@ class TransferController extends Controller
             'payable',
             'stockMovements'
         ]);
+
+        // Auto-post double-entry journal ledger
+        AccountingService::postTransfer($transfer);
 
         return response()->json($transfer, 201);
     }
@@ -746,6 +776,30 @@ class TransferController extends Controller
                             $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
                             $itemTotalPrice = round(($receivedBaseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
 
+                            $destStock = $ingredient->stockForOutlet($destOutlet->id);
+                            $negHandling = strtoupper(trim($validated['negative_handling'] ?? 'RESET_TO_ZERO'));
+
+                            // Kategori: Transfer Masuk (Barang Baru) -> Reset minus ke 0 via penyesuaian di kartu stok
+                            if ($destStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                                $minusQty = abs((float)$destStock);
+                                StockMovement::create([
+                                    'business_id'   => $transfer->business_id,
+                                    'date'          => $receiveDate,
+                                    'ingredient_id' => $ingredient->id,
+                                    'outlet_id'     => $destOutlet->id,
+                                    'type'          => 'ADJUSTMENT_IN',
+                                    'qty'           => $minusQty,
+                                    'unit_price'    => $sourcePricePerBeli,
+                                    'total_price'   => 0,
+                                    'cost_before'   => $ingredient->costPerPakaiForOutlet($destOutlet->id),
+                                    'cost_after'    => $ingredient->costPerPakaiForOutlet($destOutlet->id),
+                                    'note'          => "Reset Stok Minus (Transfer Masuk Barang Baru) – Normalisasi ke 0 ({$transfer->transfer_no})",
+                                    'transfer_id'   => $transfer->id,
+                                    'user_id'       => $userId,
+                                    'created_by'    => $userId,
+                                ]);
+                            }
+
                             // Cabang tujuan menyerap stok transfer ke moving average mandiri miliknya
                             $destAvg = $ingredient->recalculateMovingAverage($receivedBaseQty, $sourcePricePerPakai, $destOutlet->id);
 
@@ -756,6 +810,7 @@ class TransferController extends Controller
                                 : "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})";
 
                             StockMovement::create([
+                                'business_id'   => $transfer->business_id,
                                 'date'          => $receiveDate,
                                 'ingredient_id' => $ingredient->id,
                                 'type'          => $movementType,
@@ -812,6 +867,9 @@ class TransferController extends Controller
             'returnRejecter',
             'stockMovements'
         ]);
+
+        // Auto-post double-entry journal ledger
+        AccountingService::postTransfer($transfer);
 
         $message = ($totalReturned > 0)
             ? "Penerimaan dicatat. Pengajuan retur {$totalReturned} unit telah dikirim dan MENUNGGU PERSETUJUAN (APPROVAL) dari cabang pengirim ({$sourceName})."
@@ -891,6 +949,9 @@ class TransferController extends Controller
                 'updated_by'    => $request->user()?->id,
             ]);
         });
+
+        // Auto-post double-entry journal ledger
+        AccountingService::postTransfer($transfer);
 
         $transfer->load([
             'sourceOutlet',
@@ -1196,6 +1257,9 @@ class TransferController extends Controller
             ]);
         });
 
+        // Auto-post double-entry journal ledger
+        AccountingService::postTransfer($transfer);
+
         $transfer->load([
             'sourceOutlet',
             'destinationOutlet',
@@ -1324,6 +1388,10 @@ class TransferController extends Controller
         }
 
         DB::transaction(function () use ($transfer) {
+            JournalEntry::where('reference_type', 'TRANSFER')
+                ->where('reference_id', $transfer->id)
+                ->delete();
+
             // 1. Rollback & Hapus Hutang Supplier (jika ada)
             if ($transfer->payable_id) {
                 PayablePayment::where('payable_id', $transfer->payable_id)->delete();

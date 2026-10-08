@@ -43,7 +43,7 @@ class UserController extends Controller
             $excludedRoles = ['owner_bisnis', 'owner_website', 'superadmin_platform', 'superadmin', 'owner', 'admin'];
             $query->where('business_id', $currentUser->business_id)
                   ->whereNotIn('role', $excludedRoles);
-            if ($request->outlet_id) {
+            if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
                 $query->where('outlet_id', $request->outlet_id);
             }
             $baseCount = User::where('business_id', $currentUser->business_id)

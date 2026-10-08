@@ -11,6 +11,11 @@ use App\Models\Receivable;
 use App\Models\ReceivablePayment;
 use App\Models\Payable;
 use App\Models\PayablePayment;
+use App\Models\JournalEntry;
+use App\Models\JournalLine;
+use App\Models\Account;
+use App\Models\Shift;
+use App\Services\AccountingService;
 use App\Http\Controllers\ReportController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -99,7 +104,9 @@ class CashFlowController extends Controller
             if ($prevClosed && $prevClosed->closing_cash !== null) {
                 $prevClosing = (float)$prevClosed->closing_cash;
                 $prevName = $prevClosed->shift_name;
-                $diffAntar = round((float)$cs->initial_cash - $prevClosing, 2);
+                $prevDeposit = (float)($prevClosed->deposit_amount ?? 0);
+                $expectedHandover = max(0, $prevClosing - $prevDeposit);
+                $diffAntar = round((float)$cs->initial_cash - $expectedHandover, 2);
             }
             $interShiftDiffMap[$cs->id] = [
                 'inter_shift_diff'    => $diffAntar,
@@ -125,7 +132,39 @@ class CashFlowController extends Controller
             ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
             ->orderBy('opened_at', 'desc');
 
-        $availableShifts = $availableShiftsQuery->get()->map(function($s) use ($interShiftDiffMap) {
+        $rawAvailableShifts = $availableShiftsQuery->get();
+        $shiftIds = $rawAvailableShifts->pluck('id')->filter()->all();
+
+        $depositTransactions = \App\Models\CashTransaction::where(function ($q) use ($shiftIds) {
+            $q->whereIn('shift_id', $shiftIds)
+              ->orWhere(function ($sub) use ($shiftIds) {
+                  $sub->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
+                      ->where(function ($inner) use ($shiftIds) {
+                          foreach ($shiftIds as $sId) {
+                              $inner->orWhere('name', 'like', "%Shift #{$sId}%")
+                                    ->orWhere('notes', 'like', "%Shift #{$sId}%");
+                          }
+                      });
+              });
+        })->get();
+
+        $depositsByShift = [];
+        foreach ($depositTransactions as $dtx) {
+            $sId = $dtx->shift_id;
+            if (!$sId) {
+                if (preg_match('/Shift #(\d+)/i', ($dtx->name ?? '') . ' ' . ($dtx->notes ?? ''), $m)) {
+                    $sId = (int)$m[1];
+                }
+            }
+            if ($sId) {
+                if (!isset($depositsByShift[$sId])) {
+                    $depositsByShift[$sId] = collect();
+                }
+                $depositsByShift[$sId]->push($dtx);
+            }
+        }
+
+        $availableShifts = $rawAvailableShifts->map(function($s) use ($interShiftDiffMap, $depositsByShift) {
             $discrepancy = $s->cash_difference !== null 
                 ? (float)$s->cash_difference 
                 : ($s->closing_cash !== null && $s->system_cash !== null ? round((float)$s->closing_cash - (float)$s->system_cash, 2) : 0);
@@ -141,23 +180,42 @@ class CashFlowController extends Controller
                 ? round((float)$s->closing_cash - (float)$s->cash_difference, 2)
                 : ((float)$s->initial_cash + $sysSalesRaw);
 
+            // Deposit data
+            $sDepositTxs = $depositsByShift[$s->id] ?? collect();
+            $lastDepositTx = $sDepositTxs->last();
+            $depositStatus = $s->deposit_status ?: ($lastDepositTx ? ($lastDepositTx->status ?: 'APPROVED') : 'NONE');
+            $depositAmount = $s->deposit_amount !== null ? (float)$s->deposit_amount : (float)$sDepositTxs->sum('amount');
+            $depositDiff = ($s->status === 'CLOSED' && $depositAmount > 0 && $s->closing_cash !== null)
+                ? round($depositAmount - (float)$s->closing_cash, 2)
+                : 0.0;
+
             return [
-                'id'                 => $s->id,
-                'shift_name'         => $s->shift_name,
-                'opened_at'          => $s->opened_at,
-                'closed_at'          => $s->closed_at,
-                'status'             => $s->status,
-                'cashier_name'       => $s->user?->name ?: 'Kasir',
-                'initial_cash'       => (float)$s->initial_cash,
-                'closing_cash'       => (float)$s->closing_cash,
-                'system_cash'        => (float)$expectedCash,
-                'system_sales'       => $sysSalesRaw,
-                'cash_difference'    => $discrepancy,
-                'inter_shift_diff'   => $interData['inter_shift_diff'],
-                'prev_shift_name'    => $interData['prev_shift_name'],
-                'prev_closing_cash'  => $interData['prev_closing_cash'],
-                'notes'              => $s->notes,
-                'date'               => $s->opened_at ? substr($s->opened_at, 0, 10) : null,
+                'id'                     => $s->id,
+                'shift_name'             => $s->shift_name,
+                'opened_at'              => $s->opened_at,
+                'closed_at'              => $s->closed_at,
+                'status'                 => $s->status,
+                'cashier_name'           => $s->user?->name ?: 'Kasir',
+                'initial_cash'           => (float)$s->initial_cash,
+                'closing_cash'           => (float)$s->closing_cash,
+                'system_cash'            => (float)$expectedCash,
+                'system_sales'           => $sysSalesRaw,
+                'cash_difference'        => $discrepancy,
+                'inter_shift_diff'       => $interData['inter_shift_diff'],
+                'prev_shift_name'        => $interData['prev_shift_name'],
+                'prev_closing_cash'      => $interData['prev_closing_cash'],
+                'deposit_status'         => $depositStatus,
+                'deposit_amount'         => $depositAmount,
+                'is_deposited'           => $depositStatus === 'APPROVED' && $depositAmount > 0,
+                'is_deposit_pending'     => $depositStatus === 'PENDING',
+                'is_deposit_rejected'    => $depositStatus === 'REJECTED',
+                'deposit_account'        => $s->deposit_account ?: ($lastDepositTx?->account ?? ($depositAmount > 0 ? 'KAS_BESAR' : null)),
+                'deposit_account_label'  => $s->deposit_account_label ?: ($lastDepositTx?->account === 'BANK_MAIN' ? 'Rekening Bank Utama' : ($depositAmount > 0 ? 'Kas Besar / Brankas' : null)),
+                'deposit_diff'           => $depositDiff,
+                'deposit_notes'          => $s->deposit_notes ?: $lastDepositTx?->notes,
+                'deposit_transaction_no' => $lastDepositTx?->transaction_no,
+                'notes'                  => $s->notes,
+                'date'                   => $s->opened_at ? substr($s->opened_at, 0, 10) : null,
             ];
         })->values();
 
@@ -244,321 +302,415 @@ class CashFlowController extends Controller
         };
 
         // Helper closures for shift filtering
-        $applyShiftFilter = function($query, $column = 'shift_id') use ($shiftFilterIds, $isShiftFiltered) {
-            if (!$isShiftFiltered) return;
-            $query->whereIn($column, $shiftFilterIds);
-        };
-
-        // =========================================================================
-        // 1. ARUS KAS DARI AKTIVITAS OPERASI (OPERATING CASH FLOW / OCF)
-        // =========================================================================
-        
-        // A. Penerimaan Kas dari Penjualan Kasir Langsung (Direct Cash/Instant Sales Inflows)
-        $trxQuery = Transaction::where('status', 'PAID')
-            ->whereBetween('date', [$from, $to])
-            ->select(['payment_method', 'total_price', 'shift_id']);
-        if ($outletId) {
-            $trxQuery->where('outlet_id', $outletId);
+        // Auto-seed COA & auto-sync if journal lines/entries are empty
+        $businessId = $user ? $user->business_id : null;
+        if ($businessId) {
+            Account::seedForBusiness($businessId);
+            $hasJournalLines = JournalLine::whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId))->exists();
+            if (!$hasJournalLines) {
+                AccountingService::syncAllHistoricalData($businessId);
+            }
         }
-        $applyPmFilter($trxQuery, 'payment_method');
-        $applyShiftFilter($trxQuery, 'shift_id');
-        $transactions = $trxQuery->get();
 
+        // =========================================================================
+        // 1. QUERY CASH & BANK ACCOUNTS (Akun Kas & Setara Kas: 1-11xxx / CASH & BANK)
+        // =========================================================================
+        $selectedAccountCode = $request->input('account_code', 'ALL');
+
+        $allCashAccounts = Account::when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->where(function($q) {
+                $q->whereIn('category', ['CASH', 'BANK'])
+                  ->orWhere('code', 'like', '1-11%');
+            })
+            ->where('is_active', true)
+            ->orderBy('code', 'asc')
+            ->get();
+
+        if ($allCashAccounts->isEmpty()) {
+            $defaultAccs = Account::defaultAccounts();
+            foreach ($defaultAccs as $da) {
+                if (str_starts_with($da['code'], '1-11')) {
+                    $allCashAccounts->push((object)$da);
+                }
+            }
+        }
+
+        $cashAccountCodes = $allCashAccounts->pluck('code')->all();
+        if (empty($cashAccountCodes)) {
+            $cashAccountCodes = ['1-11001', '1-11002', '1-11003'];
+        }
+
+        // Hitung Saldo Awal, Debit Masuk, Kredit Keluar, & Saldo Akhir untuk SETIAP akun kas (Sesuai Neraca & rollup akun induk)
+        $cashAccountsOverview = [];
+        $totalInitialAll = 0.0;
+        $totalDebitAll = 0.0;
+        $totalCreditAll = 0.0;
+        $totalEndingAll = 0.0;
+
+        foreach ($allCashAccounts as $cAcc) {
+            $cCode = $cAcc->code;
+            $cName = $cAcc->name;
+            $cCat  = $cAcc->category ?? 'CASH';
+
+            // Check if this is a parent account (has children or no dot in code and has parent_code null)
+            $isParent = empty($cAcc->parent_code) && !str_contains($cCode, '.');
+            $childAccountCodes = $allCashAccounts->filter(function($a) use ($cCode) {
+                return ($a->parent_code ?? null) === $cCode 
+                    || (str_starts_with($a->code, "{$cCode}.") && $a->code !== $cCode);
+            })->pluck('code')->all();
+
+            $hasChildren = !empty($childAccountCodes);
+
+            // Determine matching journal codes for this account
+            if ($hasChildren) {
+                $matchingCodes = array_values(array_unique(array_merge([$cCode], $childAccountCodes)));
+            } else {
+                $matchingCodes = [$cCode];
+            }
+
+            // Saldo Awal (< $from)
+            $pQ = JournalLine::where('entry_date', '<', $from)->whereIn('account_code', $matchingCodes);
+            if ($outletId) $pQ->where('outlet_id', $outletId);
+            if ($businessId) $pQ->whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId));
+            $pSums = $pQ->selectRaw('SUM(debit) as total_debit, SUM(credit) as total_credit')->first();
+            $initBal = round((float)($pSums?->total_debit ?? 0) - (float)($pSums?->total_credit ?? 0), 2);
+
+            // Mutasi Periode Ini ($from s/d $to)
+            $curQ = JournalLine::whereBetween('entry_date', [$from, $to])->whereIn('account_code', $matchingCodes);
+            if ($outletId) $curQ->where('outlet_id', $outletId);
+            if ($businessId) $curQ->whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId));
+            $curSums = $curQ->selectRaw('SUM(debit) as total_debit, SUM(credit) as total_credit')->first();
+            $totDeb = round((float)($curSums?->total_debit ?? 0), 2);
+            $totCrd = round((float)($curSums?->total_credit ?? 0), 2);
+            $netChg = round($totDeb - $totCrd, 2);
+            $endBal = round($initBal + $netChg, 2);
+
+            $cashAccountsOverview[] = [
+                'code'            => $cCode,
+                'name'            => $cName,
+                'category'        => $cCat,
+                'is_parent'       => $isParent || $hasChildren,
+                'has_children'    => $hasChildren,
+                'initial_balance' => $initBal,
+                'total_debit'     => $totDeb,
+                'total_credit'    => $totCrd,
+                'net_change'      => $netChg,
+                'ending_balance'  => $endBal,
+            ];
+
+            // Only sum leaf/child accounts to total_accounts_overview to prevent double counting
+            if (!$hasChildren) {
+                $totalInitialAll += $initBal;
+                $totalDebitAll   += $totDeb;
+                $totalCreditAll  += $totCrd;
+                $totalEndingAll  += $endBal;
+            }
+        }
+
+        // Tentukan akun kas aktif yang dihitung untuk Laporan Arus Kas
+        if ($selectedAccountCode !== 'ALL') {
+            $activeCashCodes = $allCashAccounts->filter(function($a) use ($selectedAccountCode) {
+                return $a->code === $selectedAccountCode 
+                    || str_starts_with($a->code, "{$selectedAccountCode}.") 
+                    || ($a->parent_code ?? null) === $selectedAccountCode;
+            })->pluck('code')->unique()->values()->all();
+
+            if (empty($activeCashCodes)) {
+                $activeCashCodes = [$selectedAccountCode];
+            }
+        } else {
+            $activeCashCodes = $cashAccountCodes;
+        }
+
+        $targetAccountName = 'SEMUA KAS & BANK';
+        if ($selectedAccountCode !== 'ALL') {
+            $matchedAcc = $allCashAccounts->firstWhere('code', $selectedAccountCode);
+            if ($matchedAcc) {
+                $targetAccountName = "{$matchedAcc->name} ({$selectedAccountCode})";
+            }
+        }
+
+        // A. Saldo Awal Kas Akun Terpilih (Prior to $from)
+        $priorCashQuery = JournalLine::where('entry_date', '<', $from)->whereIn('account_code', $activeCashCodes);
+        if ($outletId) {
+            $priorCashQuery->where('outlet_id', $outletId);
+        }
+        if ($businessId) {
+            $priorCashQuery->whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId));
+        }
+        $priorCashSums = $priorCashQuery->selectRaw('SUM(debit) as total_debit, SUM(credit) as total_credit')->first();
+        $initialCashBalance = round((float)($priorCashSums?->total_debit ?? 0) - (float)($priorCashSums?->total_credit ?? 0), 2);
+
+        // B. In-Period Journal Lines for Selected Cash Account(s) ($from to $to)
+        $periodCashLinesQuery = JournalLine::with(['journalEntry.lines', 'outlet'])
+            ->whereBetween('entry_date', [$from, $to])
+            ->whereIn('account_code', $activeCashCodes);
+        if ($outletId) {
+            $periodCashLinesQuery->where('outlet_id', $outletId);
+        }
+        if ($businessId) {
+            $periodCashLinesQuery->whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId));
+        }
+        $periodCashLines = $periodCashLinesQuery->orderBy('entry_date', 'asc')->orderBy('id', 'asc')->get();
+
+        // =========================================================================
+        // 2. CLASSIFY CASH FLOWS BASED ON GENERAL LEDGER JOURNAL ENTRIES
+        // =========================================================================
         $cashSales = 0.0;
         $qrisSales = 0.0;
         $grabSales = 0.0;
         $transferSales = 0.0;
         $debitSales = 0.0;
         $otherSales = 0.0;
-        $newKasbonTotal = 0.0;
-
-        foreach ($transactions as $t) {
-            $amt = (float)$t->total_price;
-            $method = strtoupper(trim($t->payment_method ?: 'CASH'));
-
-            if (in_array($method, ['KASBON', 'PIUTANG'])) {
-                $newKasbonTotal += $amt;
-                continue;
-            }
-
-            if ($method === 'CASH' || $method === 'TUNAI') {
-                $cashSales += $amt;
-            } elseif (str_contains($method, 'QRIS')) {
-                $qrisSales += $amt;
-            } elseif (str_contains($method, 'GRAB') || str_contains($method, 'GOFOOD') || str_contains($method, 'SHOPEE') || str_contains($method, 'TIKTOK')) {
-                $grabSales += $amt;
-            } elseif (str_contains($method, 'TRANSFER')) {
-                $transferSales += $amt;
-            } elseif (str_contains($method, 'DEBIT') || str_contains($method, 'EDC') || str_contains($method, 'CREDIT')) {
-                $debitSales += $amt;
-            } else {
-                $otherSales += $amt;
-            }
-        }
-
-        $totalDirectSalesReceipts = $cashSales + $qrisSales + $grabSales + $transferSales + $debitSales + $otherSales;
-
-        // B. Penerimaan Kas dari Pembayaran Kasbon Pelanggan (Receivable Collections)
-        $recPayQuery = ReceivablePayment::with(['receivable', 'outlet', 'receiver'])
-            ->whereBetween('payment_date', [$from, $to])
-            ->select(['id', 'payment_no', 'receivable_id', 'business_id', 'outlet_id', 'shift_id', 'payment_date', 'amount', 'payment_method', 'reference_no', 'notes', 'received_by']);
-        if ($outletId) {
-            $recPayQuery->where('outlet_id', $outletId);
-        }
-        $applyPmFilter($recPayQuery, 'payment_method');
-        $applyShiftFilter($recPayQuery, 'shift_id');
-        $receivablePayments = $recPayQuery->get();
-
         $receivableCashIn = 0.0;
-        $recPayCash = 0.0;
-        $recPayTransfer = 0.0;
-        $recPayQris = 0.0;
-        $recPayDebit = 0.0;
-        $recPayOther = 0.0;
-
-        foreach ($receivablePayments as $rp) {
-            $rpAmt = (float)$rp->amount;
-            $receivableCashIn += $rpAmt;
-            $rpMethod = strtoupper(trim($rp->payment_method ?: 'CASH'));
-
-            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
-                $recPayCash += $rpAmt;
-            } elseif (str_contains($rpMethod, 'TRANSFER')) {
-                $recPayTransfer += $rpAmt;
-            } elseif (str_contains($rpMethod, 'QRIS')) {
-                $recPayQris += $rpAmt;
-            } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC')) {
-                $recPayDebit += $rpAmt;
-            } else {
-                $recPayOther += $rpAmt;
-            }
-        }
-
-        // Penerimaan Operasional Lainnya dari buku kas manual
-        $extraOpInQuery = CashTransaction::where('activity_type', 'OPERATING')
-            ->where('type', 'IN')
-            ->whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $extraOpInQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $applyPmFilter($extraOpInQuery, 'payment_method');
-        $extraOpIn = (float)$extraOpInQuery->sum('amount');
-        $totalOperatingInflows = $totalDirectSalesReceipts + $receivableCashIn + $extraOpIn;
-
-        // B. Pengeluaran Kas untuk Belanja Persediaan Bahan Baku (Cash Paid for Inventory Purchases)
-        $movQuery = StockMovement::with(['ingredient' => function($q) {
-            $q->select(['id', 'name', 'unit_pakai', 'konversi', 'harga']);
-        }])
-            ->where('type', 'PURCHASE')
-            ->whereBetween('date', [$from, $to])
-            ->select(['id', 'ingredient_id', 'outlet_id', 'type', 'date', 'unit_price', 'total_price', 'qty', 'payment_type']);
-        if ($outletId) {
-            $movQuery->where('outlet_id', $outletId);
-        }
-        if ($isPmFiltered) {
-            if ($pmFilter === 'CASH' || $pmFilter === 'TUNAI') {
-                $movQuery->where(fn($q) => $q->whereIn('payment_type', ['CASH', 'TUNAI'])->orWhereNull('payment_type'));
-            } elseif ($pmFilter === 'TRANSFER') {
-                $movQuery->where('payment_type', 'like', '%TRANSFER%');
-            } elseif ($pmFilter === 'PETTY_CASH') {
-                $movQuery->where('payment_type', 'PETTY_CASH');
-            } elseif ($pmFilter === 'QRIS') {
-                $movQuery->where('payment_type', 'like', '%QRIS%');
-            } else {
-                $movQuery->whereRaw('0 = 1');
-            }
-        }
-        $purchaseMovements = $movQuery->get();
+        $extraOpIn = 0.0;
+        $shiftCashOver = 0.0;
+        $internalTransferIn = 0.0;
 
         $stockPurchasesCashTotal = 0.0;
-        $unpaidCreditPurchasesTotal = 0.0;
+        $supplierDebtCashOut = 0.0;
+        $totalOpexCashOut = 0.0;
+        $shiftCashShort = 0.0;
+        $internalTransferOut = 0.0;
+
+        $investingInflows = 0.0;
+        $investingOutflows = 0.0;
+        $capexBreakdown = [];
+
+        $financingInflows = 0.0;
+        $financingOutflows = 0.0;
+        $financingBreakdown = [];
+
+        $recPayCash = 0.0; $recPayTransfer = 0.0; $recPayQris = 0.0; $recPayDebit = 0.0; $recPayOther = 0.0;
+
+        $runningMutationBalance = $initialCashBalance;
+        $journalLinesAuditTrail = [];
+
+        $detailedInflows = [];
+        $detailedOutflows = [];
+
+        foreach ($periodCashLines as $line) {
+            $entry = $line->journalEntry;
+            if (!$entry) continue;
+
+            $entryType = strtoupper((string)($entry->entry_type ?: $entry->reference_type));
+            $counterLines = $entry->lines ? $entry->lines->where('id', '!=', $line->id) : collect();
+
+            $deb = (float)$line->debit;
+            $crd = (float)$line->credit;
+            $runningMutationBalance += ($deb - $crd);
+
+            $counterAccountNames = $counterLines->map(fn($cl) => $cl->account_code)->implode(', ');
+            $memo = $line->memo ?: ($entry->description ?: '-');
+            $dateStr = is_string($line->entry_date) ? substr($line->entry_date, 0, 10) : ($line->entry_date ? $line->entry_date->format('Y-m-d') : '-');
+            $refNo = $entry->entry_no ?: "JE-{$line->journal_entry_id}";
+
+            $auditItem = [
+                'id'               => $line->id,
+                'journal_entry_id' => $line->journal_entry_id,
+                'journal_id'       => $entry->id,
+                'date'             => $dateStr,
+                'ref_no'           => $refNo,
+                'account_code'     => $line->account_code,
+                'counter_accounts' => $counterAccountNames ?: '-',
+                'category'         => $entryType ?: 'JURNAL',
+                'description'      => $memo,
+                'debit'            => $deb,
+                'credit'           => $crd,
+                'net_amount'       => $deb > 0 ? $deb : -$crd,
+                'running_balance'  => round($runningMutationBalance, 2),
+                'outlet_name'      => $line->outlet?->name ?: 'Pusat',
+            ];
+            $journalLinesAuditTrail[] = $auditItem;
+
+            // Uang Kas Masuk (Debit to Cash Account)
+            if ($deb > 0) {
+                $amount = $deb;
+
+                // Check if internal cash transfer between cash accounts
+                $isInternalCashTransfer = $counterLines->contains(fn($cl) => in_array($cl->account_code, $cashAccountCodes) && (float)$cl->credit > 0);
+                if ($isInternalCashTransfer) {
+                    $internalTransferIn += $amount;
+                    $transferTitle = 'Mutasi Masuk Antar Kas';
+                    if (str_contains(strtoupper($memo), 'SETORAN') || str_contains($entryType, 'DEPOSIT')) {
+                        $transferTitle = 'Penerimaan Setoran Kasir';
+                    }
+                    $detailedInflows[] = array_merge($auditItem, ['flow_type' => 'INTERNAL_TRANSFER', 'title' => $transferTitle]);
+                    continue;
+                }
+
+                if ($entryType === 'SALES' || $counterLines->contains(fn($cl) => str_starts_with($cl->account_code, '4-41001') || in_array($cl->account_code, ['1-12003', '1-12004', '1-12005', '1-12006']))) {
+                    if ($line->account_code === '1-11002') {
+                        $cashSales += $amount;
+                    } elseif ($line->account_code === '1-11003') {
+                        $transferSales += $amount;
+                    } elseif ($line->account_code === '1-11004' || str_contains($line->account_code, '11004') || str_contains($line->account_code, '12003')) {
+                        $qrisSales += $amount;
+                    } elseif (str_contains($line->account_code, '12004') || str_contains($line->account_code, '12005') || str_contains($line->account_code, '12006')) {
+                        $grabSales += $amount;
+                    } else {
+                        $otherSales += $amount;
+                    }
+                    $detailedInflows[] = array_merge($auditItem, ['flow_type' => 'SALES', 'title' => 'Penjualan Kasir POS']);
+                } elseif ($entryType === 'RECEIVABLE_PAYMENT' || $counterLines->contains(fn($cl) => $cl->account_code === '1-12001')) {
+                    $receivableCashIn += $amount;
+                    if ($line->account_code === '1-11002') $recPayCash += $amount;
+                    elseif ($line->account_code === '1-11003') $recPayTransfer += $amount;
+                    elseif (str_contains($line->account_code, '12003')) $recPayQris += $amount;
+                    else $recPayOther += $amount;
+                    $detailedInflows[] = array_merge($auditItem, ['flow_type' => 'RECEIVABLE', 'title' => 'Pelunasan Kasbon Pelanggan']);
+                } elseif ($entryType === 'SHIFT_CLOSING' && $counterLines->contains(fn($cl) => $cl->account_code === '4-41002')) {
+                    $shiftCashOver += $amount;
+                    $detailedInflows[] = array_merge($auditItem, ['flow_type' => 'CASH_OVER', 'title' => 'Surplus / Lebih Kas Kasir']);
+                } elseif ($counterLines->contains(fn($cl) => str_starts_with($cl->account_code, '1-2'))) {
+                    $investingInflows += $amount;
+                    $detailedInflows[] = array_merge($auditItem, ['flow_type' => 'INVESTING', 'title' => 'Penjualan Aset Tetap']);
+                } elseif ($counterLines->contains(fn($cl) => $cl->account_code === '3-31001' || str_starts_with($cl->account_code, '2-'))) {
+                    $financingInflows += $amount;
+                    $financingBreakdown[] = [
+                        'category' => 'CAPITAL_INJECTION',
+                        'label'    => $memo ?: 'Setoran Modal / Injeksi Dana',
+                        'type'     => 'IN',
+                        'amount'   => $amount,
+                    ];
+                    $detailedInflows[] = array_merge($auditItem, ['flow_type' => 'CAPITAL_INJECTION', 'title' => 'Setoran Modal / Modal Awal Kasir']);
+                } else {
+                    $extraOpIn += $amount;
+                    $detailedInflows[] = array_merge($auditItem, ['flow_type' => 'OTHER_INCOME', 'title' => 'Penerimaan Kas Operasi Lain']);
+                }
+            }
+
+            // Uang Kas Keluar (Credit to Cash Account)
+            if ($crd > 0) {
+                $amount = $crd;
+
+                // Check if internal cash transfer between cash accounts
+                $isInternalCashTransfer = $counterLines->contains(fn($cl) => in_array($cl->account_code, $cashAccountCodes) && (float)$cl->debit > 0);
+                if ($isInternalCashTransfer) {
+                    $internalTransferOut += $amount;
+                    $transferTitle = 'Mutasi Keluar Antar Kas';
+                    if (str_contains(strtoupper($memo), 'SETORAN') || str_contains($entryType, 'DEPOSIT')) {
+                        $transferTitle = 'Setoran Kasir ke Kas Besar';
+                    }
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'INTERNAL_TRANSFER', 'title' => $transferTitle]);
+                    continue;
+                }
+
+                if ($entryType === 'PURCHASE' || $counterLines->contains(fn($cl) => str_starts_with($cl->account_code, '1-13'))) {
+                    $stockPurchasesCashTotal += $amount;
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'PURCHASE', 'title' => 'Pembelian Stok Bahan Baku']);
+                } elseif ($entryType === 'PAYABLE_PAYMENT' || $counterLines->contains(fn($cl) => $cl->account_code === '2-21001')) {
+                    $supplierDebtCashOut += $amount;
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'PAYABLE', 'title' => 'Pelunasan Hutang Supplier']);
+                } elseif ($entryType === 'SHIFT_CLOSING' || $counterLines->contains(fn($cl) => $cl->account_code === '6-61008')) {
+                    $shiftCashShort += $amount;
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'CASH_SHORT', 'title' => 'Selisih Kurang / Tekor Kasir']);
+                } elseif ($entryType === 'OPEX' || $counterLines->contains(fn($cl) => str_starts_with($cl->account_code, '6-'))) {
+                    $totalOpexCashOut += $amount;
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'OPEX', 'title' => 'Beban Operasional Toko (OPEX)']);
+                } elseif ($counterLines->contains(fn($cl) => str_starts_with($cl->account_code, '1-2'))) {
+                    $investingOutflows += $amount;
+                    $capexBreakdown[] = [
+                        'category' => 'EQUIPMENT',
+                        'label'    => $memo ?: 'Belanja Aset & Peralatan',
+                        'type'     => 'OUT',
+                        'amount'   => $amount,
+                    ];
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'CAPEX', 'title' => 'Belanja Modal & Peralatan (CapEx)']);
+                } elseif ($counterLines->contains(fn($cl) => $cl->account_code === '3-31002')) {
+                    $financingOutflows += $amount;
+                    $financingBreakdown[] = [
+                        'category' => 'OWNER_WITHDRAWAL',
+                        'label'    => $memo ?: 'Prive Penarikan Owner',
+                        'type'     => 'OUT',
+                        'amount'   => $amount,
+                    ];
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'PRIVE', 'title' => 'Prive / Penarikan Owner']);
+                } else {
+                    $totalOpexCashOut += $amount;
+                    $detailedOutflows[] = array_merge($auditItem, ['flow_type' => 'OTHER_EXPENSE', 'title' => 'Pengeluaran Kas Operasional Lain']);
+                }
+            }
+        }
+
+        $totalDirectSalesReceipts = round($cashSales + $qrisSales + $grabSales + $transferSales + $debitSales + $otherSales, 2);
+        $totalOperatingInflows = round($totalDirectSalesReceipts + $receivableCashIn + $extraOpIn + $shiftCashOver + $internalTransferIn, 2);
+
+        $totalInventoryCashOut = round($stockPurchasesCashTotal + $supplierDebtCashOut, 2);
+        $totalOperatingExpensesCashOut = round($totalOpexCashOut + $shiftCashShort + $internalTransferOut, 2);
+        $totalOperatingOutflows = round($totalInventoryCashOut + $totalOperatingExpensesCashOut, 2);
+
+        $netOperatingCashFlow = round($totalOperatingInflows - $totalOperatingOutflows, 2);
+        $netInvestingCashFlow = round($investingInflows - $investingOutflows, 2);
+        $netFinancingCashFlow = round($financingInflows - $financingOutflows, 2);
+        $netCashFlow = round($netOperatingCashFlow + $netInvestingCashFlow + $netFinancingCashFlow, 2);
+        $closingCashTotal = round($initialCashBalance + $netCashFlow, 2);
+
+        // Supporting Details & Reconciliation Bridge
+        $recPayQuery = ReceivablePayment::with(['receivable', 'outlet', 'receiver'])
+            ->whereBetween('payment_date', [$from, $to])
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId));
+        $receivablePayments = $recPayQuery->get();
+
+        $recListCash = 0.0; $recListQris = 0.0; $recListTransfer = 0.0; $recListDebit = 0.0; $recListOther = 0.0;
+        foreach ($receivablePayments as $rp) {
+            $amt = (float)$rp->amount;
+            $pm = strtoupper(trim((string)$rp->payment_method));
+            if ($pm === 'CASH' || $pm === 'TUNAI' || $pm === 'PETTY_CASH' || $pm === 'KAS') {
+                $recListCash += $amt;
+            } elseif (str_contains($pm, 'QRIS')) {
+                $recListQris += $amt;
+            } elseif (str_contains($pm, 'TRANSFER') || str_contains($pm, 'BANK') || str_contains($pm, 'BCA') || str_contains($pm, 'BRI') || str_contains($pm, 'MANDIRI')) {
+                $recListTransfer += $amt;
+            } elseif (str_contains($pm, 'DEBIT') || str_contains($pm, 'EDC') || str_contains($pm, 'KARTU') || str_contains($pm, 'CREDIT')) {
+                $recListDebit += $amt;
+            } else {
+                $recListOther += $amt;
+            }
+        }
+        $totalRecPayments = round($receivablePayments->sum('amount'), 2);
+        if ($totalRecPayments > 0 && $receivableCashIn <= 0) {
+            $receivableCashIn = $totalRecPayments;
+        }
+
+        $movQuery = StockMovement::with(['ingredient'])
+            ->where('type', 'PURCHASE')
+            ->whereBetween('date', [$from, $to])
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId));
+        $purchaseMovements = $movQuery->get();
+
         $purchaseItemsSummary = [];
         foreach ($purchaseMovements as $m) {
             $ing = $m->ingredient;
-            $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
-            $unitCost = $m->unit_price > 0 ? (float)$m->unit_price : ($ing ? (float)$ing->harga / $konversi : 0);
-            $totalCost = $m->total_price > 0 ? (float)$m->total_price : round((float)$m->qty * $unitCost, 2);
-
-            $isCredit = (strtoupper($m->payment_type ?? '') === 'HUTANG');
-            if ($isCredit) {
-                $unpaidCreditPurchasesTotal += $totalCost;
-            } else {
-                $stockPurchasesCashTotal += $totalCost;
-            }
-
             if ($ing) {
                 $ingId = $ing->id;
                 if (!isset($purchaseItemsSummary[$ingId])) {
-                    $purchaseItemsSummary[$ingId] = [
-                        'name'  => $ing->name,
-                        'unit'  => $ing->unit_pakai,
-                        'qty'   => 0,
-                        'total' => 0,
-                    ];
+                    $purchaseItemsSummary[$ingId] = ['name' => $ing->name, 'unit' => $ing->unit_pakai, 'qty' => 0, 'total' => 0];
                 }
                 $purchaseItemsSummary[$ingId]['qty'] += (float)$m->qty;
-                $purchaseItemsSummary[$ingId]['total'] += $totalCost;
+                $purchaseItemsSummary[$ingId]['total'] += (float)$m->total_price;
             }
         }
         usort($purchaseItemsSummary, fn($a, $b) => $b['total'] <=> $a['total']);
         $topPurchases = array_slice($purchaseItemsSummary, 0, 5);
 
-        // Kas keluar untuk pembayaran hutang supplier (Cicilan & Pelunasan Hutang + DP)
-        $payablePaymentQuery = PayablePayment::whereBetween('payment_date', [$from, $to]);
-        if ($outletId) {
-            $payablePaymentQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $applyPmFilter($payablePaymentQuery, 'payment_method');
-        $supplierDebtCashOut = (float)$payablePaymentQuery->sum('amount');
-
-        // Tambahan pembelian bahan langsung dari buku kas jika ada
-        $extraSuppQuery = CashTransaction::where('category', 'SUPPLIER_PURCHASE')
-            ->where('type', 'OUT')
-            ->whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $extraSuppQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $applyPmFilter($extraSuppQuery, 'payment_method');
-        $extraSupplierCash = (float)$extraSuppQuery->sum('amount');
-
-        // Total arus kas keluar untuk persediaan: Belanja Tunai + Pembayaran Hutang Supplier + Kas Keluar Supplier Langsung
-        $totalInventoryCashOut = $stockPurchasesCashTotal + $supplierDebtCashOut + $extraSupplierCash;
-
-        // C. Pengeluaran Kas untuk Beban Operasional Toko (Cash Paid for OPEX)
-        $opexQuery = OperatingExpense::whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $opexQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $applyPmFilter($opexQuery, 'payment_method');
-        $opexRecords = $opexQuery->get();
-        $totalOpexCashOut = (float)$opexRecords->sum('amount');
-
-        // Tambahan biaya operasional lain dari buku kas
-        $extraOpExQuery = CashTransaction::where('category', 'OTHER_EXPENSE')
-            ->where('type', 'OUT')
-            ->whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $extraOpExQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $applyPmFilter($extraOpExQuery, 'payment_method');
-        $extraOpExCash = (float)$extraOpExQuery->sum('amount');
-        $totalOperatingExpensesCashOut = $totalOpexCashOut + $extraOpExCash;
-
-        $totalOperatingOutflows = $totalInventoryCashOut + $totalOperatingExpensesCashOut;
-        $netOperatingCashFlow = round($totalOperatingInflows - $totalOperatingOutflows, 2);
-
-        // =========================================================================
-        // 2. ARUS KAS DARI AKTIVITAS INVESTASI / CAPEX (INVESTING CASH FLOW)
-        // =========================================================================
-        $invQuery = CashTransaction::where('activity_type', 'INVESTING')
-            ->whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $invQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $applyPmFilter($invQuery, 'payment_method');
-        $investingTransactions = $invQuery->get();
-
-        $investingInflows = (float)$investingTransactions->where('type', 'IN')->sum('amount');
-        $investingOutflows = (float)$investingTransactions->where('type', 'OUT')->sum('amount');
-        $netInvestingCashFlow = round($investingInflows - $investingOutflows, 2);
-
-        // Rincian CapEx per kategori
-        $capexBreakdown = [];
-        $investingCategories = ['EQUIPMENT', 'RENOVATION', 'FURNITURE', 'TECH_POS', 'ASSET_SALE'];
-        $catMeta = CashTransaction::categories();
-        foreach ($investingCategories as $cKey) {
-            $items = $investingTransactions->where('category', $cKey);
-            $cSum = (float)$items->sum('amount');
-            if ($cSum > 0) {
-                $capexBreakdown[] = [
-                    'category' => $cKey,
-                    'label'    => $catMeta[$cKey]['label'] ?? $cKey,
-                    'type'     => $catMeta[$cKey]['default_type'] ?? 'OUT',
-                    'amount'   => $cSum,
-                    'count'    => $items->count(),
-                ];
-            }
-        }
-
-        // =========================================================================
-        // 3. ARUS KAS DARI AKTIVITAS PENDANAAN (FINANCING CASH FLOW / FCF)
-        // =========================================================================
-        $finQuery = CashTransaction::where('activity_type', 'FINANCING')
-            ->whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $finQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $applyPmFilter($finQuery, 'payment_method');
-        $financingTransactions = $finQuery->get();
-
-        $financingInflows = (float)$financingTransactions->where('type', 'IN')->sum('amount');
-        $financingOutflows = (float)$financingTransactions->where('type', 'OUT')->sum('amount');
-        $netFinancingCashFlow = round($financingInflows - $financingOutflows, 2);
-
-        // Rincian Pendanaan per kategori
-        $financingBreakdown = [];
-        $financingCategories = ['CAPITAL_INJECTION', 'OWNER_WITHDRAWAL', 'LOAN_RECEIPT', 'LOAN_REPAYMENT'];
-        foreach ($financingCategories as $fKey) {
-            $fItems = $financingTransactions->where('category', $fKey);
-            $fSum = (float)$fItems->sum('amount');
-            if ($fSum > 0) {
-                $financingBreakdown[] = [
-                    'category' => $fKey,
-                    'label'    => $catMeta[$fKey]['label'] ?? $fKey,
-                    'type'     => $catMeta[$fKey]['default_type'] ?? 'IN',
-                    'amount'   => $fSum,
-                    'count'    => $fItems->count(),
-                ];
-            }
-        }
-
-        // =========================================================================
-        // 4. TOTAL PERUBAHAN KAS BERSIH (NET CHANGE IN CASH)
-        // =========================================================================
-        $netCashFlow = round($netOperatingCashFlow + $netInvestingCashFlow + $netFinancingCashFlow, 2);
-
-        // =========================================================================
-        // 5. JEMBATAN REKONSILIASI: LABA AKRUAL (P&L) VS ARUS KAS NYATA
-        // =========================================================================
+        // Reconciliation with Journal P&L
         $reportCtrl = new ReportController();
-        $plRequest = new Request([
-            'from'      => $from,
-            'to'        => $to,
-            'outlet_id' => $outletId,
-        ]);
-        if ($user) {
-            $plRequest->setUserResolver(fn() => $user);
-        }
+        $plRequest = new Request(['from' => $from, 'to' => $to, 'outlet_id' => $outletId]);
+        if ($user) { $plRequest->setUserResolver(fn() => $user); }
         $plResponse = $reportCtrl->profitAndLoss($plRequest);
         $plData = json_decode($plResponse->getContent(), true);
 
         $accrualNetProfit = (float)($plData['bottom_line']['net_profit'] ?? 0);
         $cogsTheoretical = (float)($plData['cogs']['total_cogs'] ?? 0);
         $wasteLossNonCash = (float)($plData['waste']['total_waste_loss'] ?? 0);
-
-        // Selisih antara Belanja Stok Riil vs HPP Teoretis (Working Capital Inventory Build-up)
-        // Jika Belanja Stok > HPP Resep -> Kas tertahan di chiller/gudang!
         $inventoryCapitalChange = round($totalInventoryCashOut - $cogsTheoretical, 2);
 
         $reconciliationSteps = [
             [
                 'step'        => 'accrual_profit',
-                'title'       => 'Laba Bersih Usaha (P&L Akrual)',
-                'description' => 'Keuntungan di atas kertas operasional toko berdasarkan transaksi penjualan',
+                'title'       => 'Laba Bersih Usaha (P&L Jurnal Akrual)',
+                'description' => 'Keuntungan operasional toko berdasarkan pencatatan jurnal laba rugi',
                 'amount'      => $accrualNetProfit,
                 'effect'      => 'START',
             ],
@@ -572,114 +724,95 @@ class CashFlowController extends Controller
             [
                 'step'        => 'actual_purchases',
                 'title'       => '(-) Uang Kas Dibelanjakan untuk Stok Bahan Baku Riil',
-                'description' => 'Seluruh uang kas keluar untuk beli stok bahan mentah (termasuk yang masih menumpuk di chiller/gudang)',
+                'description' => 'Seluruh uang kas keluar untuk beli stok bahan mentah (termasuk yang tersimpan di gudang)',
                 'amount'      => -$totalInventoryCashOut,
                 'effect'      => 'SUBTRACT',
             ],
             [
                 'step'        => 'waste_addback',
                 'title'       => '(+) Penyesuaian Kerugian Waste Non-Kas',
-                'description' => 'Bahan basi/rusak mengurangi laba di P&L, tetapi tidak ada uang kas keluar saat bahan dibuang',
+                'description' => 'Bahan rusak mengurangi laba di P&L, tetapi tidak ada uang kas keluar saat bahan dibuang',
                 'amount'      => $wasteLossNonCash,
                 'effect'      => 'ADD',
             ],
             [
-                'step'        => 'receivable_unpaid_deduct',
-                'title'       => '(-) Penjualan Kasbon Baru Belum Diterima Kasnya',
-                'description' => 'Omzet kasbon diakui di laba P&L, namun uang kasnya belum masuk ke kasir/bank',
-                'amount'      => -$newKasbonTotal,
-                'effect'      => 'SUBTRACT',
-            ],
-            [
                 'step'        => 'receivable_payment_add',
                 'title'       => '(+) Penerimaan Kas dari Pembayaran Kasbon Pelanggan',
-                'description' => 'Uang kas riil yang masuk dari pelunasan atau cicilan kasbon oleh customer',
+                'description' => 'Uang kas riil yang masuk dari pelunasan piutang customer',
                 'amount'      => $receivableCashIn,
                 'effect'      => 'ADD',
             ],
             [
                 'step'        => 'capex_deduct',
                 'title'       => '(-) Belanja Modal / Aset Resto (CapEx)',
-                'description' => 'Pengeluaran kas untuk beli kulkas, chiller, renovasi toko, dan mesin baru',
+                'description' => 'Pengeluaran kas untuk peralatan dan renovasi',
                 'amount'      => -$investingOutflows,
                 'effect'      => 'SUBTRACT',
             ],
             [
-                'step'        => 'asset_sale_add',
-                'title'       => '(+) Penerimaan Penjualan Aset Bekas',
-                'description' => 'Kas masuk dari penjualan peralatan atau aset bekas',
-                'amount'      => $investingInflows,
-                'effect'      => 'ADD',
-            ],
-            [
                 'step'        => 'owner_withdrawal_deduct',
                 'title'       => '(-) Prive / Penarikan Dana Tunai oleh Owner',
-                'description' => 'Pengambilan kas pribadi atau dividen berjalan oleh pemilik resto',
+                'description' => 'Pengambilan kas pribadi oleh pemilik',
                 'amount'      => -$financingOutflows,
                 'effect'      => 'SUBTRACT',
             ],
             [
                 'step'        => 'capital_injection_add',
                 'title'       => '(+) Setoran Modal Tambahan / Pinjaman',
-                'description' => 'Injeksi dana segar dari owner, partner bisnis, atau pinjaman modal',
+                'description' => 'Injeksi dana segar dari owner / pinjaman',
                 'amount'      => $financingInflows,
                 'effect'      => 'ADD',
             ],
             [
                 'step'        => 'net_cash_result',
                 'title'       => '(=) Perubahan Bersih Kas Riil (Net Cash Flow)',
-                'description' => 'Kelebihan / kekurangan kas fisik riil yang benar-benar bertambah/berkurang di rekening & kasir',
+                'description' => 'Total kas yang bertambah/berkurang di rekening & kasir dari jurnal',
                 'amount'      => $netCashFlow,
                 'effect'      => 'TOTAL',
             ],
         ];
 
-        $selectedShifts = $isShiftFiltered 
-            ? $availableShifts->whereIn('id', $shiftFilterIds)->values()
-            : $availableShifts->values();
-        $selectedShiftsInitialCashTotal = (float)$selectedShifts->sum('initial_cash');
-        $closedShifts = $selectedShifts->where('status', 'CLOSED');
-        $selectedShiftsClosingCashTotal = (float)$closedShifts->sum('closing_cash');
-        $selectedShiftsSystemCashTotal = (float)$closedShifts->sum('system_cash');
-        $selectedShiftsCashDifferenceTotal = (float)$closedShifts->sum('cash_difference');
-        $selectedShiftsInterShiftDiffTotal = (float)$selectedShifts->sum('inter_shift_diff');
-        $closedShiftsCount = $closedShifts->count();
-
         return response()->json([
             'period' => [
-                'from'                          => $from,
-                'to'                            => $to,
-                'outlet_id'                     => $outletId,
-                'selected_payment_method'       => $pmFilter,
-                'selected_shift_ids'            => $shiftFilterIds,
-                'is_shift_filtered'             => $isShiftFiltered,
-                'is_pm_filtered'                => $isPmFiltered,
-                'initial_cash_total'            => $selectedShiftsInitialCashTotal,
-                'closing_cash_total'            => $selectedShiftsClosingCashTotal,
-                'system_cash_total'             => $selectedShiftsSystemCashTotal,
-                'cash_difference_total'         => $selectedShiftsCashDifferenceTotal,
-                'inter_shift_difference_total'  => $selectedShiftsInterShiftDiffTotal,
-                'closed_shifts_count'           => $closedShiftsCount,
-                'selected_shifts_count'         => $selectedShifts->count(),
+                'from'                     => $from,
+                'to'                       => $to,
+                'outlet_id'                => $outletId,
+                'selected_account_code'    => $selectedAccountCode,
+                'selected_account_name'    => $targetAccountName,
+                'selected_payment_method'  => $pmFilter,
+                'initial_cash_total'       => $initialCashBalance,
+                'closing_cash_total'       => $closingCashTotal,
+                'net_cash_flow'            => $netCashFlow,
             ],
-            'available_shifts' => $availableShifts,
+            'selected_account_code'        => $selectedAccountCode,
+            'selected_account_name'        => $targetAccountName,
+            'cash_accounts_overview'       => $cashAccountsOverview,
+            'total_accounts_overview'      => [
+                'initial_balance' => round($totalInitialAll, 2),
+                'total_debit'     => round($totalDebitAll, 2),
+                'total_credit'    => round($totalCreditAll, 2),
+                'net_change'      => round($totalDebitAll - $totalCreditAll, 2),
+                'ending_balance'  => round($totalEndingAll, 2),
+            ],
+            'inflow_items'                 => $detailedInflows,
+            'outflow_items'                => $detailedOutflows,
+            'total_inflows'                => round($totalOperatingInflows + $investingInflows + $financingInflows, 2),
+            'total_outflows'               => round($totalOperatingOutflows + $investingOutflows + $financingOutflows, 2),
+            'journal_lines'                => $journalLinesAuditTrail,
+            'source'                       => 'GENERAL_LEDGER_JOURNALS',
+            'available_shifts'             => $availableShifts,
             'summary' => [
-                'initial_cash_total'             => $selectedShiftsInitialCashTotal,
-                'closing_cash_total'             => $selectedShiftsClosingCashTotal,
-                'system_cash_total'              => $selectedShiftsSystemCashTotal,
-                'cash_difference_total'          => $selectedShiftsCashDifferenceTotal,
-                'inter_shift_difference_total'   => $selectedShiftsInterShiftDiffTotal,
-                'closed_shifts_count'            => $closedShiftsCount,
-                'selected_shifts_count'          => $selectedShifts->count(),
-                'net_operating_cash_flow'        => $netOperatingCashFlow,
-                'net_investing_cash_flow'        => $netInvestingCashFlow,
-                'net_financing_cash_flow'        => $netFinancingCashFlow,
-                'net_cash_flow'                  => $netCashFlow,
-                'accrual_net_profit'             => $accrualNetProfit,
-                'inventory_cash_trapped'         => $inventoryCapitalChange,
-                'liquidity_status'               => $netCashFlow >= 0 ? 'SURPLUS' : 'DEFICIT',
-                'liquidity_label'                => $netCashFlow >= 0 ? 'Kas Surplus (Likuid Prima)' : 'Kas Defisit (Ketat / Waspada)',
-                'liquidity_color'                => $netCashFlow >= 0 ? '#10B981' : '#EF4444',
+                'initial_cash_total'       => $initialCashBalance,
+                'closing_cash_total'       => $closingCashTotal,
+                'net_operating_cash_flow'  => $netOperatingCashFlow,
+                'net_investing_cash_flow'  => $netInvestingCashFlow,
+                'net_financing_cash_flow'  => $netFinancingCashFlow,
+                'net_cash_flow'            => $netCashFlow,
+                'accrual_net_profit'       => $accrualNetProfit,
+                'inventory_cash_trapped'   => $inventoryCapitalChange,
+                'liquidity_status'         => $netCashFlow >= 0 ? 'SURPLUS' : 'DEFICIT',
+                'liquidity_label'          => $netCashFlow >= 0 ? 'Kas Surplus (Likuid Prima)' : 'Kas Defisit (Ketat / Waspada)',
+                'liquidity_color'          => $netCashFlow >= 0 ? '#10B981' : '#EF4444',
             ],
             'operating' => [
                 'inflows' => [
@@ -690,22 +823,22 @@ class CashFlowController extends Controller
                     'debit_sales'            => round($debitSales, 2),
                     'other_sales'            => round($otherSales, 2),
                     'direct_sales_total'     => round($totalDirectSalesReceipts, 2),
-                    'receivable_collections' => round($receivableCashIn, 2),
+                    'receivable_collections' => round(count($receivablePayments) > 0 ? $totalRecPayments : $receivableCashIn, 2),
                     'receivable_breakdown'   => [
-                        'cash'     => round($recPayCash, 2),
-                        'transfer' => round($recPayTransfer, 2),
-                        'qris'     => round($recPayQris, 2),
-                        'debit'    => round($recPayDebit, 2),
-                        'other'    => round($recPayOther, 2),
+                        'cash'     => round(count($receivablePayments) > 0 ? $recListCash : $recPayCash, 2),
+                        'transfer' => round(count($receivablePayments) > 0 ? $recListTransfer : $recPayTransfer, 2),
+                        'qris'     => round(count($receivablePayments) > 0 ? $recListQris : $recPayQris, 2),
+                        'debit'    => round(count($receivablePayments) > 0 ? $recListDebit : $recPayDebit, 2),
+                        'other'    => round(count($receivablePayments) > 0 ? $recListOther : $recPayOther, 2),
                         'count'    => $receivablePayments->count(),
                     ],
                     'combined_breakdown'     => [
-                        'cash'     => round($cashSales + $recPayCash, 2),
-                        'qris'     => round($qrisSales + $recPayQris, 2),
+                        'cash'     => round($cashSales + (count($receivablePayments) > 0 ? $recListCash : $recPayCash), 2),
+                        'qris'     => round($qrisSales + (count($receivablePayments) > 0 ? $recListQris : $recPayQris), 2),
                         'grab'     => round($grabSales, 2),
-                        'transfer' => round($transferSales + $recPayTransfer, 2),
-                        'debit'    => round($debitSales + $recPayDebit, 2),
-                        'other'    => round($otherSales + $recPayOther, 2),
+                        'transfer' => round($transferSales + (count($receivablePayments) > 0 ? $recListTransfer : $recPayTransfer), 2),
+                        'debit'    => round($debitSales + (count($receivablePayments) > 0 ? $recListDebit : $recPayDebit), 2),
+                        'other'    => round($otherSales + (count($receivablePayments) > 0 ? $recListOther : $recPayOther), 2),
                         'total'    => round($totalOperatingInflows, 2),
                     ],
                     'receivable_payments'    => $receivablePayments->map(fn($rp) => [
@@ -717,18 +850,18 @@ class CashFlowController extends Controller
                         'amount'         => (float)$rp->amount,
                         'payment_method' => strtoupper($rp->payment_method ?: 'CASH'),
                         'notes'          => $rp->notes,
-                        'outlet_name'    => $rp->outlet?->name ?? 'Cabang',
-                        'receiver_name'  => $rp->receiver?->name ?? 'Kasir',
                     ])->values(),
-                    'unpaid_kasbon_omzet'    => round($newKasbonTotal, 2),
+                    'unpaid_kasbon_omzet'    => 0.0,
                     'extra_income'           => round($extraOpIn, 2),
+                    'shift_cash_over'        => round($shiftCashOver, 2),
                     'total_inflows'          => round($totalOperatingInflows, 2),
                 ],
                 'outflows' => [
                     'stock_purchases'        => round($totalInventoryCashOut, 2),
                     'stock_purchases_direct' => round($stockPurchasesCashTotal, 2),
                     'supplier_debt_payments' => round($supplierDebtCashOut, 2),
-                    'opex_expenses'          => round($totalOperatingExpensesCashOut, 2),
+                    'opex_expenses'          => round($totalOpexCashOut, 2),
+                    'shift_cash_short'       => round($shiftCashShort, 2),
                     'total_outflows'         => round($totalOperatingOutflows, 2),
                 ],
                 'top_purchases' => $topPurchases,
@@ -752,8 +885,8 @@ class CashFlowController extends Controller
                 'accrual_profit'           => $accrualNetProfit,
                 'cash_profit'              => $netCashFlow,
                 'discrepancy_explanation'  => $inventoryCapitalChange > 0 
-                    ? "Terdapat uang kas sebesar Rp " . number_format($inventoryCapitalChange, 0, ',', '.') . " yang terkunci dalam bentuk stok bahan baku di gudang/chiller (pembelian stok lebih besar dari bahan terpakai)."
-                    : "Pembelian stok bahan baku lebih hemat dibandingkan pemakaian menu terjual.",
+                    ? "Terdapat kas sebesar Rp " . number_format($inventoryCapitalChange, 0, ',', '.') . " yang berada dalam persediaan stok bahan baku."
+                    : "Pembelian kas bahan baku lebih hemat dibandingkan pemakaian menu terjual.",
             ],
         ]);
     }
@@ -913,6 +1046,9 @@ class CashFlowController extends Controller
             'created_by'     => $user->id,
         ]);
 
+        // Auto-post double-entry journal ledger
+        AccountingService::postCashTransaction($trx);
+
         return response()->json([
             'message' => 'Transaksi kas berhasil dicatat',
             'data'    => $trx->fresh(['outlet', 'user']),
@@ -968,6 +1104,9 @@ class CashFlowController extends Controller
             'updated_by'     => $request->user()->id,
         ]);
 
+        // Auto-post double-entry journal ledger
+        AccountingService::postCashTransaction($trx);
+
         return response()->json([
             'message' => 'Transaksi kas berhasil diperbarui',
             'data'    => $trx->fresh(['outlet', 'user']),
@@ -980,6 +1119,11 @@ class CashFlowController extends Controller
     public function destroy($id)
     {
         $trx = CashTransaction::findOrFail($id);
+
+        JournalEntry::where('reference_type', 'CASH_TRANSACTION')
+            ->where('reference_id', $trx->id)
+            ->delete();
+
         $trx->delete();
 
         return response()->json([

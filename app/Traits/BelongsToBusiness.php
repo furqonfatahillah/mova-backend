@@ -52,6 +52,12 @@ trait BelongsToBusiness
                         }
                     }
                 }
+                if (empty($model->business_id) && !empty($model->outlet_id)) {
+                    $model->business_id = \App\Models\Outlet::find($model->outlet_id)?->business_id;
+                }
+                if (empty($model->business_id)) {
+                    $model->business_id = \App\Models\Business::value('id') ?: 1;
+                }
             }
         });
     }

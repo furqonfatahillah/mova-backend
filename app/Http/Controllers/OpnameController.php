@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Opname;
 use App\Models\Ingredient;
 use App\Models\Outlet;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 
 class OpnameController extends Controller
@@ -13,7 +14,12 @@ class OpnameController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $from = $request->from ?? now()->toDateString();
         $to   = $request->to   ?? now()->toDateString();
@@ -47,10 +53,11 @@ class OpnameController extends Controller
         ]);
 
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         } else {
-            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
+            $outletId = (int)($data['outlet_id'] ?? $user?->outlet_id ?? Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->value('id'));
         }
         $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
@@ -199,6 +206,9 @@ class OpnameController extends Controller
                 $user,
                 $opnameDate
             );
+
+            // Auto-post double-entry journal ledger for opname variance
+            AccountingService::postOpname($opname);
         }
 
         $opname->load(['ingredient', 'user', 'creator', 'updater', 'outlet']);
@@ -235,8 +245,13 @@ class OpnameController extends Controller
             ], 422);
         }
 
-        $outletId = $request->outlet_id ?? $request->user()->outlet_id ?? 1;
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+        if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
+            $outletId = (int)$user->outlet_id;
+        } else {
+            $outletId = (int)($request->outlet_id ?? $user?->outlet_id ?? Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->value('id'));
+        }
         $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
         // 2. Tidak boleh tanggal mundur dari sesi opname yang telah di-release sebelumnya di cabang ini
@@ -377,6 +392,11 @@ class OpnameController extends Controller
                 $user,
                 $opnameDate
             );
+
+            // Auto-post double-entry journal ledger for each opname item
+            foreach ($results as $resOpn) {
+                AccountingService::postOpname($resOpn);
+            }
         }
 
         $statusMessage = $isClosed
@@ -508,6 +528,11 @@ class OpnameController extends Controller
                 $user,
                 $firstOpn->opname_date
             );
+
+            // Auto-post double-entry journal ledger for each opname item
+            foreach ($opnames as $opn) {
+                AccountingService::postOpname($opn->fresh());
+            }
         }
 
         return response()->json([
@@ -594,7 +619,12 @@ class OpnameController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $query = Opname::with(['outlet', 'creator', 'user'])
             ->whereNotNull('opname_no')

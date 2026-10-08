@@ -22,6 +22,9 @@ class BatchPrepController extends Controller
      */
     public function indexRecipes(Request $request)
     {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         $query = PrepRecipe::with([
             'ingredient.outletIngredients',
             'ingredient.movements',
@@ -30,6 +33,13 @@ class BatchPrepController extends Controller
             'creator',
             'updater',
         ])->orderBy('name');
+
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhereHas('ingredient', fn($qi) => $qi->where('business_id', $businessId));
+            });
+        }
 
         if ($request->filled('ingredient_id')) {
             $query->where('ingredient_id', $request->ingredient_id);
@@ -79,7 +89,10 @@ class BatchPrepController extends Controller
             'items.*.waste_std'     => 'nullable|numeric|min:0|max:100',
         ]);
 
-        return DB::transaction(function () use ($data, $request) {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
+        return DB::transaction(function () use ($data, $request, $businessId) {
             if (!empty($data['ingredient_id'])) {
                 $ingredient = Ingredient::findOrFail($data['ingredient_id']);
                 $ingredient->type = 'SEMI_FINISHED';
@@ -88,21 +101,23 @@ class BatchPrepController extends Controller
                 if (isset($data['name'])) $ingredient->name = $data['name'];
                 if (isset($data['category'])) $ingredient->category = $data['category'];
                 if (isset($data['stok_min'])) $ingredient->stok_min = $data['stok_min'];
+                if ($businessId && !$ingredient->business_id) $ingredient->business_id = $businessId;
                 $ingredient->save();
             } else {
                 // Generate a unique code for the new Semi-Finished ingredient
                 $code = $data['code'] ?? null;
                 if (!$code) {
-                    $lastIng = Ingredient::orderBy('id', 'desc')->first();
+                    $lastIng = Ingredient::when($businessId, fn($q) => $q->where('business_id', $businessId))->orderBy('id', 'desc')->first();
                     $nextNum = $lastIng ? ($lastIng->id + 1) : 1;
                     $code = 'PRP-' . str_pad($nextNum, 3, '0', STR_PAD_LEFT);
-                    while (Ingredient::where('code', $code)->exists()) {
+                    while (Ingredient::when($businessId, fn($q) => $q->where('business_id', $businessId))->where('code', $code)->exists()) {
                         $nextNum++;
                         $code = 'PRP-' . str_pad($nextNum, 3, '0', STR_PAD_LEFT);
                     }
                 }
 
                 $ingredient = Ingredient::create([
+                    'business_id' => $businessId,
                     'code'        => $code,
                     'name'        => $data['name'],
                     'category'    => $data['category'] ?? 'Bahan Olahan',
@@ -125,8 +140,11 @@ class BatchPrepController extends Controller
             $prepRecipe = PrepRecipe::where('ingredient_id', $ingredient->id)->first();
             if (!$prepRecipe) {
                 $prepRecipe = new PrepRecipe();
+                $prepRecipe->business_id = $businessId;
                 $prepRecipe->ingredient_id = $ingredient->id;
                 $prepRecipe->created_by = $request->user()?->id;
+            } elseif ($businessId && !$prepRecipe->business_id) {
+                $prepRecipe->business_id = $businessId;
             }
 
             $prepRecipe->name = $data['name'];
@@ -261,10 +279,12 @@ class BatchPrepController extends Controller
         $recipe = PrepRecipe::with(['ingredient', 'items.ingredient.outletIngredients'])->findOrFail($request->prep_recipe_id);
         $multiplier = (float)($request->batch_multiplier ?? 1.0);
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         } else {
-            $outletId = (int)($request->outlet_id ?? $user?->outlet_id ?? 1);
+            $outletId = (int)($request->outlet_id ?? $user?->outlet_id ?? Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->value('id'));
         }
 
         $itemsPreview = [];
@@ -367,6 +387,9 @@ class BatchPrepController extends Controller
      */
     public function indexBatches(Request $request)
     {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         $query = BatchPrep::with([
             'ingredient',
             'prepRecipe',
@@ -376,7 +399,13 @@ class BatchPrepController extends Controller
             'movements.ingredient',
         ])->orderByDesc('date')->orderByDesc('id');
 
-        $user = $request->user();
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhereHas('outlet', fn($qo) => $qo->where('business_id', $businessId));
+            });
+        }
+
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
 
         if ($isOutletBounded) {
@@ -432,6 +461,8 @@ class BatchPrepController extends Controller
 
         $recipe = PrepRecipe::with(['ingredient', 'items.ingredient'])->findOrFail($data['prep_recipe_id']);
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         } else {
@@ -443,30 +474,8 @@ class BatchPrepController extends Controller
         $expectedOutputQty = round((float)$recipe->output_qty * $multiplier, 3);
         $allowShortage = (bool)($data['allow_shortage'] ?? false);
 
-        // ⚠️ VALIDASI STOK MINUS: Jika stok bahan olahan atau bahan mentah minus, harus di-adjust terlebih dahulu!
-        $negativeItems = [];
-        $semiFinishedIng = $recipe->ingredient;
-        if ($semiFinishedIng && $semiFinishedIng->stockForOutlet($outletId) < -0.0001) {
-            $sfStock = $semiFinishedIng->stockForOutlet($outletId);
-            $negativeItems[] = "Bahan Olahan '{$semiFinishedIng->name}' (Stok: " . round($sfStock, 3) . " {$semiFinishedIng->unit_pakai})";
-        }
-        foreach ($recipe->items as $item) {
-            $rawIng = $item->ingredient;
-            if ($rawIng && $rawIng->stockForOutlet($outletId) < -0.0001) {
-                $rawStock = $rawIng->stockForOutlet($outletId);
-                $negativeItems[] = "Bahan Mentah '{$rawIng->name}' (Stok: " . round($rawStock, 3) . " {$rawIng->unit_pakai})";
-            }
-        }
-        if (!empty($negativeItems)) {
-            return response()->json([
-                'message' => "Terdapat bahan dengan stok MINUS: " . implode(', ', $negativeItems) . ". Anda harus melakukan Penyesuaian Stok (Adjust Stock / Opname) terlebih dahulu untuk menormalkan saldo minus sebelum melakukan masak produksi per batch.",
-                'error_code' => 'STOCK_NEGATIVE_ADJUSTMENT_REQUIRED',
-                'negative_items' => $negativeItems,
-            ], 422);
-        }
-
         return DB::transaction(function () use (
-            $data, $recipe, $outletId, $multiplier, $actualOutputQty, $date, $expectedOutputQty, $allowShortage, $request
+            $data, $recipe, $outletId, $multiplier, $actualOutputQty, $date, $expectedOutputQty, $allowShortage, $request, $businessId
         ) {
             // Check stock availability if not allow_shortage
             $shortages = [];
@@ -494,7 +503,8 @@ class BatchPrepController extends Controller
 
             // Generate Batch Number: BATCH-YYYYMMDD-XXXX
             $datePrefix = date('Ymd', strtotime($date));
-            $latestBatch = BatchPrep::where('batch_no', 'like', "BATCH-{$datePrefix}-%")
+            $latestBatch = BatchPrep::when($businessId, fn($q) => $q->where('business_id', $businessId))
+                ->where('batch_no', 'like', "BATCH-{$datePrefix}-%")
                 ->orderByDesc('id')
                 ->first();
 
@@ -506,6 +516,7 @@ class BatchPrepController extends Controller
 
             // Create BatchPrep header
             $batchPrep = BatchPrep::create([
+                'business_id'         => $businessId,
                 'outlet_id'           => $outletId,
                 'batch_no'            => $batchNo,
                 'prep_recipe_id'      => $recipe->id,
@@ -541,6 +552,7 @@ class BatchPrepController extends Controller
                 $totalBatchCost += $itemTotalCost;
 
                 StockMovement::create([
+                    'business_id'   => $businessId,
                     'date'          => $date,
                     'ingredient_id' => $rawIng->id,
                     'outlet_id'     => $outletId,
@@ -578,6 +590,7 @@ class BatchPrepController extends Controller
             }
 
             StockMovement::create([
+                'business_id'   => $businessId,
                 'date'          => $date,
                 'ingredient_id' => $semiFinishedIng->id,
                 'outlet_id'     => $outletId,

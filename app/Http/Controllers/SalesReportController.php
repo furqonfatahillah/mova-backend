@@ -93,7 +93,12 @@ class SalesReportController extends Controller
         $outletId   = $this->getTargetOutletId($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId);
 
-        $query = Transaction::with(['menu'])
+        $query = Transaction::with([
+            'menu.recipes.items.ingredient.outletIngredients',
+            'menu.outletMenus',
+            'menu.bundleItems.bundledMenu.recipes.items.ingredient.outletIngredients',
+            'menu.bundleItems.ingredient.outletIngredients'
+        ])
             ->where('business_id', $businessId)
             ->whereBetween('date', [$request->from, $request->to]);
 
@@ -109,6 +114,11 @@ class SalesReportController extends Controller
             $menuId = $t->menu_id ?: ('CUSTOM_' . ($t->notes ?: 'Lain-lain'));
             if (!isset($grouped[$menuId])) {
                 $menu = $t->menu;
+                $calculatedHpp = $menu ? (float)$menu->calculateHpp($t->date, $outletId ?: $t->outlet_id) : 0.0;
+                if ($calculatedHpp <= 0 && $menu) {
+                    $calculatedHpp = (float)($menu->cost_price ?: 0);
+                }
+
                 $grouped[$menuId] = [
                     'menu_id'            => $t->menu_id,
                     'code'               => $menu?->code ?: ($t->menu_id ? (string)$t->menu_id : '-'),
@@ -116,7 +126,7 @@ class SalesReportController extends Controller
                     'qty_sold'           => 0,
                     'qty_refund'         => 0,
                     'unit'               => $menu?->unit ?: 'Cup',
-                    'cost_price'         => (float)($menu?->cost_price ?: 0),
+                    'cost_price'         => $calculatedHpp,
                     'price'              => (float)($menu?->price ?: ($t->total_price / max(1, $t->qty))),
                     'discount_amount'    => 0.0,
                     'total_sales'        => 0.0,
@@ -316,12 +326,12 @@ class SalesReportController extends Controller
             'to'   => 'required|date|after_or_equal:from',
         ]);
 
-        $businessId = $request->user()?->business_id ?? 1;
+        $businessId = $request->user()?->business_id;
         $outletId   = $this->getTargetOutletId($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId);
 
         $query = Transaction::with(['outlet', 'user', 'customer', 'receivable.payments'])
-            ->where('business_id', $businessId)
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
             ->where('status', 'PAID')
             ->whereBetween('date', [$request->from, $request->to])
             ->orderBy('date', 'asc')
@@ -620,7 +630,13 @@ class SalesReportController extends Controller
         $outletId   = $this->getTargetOutletId($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId);
 
-        $query = Transaction::with(['menu', 'user', 'outlet', 'customer', 'discount', 'receivable.payments'])
+        $query = Transaction::with([
+            'menu.recipes.items.ingredient.outletIngredients',
+            'menu.outletMenus',
+            'menu.bundleItems.bundledMenu.recipes.items.ingredient.outletIngredients',
+            'menu.bundleItems.ingredient.outletIngredients',
+            'user', 'outlet', 'customer', 'discount', 'receivable.payments'
+        ])
             ->where('business_id', $businessId)
             ->where('status', 'PAID')
             ->whereBetween('date', [$request->from, $request->to])
@@ -656,7 +672,10 @@ class SalesReportController extends Controller
             }
 
             $qty = (int)$t->qty;
-            $hpp = (float)($menu?->cost_price ?: 0);
+            $hpp = $menu ? (float)$menu->calculateHpp($t->date, $t->outlet_id) : 0.0;
+            if ($hpp <= 0 && $menu) {
+                $hpp = (float)($menu->cost_price ?: 0);
+            }
             $price = (float)($menu?->price ?: ($t->total_price / max(1, $qty)));
             $subtotal = (float)$t->subtotal;
             $disc = (float)($t->discount_amount ?: 0);
@@ -678,21 +697,28 @@ class SalesReportController extends Controller
                 'no'               => $idx + 1,
                 'date'             => $t->created_at ? $t->created_at->format('d/m/Y H:i:s') : ($t->date . ' 00:00:00'),
                 'created_at'       => $t->created_at ? $t->created_at->format('d/m/Y H:i:s') : '',
-                'created_by'       => $t->user?->name ?: 'Lulu',
+                'created_by'       => $t->user?->name ?: ($t->creator?->name ?: 'Kasir'),
                 'order_number'     => $t->order_number,
                 'customer'         => $t->customer_name ?: ($t->customer?->name ?: 'Walk-in Customer'),
+                'customer_name'    => $t->customer_name ?: ($t->customer?->name ?: 'Walk-in Customer'),
                 'promo'            => $t->discount_name ?: ($t->discount?->name ?: ''),
                 'payment_method'   => $payMethod,
                 'deposit_account'  => $depositAccount,
                 'product_code'     => $menu?->code ?: ($t->menu_id ? (string)$t->menu_id : '-'),
+                'item_code'        => $menu?->code ?: ($t->menu_id ? (string)$t->menu_id : '-'),
                 'product_name'     => $menu?->name ?: ($t->notes ?: 'Menu'),
-                'product_category' => $menu?->category ?: 'KOPI',
+                'item_name'        => $menu?->name ?: ($t->notes ?: 'Menu'),
+                'product_category' => $menu?->category ?: ($menu?->categoryModel?->name ?: 'Menu'),
+                'category'         => $menu?->category ?: ($menu?->categoryModel?->name ?: 'Menu'),
                 'sales_type'       => $t->order_type ?: 'Dine-in',
                 'hpp'              => $hpp,
+                'cost_price'       => $hpp,
                 'qty'              => $qty,
-                'unit'             => $menu?->unit ?: 'Cup',
+                'unit'             => $menu?->unit ?: 'porsi',
                 'price'            => $price,
+                'unit_price'       => $price,
                 'discount'         => $disc,
+                'discount_amount'  => $disc,
                 'subtotal'         => $subtotal,
                 'discount_extra'   => 0.0,
                 'discount_customer'=> 0.0,
@@ -700,9 +726,12 @@ class SalesReportController extends Controller
                 'service_charge'   => 0.0,
                 'shipping'         => 0.0,
                 'total_sale'       => $subtotal,
+                'penjualan'        => $subtotal,
+                'total_sales'      => $subtotal,
                 'receivable'       => $remReceivable,
+                'piutang'          => $remReceivable,
                 'profit'           => $profit,
-                'cashier'          => $t->user?->name ?: 'Lulu',
+                'cashier'          => $t->user?->name ?: ($t->creator?->name ?: 'Kasir'),
                 'receipt_printed'  => 0,
             ];
         }
@@ -713,6 +742,7 @@ class SalesReportController extends Controller
                 return str_contains(strtolower($it['order_number']), $s)
                     || str_contains(strtolower($it['customer']), $s)
                     || str_contains(strtolower($it['product_name']), $s)
+                    || str_contains(strtolower($it['item_name']), $s)
                     || str_contains(strtolower($it['product_code']), $s)
                     || str_contains(strtolower($it['cashier']), $s);
             });
@@ -727,7 +757,8 @@ class SalesReportController extends Controller
             'total_items'      => count($items),
             'total_qty'        => array_sum(array_column($items, 'qty')),
             'total_discount'   => array_sum(array_column($items, 'discount')),
-            'total_sale'       => array_sum(array_column($items, 'total_sale')),
+            'total_sales'      => array_sum(array_column($items, 'subtotal')),
+            'total_sale'       => array_sum(array_column($items, 'subtotal')),
             'total_receivable' => array_sum(array_column($items, 'receivable')),
             'total_profit'     => array_sum(array_column($items, 'profit')),
         ];
@@ -847,21 +878,30 @@ class SalesReportController extends Controller
                 'date'             => $t->created_at ? $t->created_at->format('d/m/Y H:i:s') : ($t->date . ' 00:00:00'),
                 'customer_code'    => $customer?->code ?: ($t->customer_id ? (string)$t->customer_id : '-'),
                 'customer_name'    => $t->customer_name ?: ($customer?->name ?: 'Walk-in Customer'),
+                'customer'         => $t->customer_name ?: ($customer?->name ?: 'Walk-in Customer'),
                 'customer_group'   => 'Reguler',
                 'order_number'     => $t->order_number,
+                'transaction_no'   => $t->order_number,
                 'product_name'     => $menu?->name ?: ($t->notes ?: 'Menu'),
+                'item_name'        => $menu?->name ?: ($t->notes ?: 'Menu'),
                 'qty'              => $qty,
                 'unit'             => $menu?->unit ?: 'Cup',
                 'price'            => $price,
+                'unit_price'       => $price,
                 'discount'         => (float)($t->discount_amount ?: 0),
+                'discount_amount'  => (float)($t->discount_amount ?: 0),
                 'tax'              => 0.0,
                 'service_charge'   => 0.0,
                 'shipping'         => 0.0,
                 'total'            => $subtotal,
+                'subtotal'         => $subtotal,
+                'total_sales'      => $subtotal,
                 'total_paid'       => $paid,
+                'paid'             => $paid,
                 'payment_method'   => $payMethod,
                 'receivable'       => $receivable,
-                'cashier'          => $t->user?->name ?: 'Lulu',
+                'piutang'          => $receivable,
+                'cashier'          => $t->user?->name ?: ($t->creator?->name ?: 'Kasir'),
             ];
         }
 
@@ -871,6 +911,7 @@ class SalesReportController extends Controller
                 return str_contains(strtolower($it['customer_name']), $s)
                     || str_contains(strtolower($it['customer_code']), $s)
                     || str_contains(strtolower($it['product_name']), $s)
+                    || str_contains(strtolower($it['item_name']), $s)
                     || str_contains(strtolower($it['order_number']), $s);
             });
             $items = array_values($items);
@@ -884,8 +925,10 @@ class SalesReportController extends Controller
             'total_rows'       => count($items),
             'total_qty'        => array_sum(array_column($items, 'qty')),
             'total_amount'     => array_sum(array_column($items, 'total')),
+            'total_sales'      => array_sum(array_column($items, 'total')),
             'total_paid'       => array_sum(array_column($items, 'total_paid')),
             'total_receivable' => array_sum(array_column($items, 'receivable')),
+            'total_piutang'    => array_sum(array_column($items, 'receivable')),
         ];
 
         $comparePeriod = $this->resolveComparePeriod($request, $request->from, $request->to);
@@ -1003,8 +1046,12 @@ class SalesReportController extends Controller
             $items[] = [
                 'no'               => $idx++,
                 'waktu'            => $key,
+                'jam'              => $key,
+                'hour_range'       => $key,
                 'total_penjualan'  => $sales,
+                'total_sales'      => $sales,
                 'avg_penjualan'    => $avgSales,
+                'rata_rata'        => $avgSales,
                 'penjualan_pct'    => $salesPct,
                 'transaksi'        => $trxCount,
                 'transaksi_pct'    => $trxPct,
@@ -1017,6 +1064,7 @@ class SalesReportController extends Controller
 
         $summary = [
             'total_sales'        => $grandSales,
+            'total_penjualan'    => $grandSales,
             'total_transactions' => $grandTransactions,
             'total_products'     => $grandProducts,
             'total_guests'       => $grandGuests,
@@ -1122,6 +1170,8 @@ class SalesReportController extends Controller
             $items[] = [
                 'no'               => $idx + 1,
                 'customer'         => $r->customer_name ?: ($r->customer?->name ?: 'Walk-in Customer'),
+                'customer_name'    => $r->customer_name ?: ($r->customer?->name ?: 'Walk-in Customer'),
+                'customer_phone'   => $r->customer?->phone ?: '-',
                 'ar_type'          => $arType,
                 'ar_type_label'    => $typeLabel,
                 'merchant_channel' => $channel,
@@ -1131,13 +1181,20 @@ class SalesReportController extends Controller
                 'payments_count'   => $r->payments->count(),
                 'last_payment_date'=> $latestPayment && $latestPayment->payment_date ? (is_string($latestPayment->payment_date) ? date('d/m/Y', strtotime($latestPayment->payment_date)) : $latestPayment->payment_date->format('d/m/Y')) : null,
                 'tanggal'          => $r->issue_date ? date('d/m/Y', strtotime($r->issue_date)) : '',
+                'date'             => $r->issue_date ? date('d/m/Y', strtotime($r->issue_date)) : '',
                 'jam'              => $r->created_at ? $r->created_at->format('H:i') : '00:00',
                 'no_penjualan'     => $r->order_number ?: ($r->receivable_no ?: '-'),
+                'transaction_no'   => $r->order_number ?: ($r->receivable_no ?: '-'),
+                'receivable_no'    => $r->receivable_no ?: ($r->order_number ?: '-'),
+                'order_number'     => $r->order_number ?: ($r->receivable_no ?: '-'),
                 'gross_amount'     => (float)$r->total_amount,
+                'total_amount'     => (float)$r->total_amount,
                 'mdr_fee'          => (float)($r->mdr_fee ?? 0),
                 'piutang'          => (float)$r->total_amount,
                 'dibayar'          => (float)$r->paid_amount,
+                'paid_amount'      => (float)$r->paid_amount,
                 'sisa_piutang'     => (float)$r->remaining_amount,
+                'remaining_amount' => (float)$r->remaining_amount,
                 'net_amount'       => (float)($r->net_amount > 0 ? $r->net_amount : $r->total_amount),
                 'settlement_status'=> $r->settlement_status ?: (($r->status === 'PAID') ? 'SETTLED' : 'UNSETTLED'),
                 'settled_at'       => $r->settled_at ? $r->settled_at->format('d/m/Y') : null,
@@ -1145,22 +1202,105 @@ class SalesReportController extends Controller
                 'usia_piutang'     => "{$diffDays} Hari",
                 'usia_days'        => $diffDays,
                 'jatuh_tempo'      => $r->due_date ? date('d/m/Y', strtotime($r->due_date)) : '-',
+                'due_date'         => $r->due_date ? date('d/m/Y', strtotime($r->due_date)) : '-',
                 'status'           => $r->status,
             ];
+        }
+
+        // Include Active Open Bills in Laporan Buku Piutang if applicable
+        $allowOpenBills = !$request->filled('ar_type') || $request->ar_type === 'ALL' || $request->ar_type === 'all' || $request->ar_type === 'OPEN_BILL';
+        if ($allowOpenBills) {
+            $openBillsQuery = \App\Models\Transaction::with(['menu', 'user', 'outlet', 'customer'])
+                ->where('status', 'HOLD')
+                ->whereBetween('date', [$request->from, $request->to])
+                ->orderBy('created_at', 'asc');
+
+            if ($businessId) {
+                $openBillsQuery->where('business_id', $businessId);
+            }
+            if ($outletId) {
+                $openBillsQuery->where('outlet_id', $outletId);
+            }
+
+            $obRows = $openBillsQuery->get();
+            $obGrouped = [];
+            foreach ($obRows as $t) {
+                $ord = $t->order_number;
+                if (!isset($obGrouped[$ord])) {
+                    $obGrouped[$ord] = [
+                        'order_number'  => $ord,
+                        'date'          => $t->date ?: (is_string($t->created_at) ? substr($t->created_at, 0, 10) : now()->toDateString()),
+                        'created_at'    => $t->created_at,
+                        'customer_name' => $t->customer_name ?: ($t->table_number ? 'Meja ' . $t->table_number : 'Walk-in Customer'),
+                        'table_number'  => $t->table_number,
+                        'total_price'   => 0.0,
+                    ];
+                }
+                $obGrouped[$ord]['total_price'] += (float)$t->total_price;
+            }
+
+            foreach ($obGrouped as $ob) {
+                $issueTs = strtotime($ob['date']);
+                $diffDays = max(0, (int)floor(($todayTs - $issueTs) / 86400));
+                $items[] = [
+                    'no'               => count($items) + 1,
+                    'customer'         => $ob['customer_name'] . ($ob['table_number'] ? " (Meja {$ob['table_number']})" : ''),
+                    'customer_name'    => $ob['customer_name'],
+                    'customer_phone'   => '-',
+                    'ar_type'          => 'OPEN_BILL',
+                    'ar_type_label'    => 'Piutang Open Bill (Tagihan Meja)',
+                    'merchant_channel' => 'Open Bill Meja',
+                    'payment_method'   => 'BELUM BAYAR (OPEN BILL)',
+                    'payment_methods'  => [],
+                    'latest_payment_method' => null,
+                    'payments_count'   => 0,
+                    'last_payment_date'=> null,
+                    'tanggal'          => date('d/m/Y', strtotime($ob['date'])),
+                    'date'             => date('d/m/Y', strtotime($ob['date'])),
+                    'jam'              => $ob['created_at'] ? (is_string($ob['created_at']) ? substr($ob['created_at'], 11, 5) : $ob['created_at']->format('H:i')) : '00:00',
+                    'no_penjualan'     => $ob['order_number'],
+                    'transaction_no'   => $ob['order_number'],
+                    'receivable_no'    => $ob['order_number'],
+                    'order_number'     => $ob['order_number'],
+                    'gross_amount'     => (float)$ob['total_price'],
+                    'total_amount'     => (float)$ob['total_price'],
+                    'mdr_fee'          => 0,
+                    'piutang'          => (float)$ob['total_price'],
+                    'dibayar'          => 0,
+                    'paid_amount'      => 0,
+                    'sisa_piutang'     => (float)$ob['total_price'],
+                    'remaining_amount' => (float)$ob['total_price'],
+                    'net_amount'       => (float)$ob['total_price'],
+                    'settlement_status'=> 'UNSETTLED',
+                    'settled_at'       => null,
+                    'settlement_bank'  => null,
+                    'usia_piutang'     => "{$diffDays} Hari",
+                    'usia_days'        => $diffDays,
+                    'jatuh_tempo'      => date('d/m/Y', strtotime($ob['date'])),
+                    'due_date'         => date('d/m/Y', strtotime($ob['date'])),
+                    'status'           => 'OPEN_BILL',
+                ];
+            }
         }
 
         $custItems = array_filter($items, fn($it) => $it['ar_type'] === 'CUSTOMER');
         $qrisItems = array_filter($items, fn($it) => $it['ar_type'] === 'MERCHANT_QRIS');
         $ecomItems = array_filter($items, fn($it) => $it['ar_type'] === 'MERCHANT_ECOMMERCE');
+        $obItems   = array_filter($items, fn($it) => $it['ar_type'] === 'OPEN_BILL');
 
         $summary = [
             'total_rows'               => count($items),
             'total_piutang'            => array_sum(array_column($items, 'piutang')),
+            'total_gross_piutang'      => array_sum(array_column($items, 'piutang')),
+            'total_mdr_fee'            => array_sum(array_column($items, 'mdr_fee')),
+            'total_net_piutang'        => array_sum(array_column($items, 'net_amount')),
             'total_dibayar'            => array_sum(array_column($items, 'dibayar')),
             'total_sisa_piutang'       => array_sum(array_column($items, 'sisa_piutang')),
-            // Breakdown for Customer vs Merchant (QRIS & E-Commerce)
+            // Breakdown for Customer, Open Bill vs Merchant
             'total_customer_piutang'   => array_sum(array_column($custItems, 'piutang')),
             'total_customer_sisa'      => array_sum(array_column($custItems, 'sisa_piutang')),
+            'total_open_bill_piutang'  => array_sum(array_column($obItems, 'piutang')),
+            'total_open_bill_sisa'     => array_sum(array_column($obItems, 'sisa_piutang')),
             'total_merchant_qris'      => array_sum(array_column($qrisItems, 'piutang')),
             'total_qris_unsettled'     => array_sum(array_column($qrisItems, 'sisa_piutang')),
             'total_merchant_ecommerce' => array_sum(array_column($ecomItems, 'piutang')),
@@ -1237,11 +1377,21 @@ class SalesReportController extends Controller
             $items[] = [
                 'no'               => $idx++,
                 'tanggal'          => $g['tanggal'],
+                'date'             => $g['date_raw'],
                 'promo'            => $g['promo'],
+                'nama_promo'       => $g['promo'],
+                'name'             => $g['promo'],
+                'code'             => '-',
                 'jenis'            => $g['jenis'],
+                'type'             => $g['jenis'],
                 'jumlah_transaksi' => $trxCount,
+                'count'            => $trxCount,
+                'used_count'       => $trxCount,
                 'nilai'            => (float)$g['nilai'],
+                'discount_amount'  => (float)$g['nilai'],
+                'total_discount'   => (float)$g['nilai'],
                 'penjualan_promo'  => (float)$g['penjualan_promo'],
+                'total_sales'      => (float)$g['penjualan_promo'],
             ];
         }
 
@@ -1262,8 +1412,11 @@ class SalesReportController extends Controller
         $summary = [
             'total_rows'             => count($items),
             'total_promo'            => array_sum(array_column($items, 'jumlah_transaksi')),
+            'total_transactions'     => array_sum(array_column($items, 'jumlah_transaksi')),
             'total_nilai'            => array_sum(array_column($items, 'nilai')),
+            'total_discount'         => array_sum(array_column($items, 'nilai')),
             'total_penjualan_promo'  => array_sum(array_column($items, 'penjualan_promo')),
+            'total_sales'            => array_sum(array_column($items, 'penjualan_promo')),
         ];
 
         return response()->json([

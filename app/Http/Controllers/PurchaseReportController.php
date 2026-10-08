@@ -21,6 +21,7 @@ class PurchaseReportController extends Controller
     private function resolveOutletScope(Request $request): array
     {
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
 
         if ($isOutletBounded) {
@@ -37,7 +38,7 @@ class PurchaseReportController extends Controller
         if ($reqOutletId && $reqOutletId !== 'ALL' && $reqOutletId !== 'all') {
             $outletId = (int)$reqOutletId;
             $outlet = Outlet::find($outletId);
-            $isHolding = $outlet ? (bool)$outlet->is_main : ($outletId == 1);
+            $isHolding = $outlet ? (bool)$outlet->is_main : false;
             $scope = $isHolding ? 'HOLDING' : 'OUTLET';
             return [$outletId, $scope, $isHolding];
         }
@@ -51,6 +52,7 @@ class PurchaseReportController extends Controller
     private function getContextNames(Request $request, ?int $outletId, string $scope): array
     {
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
         $business = $user?->business;
         $businessName = $business?->name ?: ($user?->business_name ?: 'MOVA POS');
 
@@ -58,7 +60,7 @@ class PurchaseReportController extends Controller
             $ot = Outlet::find($outletId);
             $outletName = $ot ? $ot->name : "Outlet #{$outletId}";
         } elseif ($scope === 'HOLDING') {
-            $holding = Outlet::where('is_main', true)->first();
+            $holding = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->where('is_main', true)->first();
             $outletName = $holding ? "Holding - {$holding->name}" : 'Holding (Pusat / Gudang Utama)';
         } elseif ($scope === 'OUTLET') {
             $outletName = 'Semua Outlet Cabang (Kas Only)';
@@ -102,6 +104,9 @@ class PurchaseReportController extends Controller
         $from = $request->input('from', now()->startOfMonth()->toDateString());
         $to   = $request->input('to', now()->toDateString());
 
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         [$outletId, $scope, $isHolding] = $this->resolveOutletScope($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId, $scope);
 
@@ -111,16 +116,25 @@ class PurchaseReportController extends Controller
             ->orderBy('date', 'desc')
             ->orderBy('id', 'desc');
 
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhereHas('outlet', fn($qo) => $qo->where('business_id', $businessId));
+            });
+        }
+
         // Apply outlet or scope filter
+        $holdingIds = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->where('is_main', true)->pluck('id')->toArray();
+        if (empty($holdingIds)) {
+            $firstOt = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->orderBy('id', 'asc')->value('id');
+            $holdingIds = $firstOt ? [$firstOt] : [];
+        }
+
         if ($outletId) {
             $query->where('outlet_id', $outletId);
         } elseif ($scope === 'HOLDING') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $query->whereIn('outlet_id', $holdingIds);
         } elseif ($scope === 'OUTLET') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $query->whereNotIn('outlet_id', $holdingIds);
             // Outlet Cabang rule: Kas Only
             $query->where('payment_type', 'CASH');
@@ -183,7 +197,7 @@ class PurchaseReportController extends Controller
             $pembelian = $subtotal;
 
             $payType = strtoupper($m->payment_type ?: 'CASH');
-            $isRowHolding = $ot ? (bool)$ot->is_main : ((int)$m->outlet_id === 1);
+            $isRowHolding = $ot ? (bool)$ot->is_main : false;
 
             // Compute paid vs debt
             if ($payType === 'HUTANG') {
@@ -283,6 +297,9 @@ class PurchaseReportController extends Controller
         $from = $request->input('from', now()->startOfMonth()->toDateString());
         $to   = $request->input('to', now()->toDateString());
 
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         [$outletId, $scope, $isHolding] = $this->resolveOutletScope($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId, $scope);
 
@@ -290,15 +307,24 @@ class PurchaseReportController extends Controller
             ->where('type', 'PURCHASE')
             ->whereBetween('date', [$from, $to]);
 
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhereHas('outlet', fn($qo) => $qo->where('business_id', $businessId));
+            });
+        }
+
+        $holdingIds = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->where('is_main', true)->pluck('id')->toArray();
+        if (empty($holdingIds)) {
+            $firstOt = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->orderBy('id', 'asc')->value('id');
+            $holdingIds = $firstOt ? [$firstOt] : [];
+        }
+
         if ($outletId) {
             $query->where('outlet_id', $outletId);
         } elseif ($scope === 'HOLDING') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $query->whereIn('outlet_id', $holdingIds);
         } elseif ($scope === 'OUTLET') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $query->whereNotIn('outlet_id', $holdingIds);
             $query->where('payment_type', 'CASH');
         }
@@ -405,6 +431,9 @@ class PurchaseReportController extends Controller
         $from = $request->input('from', now()->startOfMonth()->toDateString());
         $to   = $request->input('to', now()->toDateString());
 
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         [$outletId, $scope, $isHolding] = $this->resolveOutletScope($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId, $scope);
 
@@ -413,15 +442,24 @@ class PurchaseReportController extends Controller
             ->whereBetween('date', [$from, $to])
             ->orderBy('date', 'desc');
 
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhereHas('outlet', fn($qo) => $qo->where('business_id', $businessId));
+            });
+        }
+
+        $holdingIds = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->where('is_main', true)->pluck('id')->toArray();
+        if (empty($holdingIds)) {
+            $firstOt = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->orderBy('id', 'asc')->value('id');
+            $holdingIds = $firstOt ? [$firstOt] : [];
+        }
+
         if ($outletId) {
             $query->where('outlet_id', $outletId);
         } elseif ($scope === 'HOLDING') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $query->whereIn('outlet_id', $holdingIds);
         } elseif ($scope === 'OUTLET') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $query->whereNotIn('outlet_id', $holdingIds);
             $query->where('payment_type', 'CASH');
         }
@@ -560,6 +598,9 @@ class PurchaseReportController extends Controller
         $from = $request->input('from', now()->startOfMonth()->toDateString());
         $to   = $request->input('to', now()->toDateString());
 
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         [$outletId, $scope, $isHolding] = $this->resolveOutletScope($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId, $scope);
 
@@ -587,6 +628,10 @@ class PurchaseReportController extends Controller
             ->whereBetween('issue_date', [$from, $to])
             ->orderBy('issue_date', 'desc')
             ->orderBy('id', 'desc');
+
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
 
         if ($outletId) {
             $query->where('outlet_id', $outletId);
@@ -702,6 +747,9 @@ class PurchaseReportController extends Controller
         $from = $request->input('from', now()->startOfMonth()->toDateString());
         $to   = $request->input('to', now()->toDateString());
 
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         [$outletId, $scope, $isHolding] = $this->resolveOutletScope($request);
         [$businessName, $outletName] = $this->getContextNames($request, $outletId, $scope);
 
@@ -712,15 +760,21 @@ class PurchaseReportController extends Controller
             ->orderBy('date', 'desc')
             ->orderBy('id', 'desc');
 
+        if ($businessId) {
+            $transferQuery->where('business_id', $businessId);
+        }
+
+        $holdingIds = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->where('is_main', true)->pluck('id')->toArray();
+        if (empty($holdingIds)) {
+            $firstOt = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->orderBy('id', 'asc')->value('id');
+            $holdingIds = $firstOt ? [$firstOt] : [];
+        }
+
         if ($outletId) {
             $transferQuery->where('destination_outlet_id', $outletId);
         } elseif ($scope === 'HOLDING') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $transferQuery->whereIn('destination_outlet_id', $holdingIds);
         } elseif ($scope === 'OUTLET') {
-            $holdingIds = Outlet::where('is_main', true)->pluck('id')->toArray();
-            if (empty($holdingIds)) $holdingIds = [1];
             $transferQuery->whereNotIn('destination_outlet_id', $holdingIds);
         }
 

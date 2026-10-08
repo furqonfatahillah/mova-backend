@@ -6,6 +6,8 @@ use App\Models\Receivable;
 use App\Models\ReceivablePayment;
 use App\Models\Outlet;
 use App\Models\Customer;
+use App\Models\JournalEntry;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -15,7 +17,12 @@ class ReceivableController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         // Auto-sync POS transactions paid with QRIS or E-commerce channels
         $this->syncMerchantReceivables($user?->business_id, $outletId);
@@ -104,6 +111,81 @@ class ReceivableController extends Controller
 
         $items = $query->get();
 
+        // Calculate active Open Bills (Piutang Open Bill / Tagihan Meja Aktif)
+        $bizId = $user?->business_id;
+        $openBillsQuery = \App\Models\Transaction::with(['menu', 'user', 'outlet', 'modifiers', 'customer'])
+            ->where('status', 'HOLD')
+            ->orderBy('created_at', 'asc');
+
+        if ($bizId) {
+            $openBillsQuery->where('business_id', $bizId);
+        }
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $openBillsQuery->where('outlet_id', $outletId);
+        }
+
+        $openBillRows = $openBillsQuery->get();
+        $openBillsGrouped = [];
+        foreach ($openBillRows as $t) {
+            $ord = $t->order_number;
+            if (!isset($openBillsGrouped[$ord])) {
+                $openBillsGrouped[$ord] = [
+                    'id'              => $t->id,
+                    'order_number'    => $ord,
+                    'receivable_no'   => $ord,
+                    'status'          => 'HOLD',
+                    'ar_type'         => 'OPEN_BILL',
+                    'date'            => $t->date,
+                    'issue_date'      => $t->date ?: (is_string($t->created_at) ? substr($t->created_at, 0, 10) : $t->created_at?->format('Y-m-d') ?? now()->toDateString()),
+                    'due_date'        => $t->date ?: (is_string($t->created_at) ? substr($t->created_at, 0, 10) : $t->created_at?->format('Y-m-d') ?? now()->toDateString()),
+                    'customer_id'     => $t->customer_id,
+                    'customer_name'   => $t->customer_name ?: ($t->table_number ? 'Meja ' . $t->table_number : 'Walk-in Customer'),
+                    'customer_phone'  => $t->customer?->phone ?? null,
+                    'customer_address'=> $t->customer?->address ?? null,
+                    'table_number'    => $t->table_number,
+                    'order_type'      => $t->order_type,
+                    'notes'           => $t->notes,
+                    'outlet_id'       => $t->outlet_id,
+                    'outlet_name'     => $t->outlet?->name ?? 'Outlet',
+                    'shift_id'        => $t->shift_id,
+                    'subtotal'        => 0.0,
+                    'discount_amount' => 0.0,
+                    'total_amount'    => 0.0,
+                    'paid_amount'     => 0.0,
+                    'remaining_amount'=> 0.0,
+                    'cashier_name'    => $t->user?->name ?? 'Kasir',
+                    'created_at'      => is_string($t->created_at) ? $t->created_at : $t->created_at?->toDateTimeString(),
+                    'total_items'     => 0,
+                    'items'           => [],
+                ];
+            }
+            $itemSub = (float)($t->subtotal ?: $t->total_price);
+            $itemDisc = (float)($t->discount_amount ?? 0);
+            $itemTot = (float)$t->total_price;
+            $openBillsGrouped[$ord]['subtotal'] += $itemSub;
+            $openBillsGrouped[$ord]['discount_amount'] += $itemDisc;
+            $openBillsGrouped[$ord]['total_amount'] += $itemTot;
+            $openBillsGrouped[$ord]['remaining_amount'] += $itemTot;
+            $openBillsGrouped[$ord]['total_items'] += (int)$t->qty;
+            $openBillsGrouped[$ord]['items'][] = [
+                'id'          => $t->id,
+                'menu_name'   => $t->menu?->name ?? 'Menu',
+                'price'       => (float)($t->menu?->price ?? 0),
+                'qty'         => (int)$t->qty,
+                'total_price' => $itemTot,
+                'notes'       => $t->notes,
+            ];
+        }
+
+        $openBillsList = array_values($openBillsGrouped);
+        $openBillsTotal = array_sum(array_column($openBillsList, 'total_amount'));
+        $openBillsCount = count($openBillsList);
+
+        // If ar_type is specifically OPEN_BILL, return open bills as items
+        if ($request->filled('ar_type') && $request->ar_type === 'OPEN_BILL') {
+            $items = collect($openBillsList);
+        }
+
         // Calculate KPI Stats based on current tenant & outlet scope
         $statsQuery = Receivable::query();
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
@@ -156,8 +238,9 @@ class ReceivableController extends Controller
         $totalCustomers = $allTenantReceivables->where('ar_type', 'CUSTOMER')->pluck('customer_name')->map(fn($n) => strtolower(trim($n)))->unique()->count();
 
         return response()->json([
-            'data'  => $items,
-            'stats' => [
+            'data'       => $items,
+            'open_bills' => $openBillsList,
+            'stats'      => [
                 'total_receivables'          => (float)$totalReceivables,
                 'total_remaining'            => (float)$totalRemaining,
                 'total_paid'                 => (float)$totalPaid,
@@ -168,6 +251,10 @@ class ReceivableController extends Controller
                 'count_partial'              => $countPartial,
                 'count_paid'                 => $countPaid,
                 'total_customers'            => $totalCustomers,
+                // Open Bill stats
+                'open_bills_total'           => (float)$openBillsTotal,
+                'open_bills_count'           => (int)$openBillsCount,
+                'grand_total_remaining'      => (float)($totalRemaining + $openBillsTotal),
                 // AR Breakdown
                 'ar_customer_total'          => (float)$arCustTotal,
                 'ar_customer_remaining'      => (float)$arCustRemaining,
@@ -191,7 +278,12 @@ class ReceivableController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $query = Receivable::with(['customer', 'outlet', 'payments'])
             ->where('ar_type', 'CUSTOMER')
@@ -199,6 +291,38 @@ class ReceivableController extends Controller
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
+        }
+
+        if ($request->filled('status') && $request->status !== 'ALL' && $request->status !== 'all') {
+            if ($request->status === 'OVERDUE') {
+                $query->where('status', '!=', 'PAID')
+                      ->where('status', '!=', 'CANCELLED')
+                      ->where('due_date', '<', now()->toDateString());
+            } else {
+                $query->where('status', $request->status);
+            }
+        }
+
+        if ($request->filled('due_filter')) {
+            $today = now()->toDateString();
+            if ($request->due_filter === 'OVERDUE') {
+                $query->where('status', '!=', 'PAID')
+                      ->where('status', '!=', 'CANCELLED')
+                      ->where('due_date', '<', $today);
+            } elseif ($request->due_filter === 'TODAY') {
+                $query->where('due_date', $today);
+            } elseif ($request->due_filter === 'THIS_WEEK') {
+                $query->whereBetween('due_date', [$today, now()->addDays(7)->toDateString()]);
+            } elseif ($request->due_filter === 'THIS_MONTH') {
+                $query->whereBetween('due_date', [now()->startOfMonth()->toDateString(), now()->endOfMonth()->toDateString()]);
+            }
+        }
+
+        if ($request->filled('from')) {
+            $query->where('issue_date', '>=', $request->from);
+        }
+        if ($request->filled('to')) {
+            $query->where('issue_date', '<=', $request->to);
         }
 
         if ($request->filled('q')) {
@@ -255,7 +379,7 @@ class ReceivableController extends Controller
                 }
             }
 
-            $result[] = [
+            $result[$key] = [
                 'group_key'         => $key,
                 'customer_id'       => $first->customer_id,
                 'customer_name'     => $first->customer_name,
@@ -266,19 +390,139 @@ class ReceivableController extends Controller
                 'total_kasbon'      => $totalKasbon,
                 'total_paid'        => $totalPaid,
                 'total_remaining'   => $totalRemaining,
+                'open_bills_total'  => 0.0,
+                'open_bills_count'  => 0,
+                'has_open_bill'     => false,
+                'total_remaining_with_open_bills' => $totalRemaining,
                 'latest_issue_date' => $items->max('issue_date'),
                 'oldest_due_date'   => $unpaidItems->min('due_date') ?? $items->min('due_date'),
                 'has_overdue'       => $unpaidItems->contains(fn($i) => $i->is_overdue),
                 'unpaid_items'      => $unpaidItems,
                 'all_items'         => $items->values(),
+                'open_bills'        => [],
             ];
         }
 
-        // Sort by total_remaining DESC (highest active debt first)
-        usort($result, fn($a, $b) => $b['total_remaining'] <=> $a['total_remaining']);
+        // Fetch active Open Bills (status = 'HOLD')
+        $bizId = $user?->business_id;
+        $openBillsQuery = \App\Models\Transaction::with(['menu', 'user', 'outlet', 'modifiers', 'customer'])
+            ->where('status', 'HOLD')
+            ->orderBy('created_at', 'asc');
+
+        if ($bizId) {
+            $openBillsQuery->where('business_id', $bizId);
+        }
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $openBillsQuery->where('outlet_id', $outletId);
+        }
+
+        $openBillRows = $openBillsQuery->get();
+        $openBillsGrouped = [];
+        foreach ($openBillRows as $t) {
+            $ord = $t->order_number;
+            if (!isset($openBillsGrouped[$ord])) {
+                $openBillsGrouped[$ord] = [
+                    'id'              => $t->id,
+                    'order_number'    => $ord,
+                    'receivable_no'   => $ord,
+                    'status'          => 'HOLD',
+                    'ar_type'         => 'OPEN_BILL',
+                    'date'            => $t->date,
+                    'issue_date'      => $t->date ?: (is_string($t->created_at) ? substr($t->created_at, 0, 10) : $t->created_at?->format('Y-m-d') ?? now()->toDateString()),
+                    'due_date'        => $t->date ?: (is_string($t->created_at) ? substr($t->created_at, 0, 10) : $t->created_at?->format('Y-m-d') ?? now()->toDateString()),
+                    'customer_id'     => $t->customer_id,
+                    'customer_name'   => $t->customer_name ?: ($t->table_number ? 'Meja ' . $t->table_number : 'Walk-in Customer'),
+                    'customer_phone'  => $t->customer?->phone ?? null,
+                    'customer_address'=> $t->customer?->address ?? null,
+                    'table_number'    => $t->table_number,
+                    'order_type'      => $t->order_type,
+                    'notes'           => $t->notes,
+                    'outlet_id'       => $t->outlet_id,
+                    'outlet_name'     => $t->outlet?->name ?? 'Outlet',
+                    'shift_id'        => $t->shift_id,
+                    'subtotal'        => 0.0,
+                    'discount_amount' => 0.0,
+                    'total_amount'    => 0.0,
+                    'paid_amount'     => 0.0,
+                    'remaining_amount'=> 0.0,
+                    'cashier_name'    => $t->user?->name ?? 'Kasir',
+                    'created_at'      => is_string($t->created_at) ? $t->created_at : $t->created_at?->toDateTimeString(),
+                    'total_items'     => 0,
+                    'items'           => [],
+                    'is_open_bill'    => true,
+                ];
+            }
+            $itemSub = (float)($t->subtotal ?: $t->total_price);
+            $itemDisc = (float)($t->discount_amount ?? 0);
+            $itemTot = (float)$t->total_price;
+            $openBillsGrouped[$ord]['subtotal'] += $itemSub;
+            $openBillsGrouped[$ord]['discount_amount'] += $itemDisc;
+            $openBillsGrouped[$ord]['total_amount'] += $itemTot;
+            $openBillsGrouped[$ord]['remaining_amount'] += $itemTot;
+            $openBillsGrouped[$ord]['total_items'] += (int)$t->qty;
+            $openBillsGrouped[$ord]['items'][] = [
+                'id'          => $t->id,
+                'menu_name'   => $t->menu?->name ?? 'Menu',
+                'price'       => (float)($t->menu?->price ?? 0),
+                'qty'         => (int)$t->qty,
+                'total_price' => $itemTot,
+                'notes'       => $t->notes,
+            ];
+        }
+
+        foreach ($openBillsGrouped as $ord => $ob) {
+            $key = null;
+            if ($ob['customer_id']) {
+                $key = "ID_" . $ob['customer_id'];
+            } else {
+                $p = $normPhone($ob['customer_phone']);
+                $name = strtolower(trim((string)$ob['customer_name']));
+                if (!empty($p) && strlen($p) >= 6) {
+                    $key = "CUST_" . $name . "_" . $p;
+                } else {
+                    $key = "NAME_" . $name;
+                }
+            }
+
+            if (isset($result[$key])) {
+                $result[$key]['open_bills'][] = $ob;
+                $result[$key]['open_bills_total'] = ($result[$key]['open_bills_total'] ?? 0) + $ob['total_amount'];
+                $result[$key]['open_bills_count'] = ($result[$key]['open_bills_count'] ?? 0) + 1;
+                $result[$key]['has_open_bill'] = true;
+                $result[$key]['total_remaining_with_open_bills'] = $result[$key]['total_remaining'] + $result[$key]['open_bills_total'];
+            } else {
+                $result[$key] = [
+                    'group_key'         => $key,
+                    'customer_id'       => $ob['customer_id'],
+                    'customer_name'     => $ob['customer_name'],
+                    'customer_phone'    => $ob['customer_phone'],
+                    'customer_address'  => $ob['customer_address'],
+                    'total_transactions'=> 0,
+                    'unpaid_count'      => 0,
+                    'total_kasbon'      => 0.0,
+                    'total_paid'        => 0.0,
+                    'total_remaining'   => 0.0,
+                    'open_bills_total'  => (float)$ob['total_amount'],
+                    'open_bills_count'  => 1,
+                    'has_open_bill'     => true,
+                    'total_remaining_with_open_bills' => (float)$ob['total_amount'],
+                    'latest_issue_date' => $ob['issue_date'],
+                    'oldest_due_date'   => $ob['due_date'],
+                    'has_overdue'       => false,
+                    'unpaid_items'      => collect([]),
+                    'all_items'         => collect([]),
+                    'open_bills'        => [$ob],
+                ];
+            }
+        }
+
+        $resultValues = array_values($result);
+
+        // Sort by total_remaining_with_open_bills DESC (highest active debt first)
+        usort($resultValues, fn($a, $b) => $b['total_remaining_with_open_bills'] <=> $a['total_remaining_with_open_bills']);
 
         return response()->json([
-            'data' => $result
+            'data' => $resultValues
         ]);
     }
 
@@ -498,13 +742,12 @@ class ReceivableController extends Controller
         ]);
 
         $user = $request->user();
+        $businessId = $user?->business_id ?? $request->business_id;
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         } else {
-            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
+            $outletId = (int)($data['outlet_id'] ?? $user?->outlet_id ?? Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->value('id'));
         }
-
-        $businessId = $user?->business_id ?? $request->business_id;
         $receivableNo = Receivable::generateReceivableNo($businessId, $data['issue_date']);
 
         $totalAmount = (float)$data['total_amount'];
@@ -553,7 +796,7 @@ class ReceivableController extends Controller
 
             if ($initialPaid > 0) {
                 $paymentNo = ReceivablePayment::generatePaymentNo($businessId, $data['issue_date']);
-                ReceivablePayment::create([
+                $createdPayment = ReceivablePayment::create([
                     'payment_no'     => $paymentNo,
                     'receivable_id'  => $rec->id,
                     'business_id'    => $businessId,
@@ -566,6 +809,9 @@ class ReceivableController extends Controller
                     'notes'          => 'Uang Muka / Pembayaran Awal Kasbon',
                     'received_by'    => $user->id,
                 ]);
+
+                // Auto-post double-entry journal ledger for initial DP
+                AccountingService::postReceivablePayment($createdPayment);
             }
 
             return $rec;
@@ -654,17 +900,23 @@ class ReceivableController extends Controller
 
         $user = $request->user();
         $businessId = $receivable->business_id ?? $user?->business_id;
-        $paymentNo = ReceivablePayment::generatePaymentNo($businessId, $data['payment_date']);
-        $shiftId = $data['shift_id'] ?? \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $receivable->outlet_id)->orderByDesc('opened_at')->value('id') ?? $receivable->shift_id;
+        $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $receivable->outlet_id)->orderByDesc('opened_at')->first();
+        $shiftId = $data['shift_id'] ?? $activeShift?->id ?? $receivable->shift_id;
+        $paymentDate = !empty($data['payment_date']) 
+            ? $data['payment_date'] 
+            : ($activeShift && !empty($activeShift->opened_at) 
+                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d')) 
+                : now()->toDateString());
+        $paymentNo = ReceivablePayment::generatePaymentNo($businessId, $paymentDate);
 
-        DB::transaction(function () use ($receivable, $data, $user, $businessId, $paymentNo, $amount, $shiftId) {
-            ReceivablePayment::create([
+        $createdPayment = DB::transaction(function () use ($receivable, $data, $user, $businessId, $paymentNo, $amount, $shiftId, $paymentDate) {
+            $rp = ReceivablePayment::create([
                 'payment_no'     => $paymentNo,
                 'receivable_id'  => $receivable->id,
                 'business_id'    => $businessId,
                 'outlet_id'      => $receivable->outlet_id,
                 'shift_id'       => $shiftId,
-                'payment_date'   => $data['payment_date'],
+                'payment_date'   => $paymentDate,
                 'amount'         => $amount,
                 'payment_method' => $data['payment_method'],
                 'reference_no'   => $data['reference_no'] ?? null,
@@ -688,7 +940,14 @@ class ReceivableController extends Controller
                 'status'           => $newStatus,
                 'updated_by'       => $user->id,
             ]);
+
+            return $rp;
         });
+
+        // Auto-post double-entry journal ledger
+        if ($createdPayment) {
+            AccountingService::postReceivablePayment($createdPayment);
+        }
 
         $receivable->refresh()->load(['payments.receiver', 'outlet', 'creator', 'updater', 'customer']);
         return response()->json([
@@ -771,9 +1030,16 @@ class ReceivableController extends Controller
         $remainingPayment = $effectivePayAmount;
         $updatedReceivables = [];
         $firstRecOutlet = $receivables->first()?->outlet_id;
-        $shiftId = $data['shift_id'] ?? \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $firstRecOutlet)->orderByDesc('opened_at')->value('id') ?? $receivables->first()?->shift_id;
+        $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $firstRecOutlet)->orderByDesc('opened_at')->first();
+        $shiftId = $data['shift_id'] ?? $activeShift?->id ?? $receivables->first()?->shift_id;
+        $paymentDate = !empty($data['payment_date']) 
+            ? $data['payment_date'] 
+            : ($activeShift && !empty($activeShift->opened_at) 
+                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d')) 
+                : now()->toDateString());
 
-        DB::transaction(function () use ($receivables, $data, $user, &$remainingPayment, &$updatedReceivables, $shiftId) {
+        $createdPayments = [];
+        DB::transaction(function () use ($receivables, $data, $user, &$remainingPayment, &$updatedReceivables, $shiftId, $paymentDate, &$createdPayments) {
             foreach ($receivables as $rec) {
                 if ($remainingPayment <= 0) break;
 
@@ -781,21 +1047,22 @@ class ReceivableController extends Controller
                 if ($payForThis <= 0) continue;
 
                 $businessId = $rec->business_id ?? $user?->business_id;
-                $paymentNo = ReceivablePayment::generatePaymentNo($businessId, $data['payment_date']);
+                $paymentNo = ReceivablePayment::generatePaymentNo($businessId, $paymentDate);
 
-                ReceivablePayment::create([
+                $rp = ReceivablePayment::create([
                     'payment_no'     => $paymentNo,
                     'receivable_id'  => $rec->id,
                     'business_id'    => $businessId,
                     'outlet_id'      => $rec->outlet_id,
                     'shift_id'       => $shiftId,
-                    'payment_date'   => $data['payment_date'],
+                    'payment_date'   => $paymentDate,
                     'amount'         => $payForThis,
                     'payment_method' => $data['payment_method'],
                     'reference_no'   => $data['reference_no'] ?? null,
                     'notes'          => $data['notes'] ? "Pelunasan Sekaligus: {$data['notes']}" : 'Pembayaran Sekaligus Kasbon Pelanggan',
                     'received_by'    => $user->id,
                 ]);
+                $createdPayments[] = $rp;
 
                 $totalPaid = (float)$rec->payments()->sum('amount');
                 $newRemaining = max(0, (float)$rec->total_amount - $totalPaid);
@@ -819,6 +1086,11 @@ class ReceivableController extends Controller
             }
         });
 
+        // Auto-post double-entry journal ledger for bulk payments
+        foreach ($createdPayments as $p) {
+            AccountingService::postReceivablePayment($p);
+        }
+
         return response()->json([
             'message'        => 'Pembayaran sekaligus berhasil dicatat.',
             'amount_paid'    => $effectivePayAmount,
@@ -838,6 +1110,10 @@ class ReceivableController extends Controller
         $user = auth()->user();
 
         DB::transaction(function () use ($receivable, $payment, $user) {
+            JournalEntry::where('reference_type', 'RECEIVABLE_PAYMENT')
+                ->where('reference_id', $payment->id)
+                ->delete();
+
             $payment->delete();
 
             $totalPaid = (float)$receivable->payments()->sum('amount');
@@ -866,7 +1142,7 @@ class ReceivableController extends Controller
     {
         $user = $request->user();
         $businessId = $user?->business_id;
-        $outletId = $user?->outlet_id ?? 1;
+        $outletId = (int)($request->outlet_id ?? $user?->outlet_id ?? Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->value('id'));
 
         $items = $request->input('items', []);
         if (empty($items) || !is_array($items)) {
@@ -984,7 +1260,12 @@ class ReceivableController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $this->syncMerchantReceivables($user?->business_id, $outletId);
 
@@ -998,8 +1279,26 @@ class ReceivableController extends Controller
             $query->where('outlet_id', $outletId);
         }
 
-        if ($request->filled('channel')) {
-            $query->where('merchant_channel', $request->channel);
+        if ($request->filled('channel') && $request->channel !== 'ALL' && $request->channel !== 'all') {
+            $ch = strtoupper(trim($request->channel));
+            if ($ch === 'QRIS') {
+                $query->where(function ($q) {
+                    $q->where('ar_type', 'MERCHANT_QRIS')
+                      ->orWhere('merchant_channel', 'like', '%QRIS%');
+                });
+            } elseif ($ch === 'GRAB' || $ch === 'GRABFOOD') {
+                $query->where('merchant_channel', 'like', '%GRAB%');
+            } elseif ($ch === 'GOFOOD' || $ch === 'GOJEK') {
+                $query->where('merchant_channel', 'like', '%GO%');
+            } elseif ($ch === 'SHOPEE' || $ch === 'SHOPEEFOOD') {
+                $query->where('merchant_channel', 'like', '%SHOPEE%');
+            } elseif ($ch === 'TIKTOK') {
+                $query->where('merchant_channel', 'like', '%TIKTOK%');
+            } elseif ($ch === 'ECOMMERCE') {
+                $query->where('ar_type', 'MERCHANT_ECOMMERCE');
+            } else {
+                $query->where('merchant_channel', 'like', "%{$request->channel}%");
+            }
         }
 
         if ($request->filled('ar_type') && $request->ar_type !== 'ALL' && $request->ar_type !== 'all') {
@@ -1087,7 +1386,12 @@ class ReceivableController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $this->syncMerchantReceivables($user?->business_id, $outletId);
 
@@ -1108,7 +1412,18 @@ class ReceivableController extends Controller
         }
 
         if ($request->filled('channel') && $request->channel !== 'ALL' && $request->channel !== 'all') {
-            $query->where('merchant_channel', $request->channel);
+            $ch = strtoupper(trim($request->channel));
+            if ($ch === 'GRAB' || $ch === 'GRABFOOD') {
+                $query->where('merchant_channel', 'like', '%GRAB%');
+            } elseif ($ch === 'GOFOOD' || $ch === 'GOJEK') {
+                $query->where('merchant_channel', 'like', '%GO%');
+            } elseif ($ch === 'SHOPEE' || $ch === 'SHOPEEFOOD') {
+                $query->where('merchant_channel', 'like', '%SHOPEE%');
+            } elseif ($ch === 'TIKTOK') {
+                $query->where('merchant_channel', 'like', '%TIKTOK%');
+            } else {
+                $query->where('merchant_channel', 'like', "%{$request->channel}%");
+            }
         }
 
         if ($request->filled('from')) {
@@ -1486,81 +1801,10 @@ class ReceivableController extends Controller
             ");
         } catch (\Throwable $e) {}
 
-        $query = \App\Models\Transaction::where('business_id', $businessId)
-            ->where('status', 'PAID')
-            ->whereNotNull('order_number')
-            ->where(function ($q) {
-                $q->where('payment_method', 'like', '%QRIS%')
-                  ->orWhere('payment_method', 'like', '%GRAB%')
-                  ->orWhere('payment_method', 'like', '%GOFOOD%')
-                  ->orWhere('payment_method', 'like', '%SHOPEE%')
-                  ->orWhere('payment_method', 'like', '%ECOMMERCE%')
-                  ->orWhere('payment_method', 'like', '%TIKTOK%')
-                  ->orWhere('payment_method', 'like', '%TOKOPEDIA%')
-                  ->orWhere('payment_method', 'like', '%DELIVERY%')
-                  ->orWhere('payment_method', 'like', '%ONLINE%');
-            });
-
-        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
-            $query->where('outlet_id', $outletId);
-        }
-
-        $existingOrderNumbers = Receivable::where('business_id', $businessId)
-            ->whereIn('ar_type', ['MERCHANT_QRIS', 'MERCHANT_ECOMMERCE'])
-            ->whereNotNull('order_number')
-            ->pluck('order_number')
-            ->all();
-
-        $existingSet = array_flip($existingOrderNumbers);
-
-        $trxs = $query->get();
-        if ($trxs->isEmpty()) return;
-
-        $grouped = $trxs->groupBy('order_number');
-
-        foreach ($grouped as $orderNo => $orderTrxs) {
-            if (isset($existingSet[$orderNo])) continue;
-
-            $first = $orderTrxs->first();
-            $orderTotal = (float)$orderTrxs->sum('subtotal');
-            if ($orderTotal <= 0) continue;
-
-            $pmUpper = strtoupper($first->payment_method ?: 'QRIS');
-            $isQris = str_contains($pmUpper, 'QRIS');
-            $arType = $isQris ? 'MERCHANT_QRIS' : 'MERCHANT_ECOMMERCE';
-            $channel = $isQris ? 'QRIS' : ($pmUpper ?: 'E-COMMERCE');
-
-            $mdrRate = $isQris ? 0.7 : 20.0;
-            $mdrFee = round(($orderTotal * $mdrRate) / 100, 2);
-            $net = round($orderTotal - $mdrFee, 2);
-
-            Receivable::create([
-                'receivable_no'     => Receivable::generateReceivableNo($businessId, $first->date ?: now()->toDateString()),
-                'business_id'       => $businessId,
-                'outlet_id'         => $first->outlet_id,
-                'transaction_id'    => $first->id,
-                'shift_id'          => $first->shift_id,
-                'customer_id'       => $first->customer_id,
-                'ar_type'           => $arType,
-                'merchant_channel'  => $channel,
-                'order_number'      => $orderNo,
-                'customer_name'     => $isQris ? "AR Merchant - {$channel}" : "Buku E-Commerce - {$channel}",
-                'customer_phone'    => null,
-                'customer_address'  => null,
-                'issue_date'        => $first->date ?: now()->toDateString(),
-                'due_date'          => $first->date ?: now()->toDateString(),
-                'total_amount'      => $orderTotal,
-                'paid_amount'       => 0,
-                'remaining_amount'  => $net,
-                'mdr_rate'          => $mdrRate,
-                'mdr_fee'           => $mdrFee,
-                'net_amount'        => $net,
-                'status'            => 'UNPAID',
-                'settlement_status' => $isQris ? 'UNSETTLED' : 'AUTO_ECOMMERCE',
-                'notes'             => $isQris ? "Piutang QRIS {$channel} — Order #{$orderNo}" : "Buku Rekonsiliasi E-Commerce {$channel} — Order #{$orderNo} (Pencairan Otomatis via Apk)",
-                'created_by'        => $first->user_id,
-            ]);
-        }
+        // Clean up legacy MERCHANT_QRIS and MERCHANT_ECOMMERCE receivables, since they are unified into KAS APLIKASI
+        try {
+            Receivable::where('business_id', $businessId)->whereIn('ar_type', ['MERCHANT_QRIS', 'MERCHANT_ECOMMERCE'])->delete();
+        } catch (\Throwable $e) {}
     }
 }
 

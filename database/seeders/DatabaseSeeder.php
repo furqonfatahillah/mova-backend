@@ -92,5 +92,8 @@ class DatabaseSeeder extends Seeder
                 'approved_at' => now(),
             ]
         );
+
+        // 6. Setup Master Chart of Accounts (COA)
+        \App\Models\Account::seedForBusiness($business->id);
     }
 }

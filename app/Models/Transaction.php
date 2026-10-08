@@ -194,4 +194,9 @@ class Transaction extends Model
     {
         return $this->belongsTo(Customer::class);
     }
+
+    public function receivable()
+    {
+        return $this->hasOne(Receivable::class, 'transaction_id');
+    }
 }

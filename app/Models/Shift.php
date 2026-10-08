@@ -26,6 +26,15 @@ class Shift extends Model
         'closing_cash',
         'cash_difference',
         'status',
+        'deposit_status',
+        'deposit_amount',
+        'deposit_account',
+        'deposit_notes',
+        'deposit_submitted_at',
+        'deposit_submitted_by',
+        'deposit_approved_at',
+        'deposit_approved_by',
+        'deposit_rejection_reason',
         'notes',
         'closed_by',
         'created_by',
@@ -37,17 +46,23 @@ class Shift extends Model
         'updated_by_name',
         'changed_at',
         'changed_by_name',
+        'deposit_submitted_by_name',
+        'deposit_approved_by_name',
+        'deposit_account_label',
     ];
 
     protected function casts(): array
     {
         return [
-            'opened_at'       => 'datetime',
-            'closed_at'       => 'datetime',
-            'initial_cash'    => 'float',
-            'system_cash'     => 'float',
-            'closing_cash'    => 'float',
-            'cash_difference' => 'float',
+            'opened_at'             => 'datetime',
+            'closed_at'             => 'datetime',
+            'deposit_submitted_at'  => 'datetime',
+            'deposit_approved_at'   => 'datetime',
+            'initial_cash'          => 'float',
+            'system_cash'           => 'float',
+            'closing_cash'          => 'float',
+            'cash_difference'       => 'float',
+            'deposit_amount'        => 'float',
         ];
     }
 
@@ -71,6 +86,37 @@ class Shift extends Model
         return $this->belongsTo(User::class, 'closed_by');
     }
 
+    public function depositSubmittedByUser(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'deposit_submitted_by');
+    }
+
+    public function depositApprovedByUser(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'deposit_approved_by');
+    }
+
+    public function getDepositSubmittedByNameAttribute(): ?string
+    {
+        return $this->relationLoaded('depositSubmittedByUser') ? $this->depositSubmittedByUser?->name : null;
+    }
+
+    public function getDepositApprovedByNameAttribute(): ?string
+    {
+        return $this->relationLoaded('depositApprovedByUser') ? $this->depositApprovedByUser?->name : null;
+    }
+
+    public function getDepositAccountLabelAttribute(): ?string
+    {
+        if ($this->deposit_account === 'BANK_MAIN') {
+            return 'Rekening Bank Utama';
+        }
+        if ($this->deposit_account === 'KAS_BESAR' || $this->deposit_amount > 0) {
+            return 'Kas Besar / Brankas';
+        }
+        return null;
+    }
+
     public function transactions(): HasMany
     {
         return $this->hasMany(Transaction::class);
@@ -79,6 +125,11 @@ class Shift extends Model
     public function stockMovements(): HasMany
     {
         return $this->hasMany(StockMovement::class);
+    }
+
+    public function cashTransactions(): HasMany
+    {
+        return $this->hasMany(CashTransaction::class);
     }
 
     /**

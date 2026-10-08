@@ -32,8 +32,11 @@ use App\Http\Controllers\SalesReportController;
 use App\Http\Controllers\PaymentConfigurationController;
 use App\Http\Controllers\PayableController;
 use App\Http\Controllers\BalanceSheetController;
+use App\Http\Controllers\JournalController;
 use App\Http\Controllers\PurchaseReportController;
 use App\Http\Controllers\DataResetController;
+use App\Http\Controllers\AccountController;
+use App\Http\Controllers\KasAplikasiController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -44,6 +47,20 @@ Route::post('/reset-password',      [AuthController::class, 'resetPassword']);
 Route::get('/public/businesses', [BusinessController::class, 'publicList']);
 Route::get('/public/outlets', [OutletController::class, 'publicList']);
 Route::post('/payment-gateways/midtrans/webhook', [PaymentConfigurationController::class, 'handleMidtransWebhook']);
+
+// Storage media handler for API prefix
+Route::get('/storage/{path}', function ($path) {
+    $fullPath = storage_path('app/public/' . $path);
+    if (!file_exists($fullPath)) {
+        abort(404);
+    }
+    $file = file_get_contents($fullPath);
+    $mime = mime_content_type($fullPath) ?: 'image/jpeg';
+    return response($file, 200)
+        ->header('Content-Type', $mime)
+        ->header('Cache-Control', 'public, max-age=86400')
+        ->header('Access-Control-Allow-Origin', '*');
+})->where('path', '.*');
 
 // Protected routes (require Sanctum token and enforce outlet scoping)
 Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::class])->group(function () {
@@ -86,10 +103,14 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/shifts/active',                 [ShiftController::class, 'active']);
     Route::get('/shifts/last-closed',            [ShiftController::class, 'lastClosed']);
     Route::post('/shifts/open',                  [ShiftController::class, 'open']);
+    Route::get('/shifts/supervisors',            [ShiftController::class, 'getSupervisors']);
+    Route::post('/shifts/sync-initial-cash-journals', [ShiftController::class, 'syncInitialCashJournals']);
     Route::get('/shifts/{shift}/summary',        [ShiftController::class, 'summary']);
-    Route::post('/shifts/{shift}/close',         [ShiftController::class, 'close']);
-    Route::post('/shifts/{shift}/deposit',       [ShiftController::class, 'deposit']);
-    Route::get('/shifts/{shift}/transactions',   [ShiftController::class, 'transactions']);
+    Route::post('/shifts/{shift}/close',           [ShiftController::class, 'close']);
+    Route::post('/shifts/{shift}/deposit',         [ShiftController::class, 'deposit']);
+    Route::post('/shifts/{shift}/deposit-approve', [ShiftController::class, 'approveDeposit']);
+    Route::post('/shifts/{shift}/deposit-reject',  [ShiftController::class, 'rejectDeposit']);
+    Route::get('/shifts/{shift}/transactions',     [ShiftController::class, 'transactions']);
     Route::get('/shifts/{shift}/receipt',        [ShiftController::class, 'receipt']);
 
     // Master Data
@@ -149,24 +170,29 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
 
     // POS & Open Bills (Dine-in Table Management)
     Route::get('/transactions/open-bills',                               [TransactionController::class, 'openBills']);
+    Route::get('/transactions/supervisors',                              [TransactionController::class, 'getSupervisors']);
+    Route::get('/transactions/void-requests',                           [TransactionController::class, 'voidRequests']);
+    Route::post('/transactions/void',                                    [TransactionController::class, 'voidTransaction']);
     Route::post('/transactions/open-bills/{orderNumber}/pay',            [TransactionController::class, 'payOpenBill']);
     Route::post('/transactions/open-bills/{orderNumber}/add-items',      [TransactionController::class, 'addItemsToOpenBill']);
+    Route::post('/transactions/open-bills/{orderNumber}/void-item',      [TransactionController::class, 'voidOpenBillItem']);
     Route::post('/transactions/open-bills/{orderNumber}/cancel',         [TransactionController::class, 'cancelOpenBill']);
     Route::post('/transactions/open-bills/{orderNumber}/split-by-item',  [TransactionController::class, 'paySplitByItem']);
     Route::post('/transactions/open-bills/{orderNumber}/split-evenly',   [TransactionController::class, 'paySplitEvenly']);
-    Route::post('/transactions/{orderNumber}/pay',                        [TransactionController::class, 'payOpenBill']);
+    Route::post('/transactions/open-bills/{orderNumber}/print-prebill',  [TransactionController::class, 'printPrebill']);
+    Route::post('/transactions/{orderNumber}/pay',                       [TransactionController::class, 'payOpenBill']);
     Route::post('/transactions/{orderNumber}/add-items',                 [TransactionController::class, 'addItemsToOpenBill']);
-    Route::get('/transactions/supervisors',                              [TransactionController::class, 'getSupervisors']);
+    Route::post('/transactions/{orderNumber}/void-item',                 [TransactionController::class, 'voidOpenBillItem']);
+    Route::post('/transactions/{orderNumber}/cancel',                    [TransactionController::class, 'cancelOpenBill']);
+    Route::post('/transactions/{orderNumber}/print-prebill',             [TransactionController::class, 'printPrebill']);
     Route::post('/transactions/{orderNumber}/void',                      [TransactionController::class, 'voidTransaction']);
-    Route::post('/transactions/void',                                    [TransactionController::class, 'voidTransaction']);
-    Route::get('/transactions/void-requests',                           [TransactionController::class, 'voidRequests']);
     Route::post('/transactions/{orderNumber}/void-approve',              [TransactionController::class, 'approveVoidTransaction']);
     Route::post('/transactions/{orderNumber}/void-reject',               [TransactionController::class, 'rejectVoidTransaction']);
     Route::post('/transactions/{orderNumber}/split-by-item',             [TransactionController::class, 'paySplitByItem']);
     Route::post('/transactions/{orderNumber}/split-evenly',              [TransactionController::class, 'paySplitEvenly']);
     Route::get('/transactions',                                          [TransactionController::class, 'index']);
     Route::post('/transactions',                                         [TransactionController::class, 'store']);
-    Route::delete('/transactions/{transaction}',                    [TransactionController::class, 'destroy']);
+    Route::delete('/transactions/{transaction}',                         [TransactionController::class, 'destroy']);
 
     // Nota Urgent & Bahan Tergantung (Pending Stock Shortfall Management & Approval Workflow)
     Route::get('/urgent-notes/summary',                          [UrgentNoteController::class, 'summary']);
@@ -230,6 +256,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::apiResource('receivables', ReceivableController::class);
 
     // Hutang Supplier (Accounts Payable & Pembayaran Hutang)
+    Route::get('/suppliers',                                            [PayableController::class, 'suppliers']);
     Route::get('/payables/suppliers',                                   [PayableController::class, 'suppliers']);
     Route::get('/payables/report',                                      [PayableController::class, 'report']);
     Route::post('/payables/bulk-payment',                               [PayableController::class, 'bulkPayment']);
@@ -251,6 +278,19 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/profit-loss',          [ReportController::class, 'profitAndLoss']);
     Route::get('/reports/balance-sheet',        [BalanceSheetController::class, 'index']);
     Route::get('/reports/balance-sheet/detail', [BalanceSheetController::class, 'detail']);
+    Route::post('/reports/balance-sheet/sync',   [BalanceSheetController::class, 'syncJournals']);
+    Route::post('/accounting/sync-journals',    [BalanceSheetController::class, 'syncJournals']);
+    Route::get('/accounting/ledger',            [JournalController::class, 'index']);
+    Route::get('/accounting/ledger/{code}',      [JournalController::class, 'accountTransactions']);
+    Route::get('/accounting/journal-entries/{id}', [JournalController::class, 'journalDetail']);
+
+    // Master Bagan Akun / Chart of Accounts (Multi-Tenant Scoped per Business)
+    Route::get('/accounting/accounts',                    [AccountController::class, 'index']);
+    Route::post('/accounting/accounts',                   [AccountController::class, 'store']);
+    Route::get('/accounting/accounts/{id}',               [AccountController::class, 'show']);
+    Route::put('/accounting/accounts/{id}',               [AccountController::class, 'update']);
+    Route::patch('/accounting/accounts/{id}/toggle-active',[AccountController::class, 'toggleActive']);
+    Route::delete('/accounting/accounts/{id}',            [AccountController::class, 'destroy']);
     Route::get('/reports/outlet-benchmark',    [ReportController::class, 'outletBenchmark']);
 
     // Sales Reports (Laporan Penjualan POS)
@@ -270,6 +310,11 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/purchase/payables',           [PurchaseReportController::class, 'payables']);
     Route::get('/reports/purchase/shipments',          [PurchaseReportController::class, 'shipments']);
 
+    // Kas Aplikasi (QRIS) & Setor ke Bank
+    Route::get('/kas-aplikasi/summary',     [KasAplikasiController::class, 'summary']);
+    Route::post('/kas-aplikasi/setor',      [KasAplikasiController::class, 'deposit']);
+    Route::post('/kas-aplikasi/upload-qris',[KasAplikasiController::class, 'uploadQrisImage']);
+
     // Rekening Bank & Payment Gateway Settings (Midtrans & Xendit)
     Route::get('/bank-accounts',                    [PaymentConfigurationController::class, 'indexBankAccounts']);
     Route::post('/bank-accounts',                   [PaymentConfigurationController::class, 'storeBankAccount']);
@@ -288,3 +333,16 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/system/reset-preview', [DataResetController::class, 'preview']);
     Route::post('/system/reset-data',   [DataResetController::class, 'resetData']);
 });
+
+// Public storage image streaming route
+Route::get('/storage/{path}', function ($path) {
+    $fullPath = storage_path('app/public/' . $path);
+    if (!file_exists($fullPath)) {
+        abort(404);
+    }
+    $file = file_get_contents($fullPath);
+    $mime = mime_content_type($fullPath) ?: 'image/jpeg';
+    return response($file, 200)
+        ->header('Content-Type', $mime)
+        ->header('Cache-Control', 'public, max-age=86400');
+})->where('path', '.*');

@@ -606,8 +606,7 @@ class MenuController extends Controller
     public function hppHistory(Request $request, Menu $menu)
     {
         $user = $request->user();
-        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ? (int)$request->outlet_id : ($user?->outlet_id));
+        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
 
         $data = \App\Services\MenuHppService::getHppData(
             $menu,

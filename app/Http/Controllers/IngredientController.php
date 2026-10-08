@@ -335,9 +335,10 @@ class IngredientController extends Controller
         }
 
         $importedCount = 0;
+        $globalEffectiveDate = $request->input('effective_date', $request->input('date'));
 
         try {
-            DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+            DB::transaction(function () use ($items, $businessId, $user, $globalEffectiveDate, &$importedCount) {
                 $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
                 if ($businessOutlets->isEmpty()) {
                     $businessOutlets = \App\Models\Outlet::all();
@@ -416,6 +417,19 @@ class IngredientController extends Controller
                         $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
                     }
 
+                    // Parse Effective Date (Tanggal Mulai Saldo Awal)
+                    $rawDate = $row['date'] ?? $row['tanggal_mulai'] ?? $row['tanggal_efektif'] ?? $row['effective_date'] ?? $row['tanggal'] ?? $globalEffectiveDate ?? null;
+                    $effectiveDate = null;
+                    if (!empty($rawDate)) {
+                        try {
+                            if (is_numeric($rawDate) && (float)$rawDate > 20000 && (float)$rawDate < 80000) {
+                                $effectiveDate = \Carbon\Carbon::createFromTimestampUTC(((float)$rawDate - 25569) * 86400)->toDateString();
+                            } else {
+                                $effectiveDate = \Carbon\Carbon::parse($rawDate)->toDateString();
+                            }
+                        } catch (\Throwable $e) {}
+                    }
+
                     // Match strictly by (business_id, code) so custom codes are honored per business
                     $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
 
@@ -435,6 +449,10 @@ class IngredientController extends Controller
                         'created_by'          => $user?->id,
                         'updated_by'          => $user?->id,
                     ];
+
+                    if ($effectiveDate) {
+                        $ingData['tanggal_saldo_awal'] = $effectiveDate;
+                    }
 
                     if ($hargaBeli > 0 || !$existingIng) {
                         $ingData['harga'] = $hargaBeli;
@@ -482,8 +500,15 @@ class IngredientController extends Controller
 
                         if ($initialStock > 0 && $isTarget) {
                             $outletRow->stok_awal = $initialStock;
+                            if ($hargaBeli > 0) {
+                                $outletRow->saldo_awal_nominal = round($initialStock * ($hargaBeli / max((float)($ingData['konversi'] ?? 1), 1)), 2);
+                            }
                         } elseif ($outletRow->stok_awal === null) {
                             $outletRow->stok_awal = 0.0;
+                        }
+
+                        if ($effectiveDate) {
+                            $outletRow->tanggal_saldo_awal = $effectiveDate;
                         }
 
                         $outletRow->stok_min = $minStok;
@@ -498,6 +523,17 @@ class IngredientController extends Controller
                     $importedCount++;
                 }
             });
+
+            if ($businessId && $importedCount > 0) {
+                try {
+                    $biz = \App\Models\Business::find($businessId);
+                    if ($biz) {
+                        \App\Services\AccountingService::postInitialBalance($biz);
+                    }
+                } catch (\Throwable $accEx) {
+                    \Illuminate\Support\Facades\Log::error("postInitialBalance after ingredient import error: " . $accEx->getMessage());
+                }
+            }
         } catch (\Throwable $e) {
             try {
                 \Illuminate\Support\Facades\Log::error("bulkImport Ingredient error: " . $e->getMessage());
@@ -526,9 +562,10 @@ class IngredientController extends Controller
         }
 
         $importedCount = 0;
+        $globalEffectiveDate = $request->input('effective_date', $request->input('date'));
 
         try {
-            DB::transaction(function () use ($items, $businessId, $user, &$importedCount) {
+            DB::transaction(function () use ($items, $businessId, $user, $globalEffectiveDate, &$importedCount) {
                 $businessOutlets = \App\Models\Outlet::where('business_id', $businessId)->get();
                 if ($businessOutlets->isEmpty()) {
                     $businessOutlets = \App\Models\Outlet::all();
@@ -603,6 +640,19 @@ class IngredientController extends Controller
                         $hargaBeli = round(($initialBalance / $initialStock) * $konversi, 2);
                     }
 
+                    // Parse Effective Date (Tanggal Mulai Saldo Awal)
+                    $rawDate = $row['date'] ?? $row['tanggal_mulai'] ?? $row['tanggal_efektif'] ?? $row['effective_date'] ?? $row['tanggal'] ?? $globalEffectiveDate ?? null;
+                    $effectiveDate = null;
+                    if (!empty($rawDate)) {
+                        try {
+                            if (is_numeric($rawDate) && (float)$rawDate > 20000 && (float)$rawDate < 80000) {
+                                $effectiveDate = \Carbon\Carbon::createFromTimestampUTC(((float)$rawDate - 25569) * 86400)->toDateString();
+                            } else {
+                                $effectiveDate = \Carbon\Carbon::parse($rawDate)->toDateString();
+                            }
+                        } catch (\Throwable $e) {}
+                    }
+
                     // Match strictly by (business_id, code) so custom codes are honored per business
                     $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
 
@@ -622,6 +672,10 @@ class IngredientController extends Controller
                         'created_by'          => $user?->id,
                         'updated_by'          => $user?->id,
                     ];
+
+                    if ($effectiveDate) {
+                        $ingData['tanggal_saldo_awal'] = $effectiveDate;
+                    }
 
                     if ($hargaBeli > 0 || !$existingIng) {
                         $ingData['harga'] = $hargaBeli;
@@ -669,8 +723,15 @@ class IngredientController extends Controller
 
                         if ($initialStock > 0 && $isTarget) {
                             $outletRow->stok_awal = $initialStock;
+                            if ($hargaBeli > 0) {
+                                $outletRow->saldo_awal_nominal = round($initialStock * ($hargaBeli / max((float)($ingData['konversi'] ?? 1), 1)), 2);
+                            }
                         } elseif ($outletRow->stok_awal === null) {
                             $outletRow->stok_awal = 0.0;
+                        }
+
+                        if ($effectiveDate) {
+                            $outletRow->tanggal_saldo_awal = $effectiveDate;
                         }
 
                         $outletRow->stok_min = $minStok;
@@ -685,6 +746,17 @@ class IngredientController extends Controller
                     $importedCount++;
                 }
             });
+
+            if ($businessId && $importedCount > 0) {
+                try {
+                    $biz = \App\Models\Business::find($businessId);
+                    if ($biz) {
+                        \App\Services\AccountingService::postInitialBalance($biz);
+                    }
+                } catch (\Throwable $accEx) {
+                    \Illuminate\Support\Facades\Log::error("postInitialBalance after perlengkapan import error: " . $accEx->getMessage());
+                }
+            }
         } catch (\Throwable $e) {
             try {
                 \Illuminate\Support\Facades\Log::error("bulkImportPerlengkapan error: " . $e->getMessage());

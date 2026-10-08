@@ -15,6 +15,10 @@ use App\Models\Payable;
 use App\Models\Supplier;
 use App\Models\Shift;
 use App\Models\CashTransaction;
+use App\Models\Account;
+use App\Models\JournalEntry;
+use App\Models\JournalLine;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -468,6 +472,7 @@ class ReportController extends Controller
                 'gross_sales'       => $this->calculateDelta($current['revenue']['gross_sales'], $previous['revenue']['gross_sales'], true),
                 'total_discount'    => $this->calculateDelta($current['revenue']['total_discount'], $previous['revenue']['total_discount'], false),
                 'cash_over'         => $this->calculateDelta($current['revenue']['cash_over'] ?? 0, $previous['revenue']['cash_over'] ?? 0, true),
+                'handover_surplus'  => $this->calculateDelta($current['revenue']['handover_surplus'] ?? 0, $previous['revenue']['handover_surplus'] ?? 0, true),
                 'transaction_count' => $this->calculateDelta($current['revenue']['transaction_count'], $previous['revenue']['transaction_count'], true),
                 'avg_order_value'   => $this->calculateDelta($current['revenue']['avg_order_value'], $previous['revenue']['avg_order_value'], true),
                 'nota_generate_net' => $this->calculateDelta($current['revenue']['nota_generate']['net_sales'] ?? 0, $previous['revenue']['nota_generate']['net_sales'] ?? 0, true),
@@ -486,9 +491,10 @@ class ReportController extends Controller
                 'waste_ratio_pct'  => $this->calculateDelta($current['waste']['waste_ratio_pct'], $previous['waste']['waste_ratio_pct'], false),
             ],
             'opex' => [
-                'total_opex'     => $this->calculateDelta($current['opex']['total_opex'], $previous['opex']['total_opex'], false),
-                'cash_shortage'  => $this->calculateDelta($current['opex']['cash_shortage'] ?? 0, $previous['opex']['cash_shortage'] ?? 0, false),
-                'opex_ratio_pct' => $this->calculateDelta($current['opex']['opex_ratio_pct'], $previous['opex']['opex_ratio_pct'], false),
+                'total_opex'        => $this->calculateDelta($current['opex']['total_opex'], $previous['opex']['total_opex'], false),
+                'cash_shortage'     => $this->calculateDelta($current['opex']['cash_shortage'] ?? 0, $previous['opex']['cash_shortage'] ?? 0, false),
+                'handover_shortage' => $this->calculateDelta($current['opex']['handover_shortage'] ?? 0, $previous['opex']['handover_shortage'] ?? 0, false),
+                'opex_ratio_pct'    => $this->calculateDelta($current['opex']['opex_ratio_pct'], $previous['opex']['opex_ratio_pct'], false),
             ],
             'bottom_line' => [
                 'net_profit'     => $this->calculateDelta($current['bottom_line']['net_profit'], $previous['bottom_line']['net_profit'], true),
@@ -822,12 +828,159 @@ class ReportController extends Controller
     }
 
     /**
-     * Internal P&L Calculation for a single period
+     * Internal P&L Calculation for a single period based directly on General Ledger Journals (Akun Nominal 4, 5, 6)
      */
     private function calculatePnlData(string $from, string $to, ?int $outletId = null, string $notaType = 'ALL'): array
     {
-        // 1. REVENUE (PENDAPATAN USAHA)
-        // ⚡ PERF: Select only required columns and avoid hydrating thousands of duplicate Menu/Recipe models
+        $user = auth()->user();
+        $businessId = $user ? $user->business_id : null;
+        if ($businessId) {
+            Account::seedForBusiness($businessId);
+            $hasJournalLines = JournalLine::whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId))->exists();
+            if (!$hasJournalLines) {
+                AccountingService::syncAllHistoricalData($businessId);
+            }
+        }
+
+        // =========================================================================
+        // 1. GENERAL LEDGER QUERY FOR NOMINAL ACCOUNTS (4-Revenue, 5-COGS, 6-OPEX)
+        // =========================================================================
+        $linesQuery = JournalLine::whereBetween('entry_date', [$from, $to]);
+        if ($outletId) {
+            $linesQuery->where('outlet_id', $outletId);
+        }
+        if ($businessId) {
+            $linesQuery->whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId));
+        }
+
+        $balances = (clone $linesQuery)
+            ->select('account_code', DB::raw('SUM(debit) as total_debit'), DB::raw('SUM(credit) as total_credit'))
+            ->groupBy('account_code')
+            ->get()
+            ->keyBy('account_code');
+
+        $allAccounts = Account::when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->where('is_active', true)
+            ->orderBy('code', 'asc')
+            ->get()
+            ->keyBy('code');
+
+        $getAccountBalance = function (string $code, string $normal = 'DEBIT') use ($balances): float {
+            $totalDeb = 0.0;
+            $totalCrd = 0.0;
+            foreach ($balances as $accCode => $row) {
+                if ($accCode === $code || str_starts_with($accCode, $code . '.')) {
+                    $totalDeb += (float)$row->total_debit;
+                    $totalCrd += (float)$row->total_credit;
+                }
+            }
+            return $normal === 'DEBIT' ? round($totalDeb - $totalCrd, 2) : round($totalCrd - $totalDeb, 2);
+        };
+
+        // =========================================================================
+        // 2. REVENUE / PENDAPATAN (Akun 4-xxxxx)
+        // =========================================================================
+        $grossSales = max(0.0, $getAccountBalance('4-41001', 'CREDIT'));
+        $totalDiscount = max(0.0, $getAccountBalance('4-41003', 'DEBIT'));
+        $cashOver = max(0.0, $getAccountBalance('4-41002', 'CREDIT'));
+
+        // Extra Revenue accounts if any
+        $extraRevenue = 0.0;
+        foreach ($allAccounts->where('type', 'REVENUE') as $acc) {
+            if ($acc->parent_code !== null) continue;
+            if (!in_array($acc->code, ['4-41001', '4-41002', '4-41003'])) {
+                $extraRevenue += max(0.0, $getAccountBalance($acc->code, 'CREDIT'));
+            }
+        }
+
+        $netSales = round($grossSales - $totalDiscount, 2);
+        $netRevenueTotal = round($netSales + $cashOver + $extraRevenue, 2);
+
+        // =========================================================================
+        // 3. COGS / HARGA POKOK PENJUALAN (Akun 5-xxxxx)
+        // =========================================================================
+        $cogsBahan     = max(0.0, $getAccountBalance('5-51001', 'DEBIT'));
+        $cogsKemasan   = max(0.0, $getAccountBalance('5-51002', 'DEBIT'));
+        $cogsWasteLoss = max(0.0, $getAccountBalance('5-51003', 'DEBIT')) + max(0.0, $getAccountBalance('5-51006', 'DEBIT'));
+        $opnameBahan   = max(0.0, $getAccountBalance('5-51004', 'DEBIT'));
+        $opnameKemasan = max(0.0, $getAccountBalance('5-51005', 'DEBIT'));
+
+        $extraCogs = 0.0;
+        foreach ($allAccounts->where('category', 'COGS') as $acc) {
+            if ($acc->parent_code !== null) continue;
+            if (!in_array($acc->code, ['5-51001', '5-51002', '5-51003', '5-51004', '5-51005', '5-51006'])) {
+                $extraCogs += max(0.0, $getAccountBalance($acc->code, 'DEBIT'));
+            }
+        }
+
+        $cogsRecipes = round($cogsBahan + $cogsKemasan + $extraCogs, 2);
+        $cogsVariance = round($opnameBahan + $opnameKemasan, 2);
+        $totalWasteLoss = round($cogsWasteLoss, 2);
+        $totalCogs = round($cogsRecipes + $totalWasteLoss + $cogsVariance, 2);
+        $cogsRatioPct = $netSales > 0 ? round(($totalCogs / $netSales) * 100, 1) : 0;
+
+        $grossProfit = round($netSales - $totalCogs, 2);
+        $grossMarginPct = $netSales > 0 ? round(($grossProfit / $netSales) * 100, 1) : 0;
+
+        $wasteRatioPct = $netSales > 0 ? round(($totalWasteLoss / $netSales) * 100, 1) : 0;
+        $operatingProfitAfterWaste = round($grossProfit, 2);
+
+        // =========================================================================
+        // 4. OPEX / BEBAN OPERASIONAL (Akun 6-xxxxx)
+        // =========================================================================
+        $expenseCategoriesConfig = [
+            '6-61001' => ['category' => 'SALARY',        'label' => 'Gaji & Upah Karyawan'],
+            '6-61002' => ['category' => 'UTILITIES',     'label' => 'Listrik (PLN)'],
+            '6-61003' => ['category' => 'UTILITIES',     'label' => 'Air (PDAM)'],
+            '6-61004' => ['category' => 'GAS',           'label' => 'Gas Masak (LPG)'],
+            '6-61005' => ['category' => 'MAINTENANCE',   'label' => 'Pemeliharaan & Aset'],
+            '6-61006' => ['category' => 'MARKETING',     'label' => 'Pemasaran & Promosi'],
+            '6-61007' => ['category' => 'LOGISTICS',     'label' => 'Logistik & Transportasi'],
+            '6-61008' => ['category' => 'CASH_SHORTAGE', 'label' => 'Biaya Lain-lain / Selisih Kurang Kasir'],
+            '6-61009' => ['category' => 'OTHER',         'label' => 'Beban Operasional Lainnya'],
+        ];
+
+        $opexBreakdown = [];
+        $totalOpexBase = 0.0;
+        $cashShortageFromJournal = max(0.0, $getAccountBalance('6-61008', 'DEBIT'));
+
+        foreach ($allAccounts->where('type', 'EXPENSE') as $acc) {
+            if ($acc->parent_code !== null) continue;
+            if (str_starts_with($acc->code, '6-')) {
+                $amt = max(0.0, $getAccountBalance($acc->code, 'DEBIT'));
+                if ($amt > 0) {
+                    $totalOpexBase += $amt;
+                    $cfg = $expenseCategoriesConfig[$acc->code] ?? ['category' => 'OTHER', 'label' => $acc->name];
+                    $opexBreakdown[] = [
+                        'account_code' => $acc->code,
+                        'category'     => $cfg['category'],
+                        'label'        => $cfg['label'],
+                        'total'        => round($amt, 2),
+                        'count'        => 1,
+                        'percentage'   => 0.0,
+                    ];
+                }
+            }
+        }
+
+        $totalOpex = round($totalOpexBase, 2);
+        $opexRatioPct = $netSales > 0 ? round(($totalOpex / $netSales) * 100, 1) : 0;
+
+        foreach ($opexBreakdown as &$ob) {
+            $ob['percentage'] = $totalOpex > 0 ? round(($ob['total'] / $totalOpex) * 100, 1) : 0;
+        }
+        unset($ob);
+        usort($opexBreakdown, fn($a, $b) => $b['total'] <=> $a['total']);
+
+        // =========================================================================
+        // 5. LABA BERSIH USAHA (NET OPERATING PROFIT - IDENTIK DENGAN NERACA)
+        // =========================================================================
+        $netProfit = round(($grossProfit + $cashOver + $extraRevenue) - $totalOpex, 2);
+        $netMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 1) : 0;
+
+        // =========================================================================
+        // 6. DETAILED OPERATIONAL CONTEXT (Transactions, Shifts, Ingredients)
+        // =========================================================================
         $trxQuery = Transaction::where('status', 'PAID')
             ->whereBetween('date', [$from, $to])
             ->select([
@@ -840,28 +993,11 @@ class ReportController extends Controller
         }
         $transactions = $trxQuery->get();
 
-        $allGross = 0.0;
-        $allDiscount = 0.0;
-        $allNet = 0.0;
-        $allItemCount = 0;
         $allOrderNumbers = [];
         $allPaymentMethodsMap = [];
-
-        $genGross = 0.0;
-        $genDiscount = 0.0;
-        $genNet = 0.0;
-        $genItemCount = 0;
-        $genOrderNumbers = [];
-        $genPaymentMethodsMap = [];
-
-        $manGross = 0.0;
-        $manDiscount = 0.0;
-        $manNet = 0.0;
-        $manItemCount = 0;
-        $manOrderNumbers = [];
-        $manPaymentMethodsMap = [];
-
-        $orderHasDiscount = [];
+        $genGross = 0.0; $genDiscount = 0.0; $genNet = 0.0; $genItemCount = 0; $genOrderNumbers = []; $genPaymentMethodsMap = [];
+        $manGross = 0.0; $manDiscount = 0.0; $manNet = 0.0; $manItemCount = 0; $manOrderNumbers = []; $manPaymentMethodsMap = [];
+        $allItemCount = 0;
 
         foreach ($transactions as $t) {
             $subtotal = (float)($t->subtotal > 0 ? $t->subtotal : ($t->total_price + ($t->discount_amount ?? 0)));
@@ -871,16 +1007,9 @@ class ReportController extends Controller
             $orderKey = $t->order_number ?: "TRX-{$t->id}";
             $method = $t->payment_method ?: 'CASH';
 
-            $allGross += $subtotal;
-            $allDiscount += $discount;
-            $allNet += $net;
             $allItemCount += $qty;
             $allOrderNumbers[$orderKey] = true;
             $allPaymentMethodsMap[$method] = ($allPaymentMethodsMap[$method] ?? 0.0) + $net;
-
-            if ($discount > 0) {
-                $orderHasDiscount[$orderKey] = true;
-            }
 
             if ($t->is_urgent_note) {
                 $manGross += $subtotal;
@@ -924,175 +1053,12 @@ class ReportController extends Controller
 
         $genPaymentBreakdown = $formatPaymentBreakdown($genPaymentMethodsMap, $genNet);
         $manPaymentBreakdown = $formatPaymentBreakdown($manPaymentMethodsMap, $manNet);
-        $allPaymentBreakdown = $formatPaymentBreakdown($allPaymentMethodsMap, $allNet);
+        $allPaymentBreakdown = $formatPaymentBreakdown($allPaymentMethodsMap, $netSales);
 
-        // Select scope according to $notaType
-        if ($notaType === 'GENERATE') {
-            $grossSales = $genGross;
-            $totalDiscount = $genDiscount;
-            $netSales = $genNet;
-            $transactionCount = count($genOrderNumbers);
-            $itemCount = $genItemCount;
-            $paymentBreakdown = $genPaymentBreakdown;
-            $targetTransactions = $transactions->filter(fn($t) => !$t->is_urgent_note);
-            $notaRatio = $allNet > 0 ? ($genNet / $allNet) : 1.0;
-        } elseif ($notaType === 'MANUAL') {
-            $grossSales = $manGross;
-            $totalDiscount = $manDiscount;
-            $netSales = $manNet;
-            $transactionCount = count($manOrderNumbers);
-            $itemCount = $manItemCount;
-            $paymentBreakdown = $manPaymentBreakdown;
-            $targetTransactions = $transactions->filter(fn($t) => (bool)$t->is_urgent_note);
-            $notaRatio = $allNet > 0 ? ($manNet / $allNet) : 0.0;
-        } else { // 'ALL'
-            $grossSales = $allGross;
-            $totalDiscount = $allDiscount;
-            $netSales = $allNet;
-            $transactionCount = count($allOrderNumbers);
-            $itemCount = $allItemCount;
-            $paymentBreakdown = $allPaymentBreakdown;
-            $targetTransactions = $transactions;
-            $notaRatio = 1.0;
-        }
-
+        $transactionCount = count($allOrderNumbers);
         $avgOrderValue = $transactionCount > 0 ? round($netSales / $transactionCount, 0) : 0;
-        $discOrderCount = count($orderHasDiscount);
 
-        // 2. COGS (HPP RIIL: RESEP + SUSUT OPNAME)
-        $varianceData = $this->buildVarianceArray($from, $to, $outletId);
-        
-        $cogsRecipesBase = 0.0;
-        $cogsVarianceBase = 0.0;
-        $topIngredientsUsage = [];
-
-        foreach ($varianceData as $row) {
-            $ing = $row['ingredient'];
-            $targetOutletId = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
-            $hargaPerPakai = $ing->costPerPakaiForOutlet($targetOutletId);
-            $rowRecipeCost = (float)$row['pemakaian_teoritis'] * $hargaPerPakai;
-            $cogsRecipesBase += $rowRecipeCost;
-
-            if ($row['unaccounted_value'] !== null) {
-                $cogsVarianceBase += (float)$row['unaccounted_value'];
-            }
-
-            if ($rowRecipeCost > 0 || (float)$row['pemakaian_teoritis'] > 0) {
-                $topIngredientsUsage[] = [
-                    'ingredient_id'   => $ing->id,
-                    'name'            => $ing->name,
-                    'ingredient_name' => $ing->name,
-                    'unit'            => $ing->unit_pakai ?: 'Pcs',
-                    'qty'             => (float)$row['pemakaian_teoritis'],
-                    'cost'            => round($rowRecipeCost, 0),
-                    'total_hpp'       => round($rowRecipeCost, 0),
-                ];
-            }
-        }
-
-        // Compute separate direct items cost for Generate vs Manual
-        $cogsDirectGen = 0.0;
-        $cogsDirectMan = 0.0;
-        $directItemsMap = [];
-
-        // ⚡ MEMORY OPTIMIZATION: Load distinct menus once into a key-map instead of thousands of Eloquent model instances
-        $distinctMenuIds = $transactions->pluck('menu_id')->filter()->unique()->all();
-        $menusMap = !empty($distinctMenuIds)
-            ? Menu::with('recipes')->whereIn('id', $distinctMenuIds)->get()->keyBy('id')
-            : collect();
-
-        foreach ($transactions as $t) {
-            $m = $menusMap->get($t->menu_id);
-            if ($m && ($m->item_type === 'DIRECT' || (!$m->activeRecipe($t->date) && $m->cost_price > 0))) {
-                $itemCost = (float)($m->cost_price * $t->qty);
-                if ($t->is_urgent_note) {
-                    $cogsDirectMan += $itemCost;
-                } else {
-                    $cogsDirectGen += $itemCost;
-                }
-
-                if (!isset($directItemsMap[$m->id])) {
-                    $directItemsMap[$m->id] = [
-                        'ingredient_id'   => 'menu_' . $m->id,
-                        'name'            => $m->name . ' (Direct Retail)',
-                        'ingredient_name' => $m->name . ' (Direct Retail)',
-                        'unit'            => 'Pcs',
-                        'qty'             => 0,
-                        'cost'            => 0,
-                        'total_hpp'       => 0,
-                    ];
-                }
-                $directItemsMap[$m->id]['qty'] += (float)$t->qty;
-                $directItemsMap[$m->id]['cost'] += round($itemCost, 0);
-                $directItemsMap[$m->id]['total_hpp'] += round($itemCost, 0);
-            }
-        }
-        foreach ($directItemsMap as $dim) {
-            $topIngredientsUsage[] = $dim;
-        }
-
-        usort($topIngredientsUsage, fn($a, $b) => ($b['total_hpp'] ?? $b['cost'] ?? 0) <=> ($a['total_hpp'] ?? $a['cost'] ?? 0));
-        $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 15);
-
-        $cogsDirectItems = ($notaType === 'GENERATE') ? $cogsDirectGen : (($notaType === 'MANUAL') ? $cogsDirectMan : ($cogsDirectGen + $cogsDirectMan));
-
-        // Apportion recipes & variance when filtered
-        $cogsRecipes = round($cogsRecipesBase * $notaRatio, 2);
-        $cogsVariance = round($cogsVarianceBase * $notaRatio, 2);
-        $totalCogs = round($cogsRecipes + $cogsVariance + $cogsDirectItems, 2);
-        $cogsRatioPct = $netSales > 0 ? round(($totalCogs / $netSales) * 100, 1) : 0;
-
-        // Gross Profit (Laba Kotor)
-        $grossProfit = round($netSales - $totalCogs, 2);
-        $grossMarginPct = $netSales > 0 ? round(($grossProfit / $netSales) * 100, 1) : 0;
-
-        // 3. KERUGIAN WASTE & SPOILAGE
-        $wasteLogQuery = WasteLog::whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $wasteLogQuery->where('outlet_id', $outletId);
-        }
-        $wasteLogs = $wasteLogQuery->get();
-
-        $wasteLossSum = (float)$wasteLogs->sum('loss_cost');
-        if ($wasteLossSum <= 0) {
-            foreach ($varianceData as $row) {
-                $wasteLossSum += (float)($row['waste_value'] ?? 0);
-            }
-        }
-        $totalWasteLossBase = round($wasteLossSum, 2);
-        $totalWasteLoss = round($totalWasteLossBase * $notaRatio, 2);
-        $wasteRatioPct = $netSales > 0 ? round(($totalWasteLoss / $netSales) * 100, 1) : 0;
-
-        $wasteReasonConfig = WasteLog::reasonCategories();
-        $wasteBreakdown = [];
-        foreach ($wasteReasonConfig as $wKey => $wLabel) {
-            $wItems = $wasteLogs->where('reason_category', $wKey);
-            $wCost = (float)$wItems->sum('loss_cost') * $notaRatio;
-            if ($wCost > 0) {
-                $wasteBreakdown[] = [
-                    'category'   => $wKey,
-                    'label'      => $wLabel,
-                    'total'      => round($wCost, 2),
-                    'count'      => $wItems->count(),
-                    'percentage' => $totalWasteLoss > 0 ? round(($wCost / $totalWasteLoss) * 100, 1) : 0,
-                ];
-            }
-        }
-        usort($wasteBreakdown, fn($a, $b) => $b['total'] <=> $a['total']);
-
-        $operatingProfitAfterWaste = round($grossProfit - $totalWasteLoss, 2);
-
-        // 4. BEBAN OPERASIONAL TOKO (OPEX)
-        $opexQuery = OperatingExpense::whereBetween('date', [$from, $to]);
-        if ($outletId) {
-            $opexQuery->where(function ($q) use ($outletId) {
-                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-            });
-        }
-        $expenses = $opexQuery->get();
-        $totalExpensesOnlyBase = round((float)$expenses->sum('amount'), 2);
-
-        // 4b. SELISIH KASIR DARI HASIL CLOSING SHIFT (CASH OVER / SHORTAGE)
+        // Shift Discrepancies Details
         $shiftsQuery = Shift::with('user')
             ->where(function($q) use ($from, $to) {
                 $q->where(function ($sub) use ($from, $to) {
@@ -1110,11 +1076,8 @@ class ReportController extends Controller
         }
         $closedShifts = $shiftsQuery->get();
 
-        $cashOverTotalBase = 0.0;
-        $cashShortTotalBase = 0.0;
         $cashOverShifts = [];
         $cashShortShifts = [];
-
         foreach ($closedShifts as $s) {
             $diff = $s->cash_difference !== null 
                 ? (float)$s->cash_difference 
@@ -1124,108 +1087,83 @@ class ReportController extends Controller
                 'id'              => $s->id,
                 'shift_name'      => $s->shift_name,
                 'cashier_name'    => $s->user?->name ?: 'Kasir',
+                'outlet_name'     => $s->outlet?->name ?: 'Semua Cabang',
                 'date'            => $s->opened_at ? substr($s->opened_at, 0, 10) : null,
-                'opened_at'       => $s->opened_at,
-                'closed_at'       => $s->closed_at,
                 'initial_cash'    => (float)$s->initial_cash,
-                'system_cash'     => (float)$s->system_cash,
                 'closing_cash'    => (float)$s->closing_cash,
                 'cash_difference' => $diff,
                 'notes'           => $s->notes,
             ];
 
             if ($diff > 0) {
-                $cashOverTotalBase += $diff;
                 $cashOverShifts[] = $shiftItem;
             } elseif ($diff < 0) {
-                $shortAmt = abs($diff);
-                $cashShortTotalBase += $shortAmt;
-                $shiftItem['shortage_amount'] = $shortAmt;
+                $shiftItem['shortage_amount'] = abs($diff);
                 $cashShortShifts[] = $shiftItem;
             }
         }
 
-        $cashOver = round($cashOverTotalBase * $notaRatio, 2);
-        $cashShort = round($cashShortTotalBase * $notaRatio, 2);
-
-        $totalOpexBase = round($totalExpensesOnlyBase + $cashShortTotalBase, 2);
-        $totalOpex = round(($totalExpensesOnlyBase * $notaRatio) + $cashShort, 2);
-        $opexRatioPct = $netSales > 0 ? round(($totalOpex / $netSales) * 100, 1) : 0;
-
-        $expenseCategoriesConfig = OperatingExpense::categories();
-        $opexBreakdown = [];
-        foreach ($expenseCategoriesConfig as $cKey => $cLabel) {
-            $cItems = $expenses->where('category', $cKey);
-            $cAmount = (float)$cItems->sum('amount') * $notaRatio;
-            if ($cAmount > 0) {
-                $opexBreakdown[] = [
-                    'category'   => $cKey,
-                    'label'      => $cLabel,
-                    'total'      => round($cAmount, 2),
-                    'count'      => $cItems->count(),
-                    'percentage' => $totalOpex > 0 ? round(($cAmount / $totalOpex) * 100, 1) : 0,
+        // Top ingredients usage breakdown
+        $topIngredientsUsage = [];
+        $varianceData = $this->buildVarianceArray($from, $to, $outletId);
+        foreach ($varianceData as $row) {
+            $ing = $row['ingredient'];
+            $targetOutletId = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
+            $hargaPerPakai = $ing->costPerPakaiForOutlet($targetOutletId);
+            $rowRecipeCost = (float)$row['pemakaian_teoritis'] * $hargaPerPakai;
+            if ($rowRecipeCost > 0 || (float)$row['pemakaian_teoritis'] > 0) {
+                $topIngredientsUsage[] = [
+                    'ingredient_id'   => $ing->id,
+                    'name'            => $ing->name,
+                    'ingredient_name' => $ing->name,
+                    'unit'            => $ing->unit_pakai ?: 'Pcs',
+                    'qty'             => (float)$row['pemakaian_teoritis'],
+                    'cost'            => round($rowRecipeCost, 0),
+                    'total_hpp'       => round($rowRecipeCost, 0),
                 ];
             }
         }
+        usort($topIngredientsUsage, fn($a, $b) => ($b['total_hpp'] ?? 0) <=> ($a['total_hpp'] ?? 0));
+        $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 15);
 
-        // Tambahkan Beban Selisih Kurang Kasir ke Breakdown OPEX jika ada tekor kasir
-        if ($cashShort > 0) {
-            $opexBreakdown[] = [
-                'category'   => 'CASH_SHORTAGE',
-                'label'      => 'Beban Selisih Kurang Kasir (Kasir Tekor)',
-                'total'      => round($cashShort, 2),
-                'count'      => count($cashShortShifts),
-                'percentage' => $totalOpex > 0 ? round(($cashShort / $totalOpex) * 100, 1) : 0,
-            ];
+        // Waste Breakdown
+        $wasteLogs = WasteLog::whereBetween('date', [$from, $to])->when($outletId, fn($q) => $q->where('outlet_id', $outletId))->get();
+        $wasteReasonConfig = WasteLog::reasonCategories();
+        $wasteBreakdown = [];
+        foreach ($wasteReasonConfig as $wKey => $wLabel) {
+            $wItems = $wasteLogs->where('reason_category', $wKey);
+            $wCost = (float)$wItems->sum('loss_cost');
+            if ($wCost > 0) {
+                $wasteBreakdown[] = [
+                    'category'   => $wKey,
+                    'label'      => $wLabel,
+                    'total'      => round($wCost, 2),
+                    'count'      => $wItems->count(),
+                    'percentage' => $totalWasteLoss > 0 ? round(($wCost / $totalWasteLoss) * 100, 1) : 0,
+                ];
+            }
         }
+        usort($wasteBreakdown, fn($a, $b) => $b['total'] <=> $a['total']);
 
-        usort($opexBreakdown, fn($a, $b) => $b['total'] <=> $a['total']);
-
-        // 5. LABA BERSIH USAHA (NET OPERATING PROFIT)
-        $netProfit = round(($grossProfit + $cashOver) - $totalWasteLoss - $totalOpex, 2);
-        $netMarginPct = $netSales > 0 ? round(($netProfit / $netSales) * 100, 1) : 0;
-
-        // Pre-compute Full Parallel Metrics for Generate vs Manual vs Combined
-        $genRatio = $allNet > 0 ? ($genNet / $allNet) : 0.0;
-        $manRatio = $allNet > 0 ? ($manNet / $allNet) : 0.0;
-
-        $cogsGen = ($cogsRecipesBase * $genRatio) + ($cogsVarianceBase * $genRatio) + $cogsDirectGen;
-        $cogsMan = ($cogsRecipesBase * $manRatio) + ($cogsVarianceBase * $manRatio) + $cogsDirectMan;
-        $cogsAll = $cogsRecipesBase + $cogsVarianceBase + ($cogsDirectGen + $cogsDirectMan);
-
-        $wasteGen = $totalWasteLossBase * $genRatio;
-        $wasteMan = $totalWasteLossBase * $manRatio;
-
-        $opexGen = ($totalExpensesOnlyBase * $genRatio) + ($cashShortTotalBase * $genRatio);
-        $opexMan = ($totalExpensesOnlyBase * $manRatio) + ($cashShortTotalBase * $manRatio);
-
-        $netProfitGen = ($genNet - $cogsGen) + ($cashOverTotalBase * $genRatio) - $wasteGen - $opexGen;
-        $netProfitMan = ($manNet - $cogsMan) + ($cashOverTotalBase * $manRatio) - $wasteMan - $opexMan;
-        $netProfitAll = ($allNet - $cogsAll) + $cashOverTotalBase - $totalWasteLossBase - $totalOpexBase;
-
-        $netMarginGen = $genNet > 0 ? round(($netProfitGen / $genNet) * 100, 1) : 0.0;
-        $netMarginMan = $manNet > 0 ? round(($netProfitMan / $manNet) * 100, 1) : 0.0;
-        $netMarginAll = $allNet > 0 ? round(($netProfitAll / $allNet) * 100, 1) : 0.0;
-
-        // Health Status Indicator
+        // Health Status
         $healthStatus = 'PRIME';
         $healthLabel  = 'Sangat Sehat (Prima)';
-        $healthColor  = '#10B981'; // Emerald
+        $healthColor  = '#10B981';
         if ($netMarginPct < 0) {
             $healthStatus = 'DEFICIT';
             $healthLabel  = 'Defisit / Rugi Operasional';
-            $healthColor  = '#EF4444'; // Red
+            $healthColor  = '#EF4444';
         } elseif ($netMarginPct < 10) {
             $healthStatus = 'WARNING';
             $healthLabel  = 'Waspada (Margin Tipis)';
-            $healthColor  = '#F59E0B'; // Amber
+            $healthColor  = '#F59E0B';
         } elseif ($netMarginPct < 20) {
             $healthStatus = 'HEALTHY';
             $healthLabel  = 'Sehat (Standar F&B Ideal)';
-            $healthColor  = '#06B6D4'; // Cyan
+            $healthColor  = '#06B6D4';
         }
 
-        // 6. WATERFALL STEP DATA
+        // Waterfall Steps
         $waterfall = [
             [
                 'step'        => 'gross_sales',
@@ -1253,7 +1191,7 @@ class ReportController extends Controller
         if ($cashOver > 0) {
             $waterfall[] = [
                 'step'        => 'cash_over',
-                'name'        => '(+) Pendapatan Selisih Lebih Kasir',
+                'name'        => '(+) Pendapatan Selisih Lebih Kasir (Closing)',
                 'amount'      => round($cashOver, 2),
                 'type'        => 'addition',
                 'pct_of_net'  => $netSales > 0 ? round(($cashOver / $netSales) * 100, 1) : 0,
@@ -1263,31 +1201,31 @@ class ReportController extends Controller
         $waterfall = array_merge($waterfall, [
             [
                 'step'        => 'cogs_recipes',
-                'name'        => 'HPP Teoretis Resep',
+                'name'        => 'HPP Bahan & Kemasan Terjual (5-51001 & 5-51002)',
                 'amount'      => -round($cogsRecipes, 2),
                 'type'        => 'subtraction',
                 'pct_of_net'  => $netSales > 0 ? round(($cogsRecipes / $netSales) * 100, 1) : 0,
             ],
             [
+                'step'        => 'waste_loss',
+                'name'        => 'Kerugian Waste / Bahan Rusak (5-51003 & 5-51006)',
+                'amount'      => -round($totalWasteLoss, 2),
+                'type'        => 'subtraction',
+                'pct_of_net'  => $wasteRatioPct,
+            ],
+            [
                 'step'        => 'cogs_variance',
-                'name'        => 'Selisih Opname / Susut Stok',
+                'name'        => 'Selisih Opname / Susut Stok (5-51004 & 5-51005)',
                 'amount'      => -round($cogsVariance, 2),
                 'type'        => 'subtraction',
                 'pct_of_net'  => $netSales > 0 ? round(($cogsVariance / $netSales) * 100, 1) : 0,
             ],
             [
                 'step'        => 'gross_profit',
-                'name'        => 'Laba Kotor (Gross Profit)',
+                'name'        => 'Laba Kotor Usaha (Gross Profit)',
                 'amount'      => round($grossProfit, 2),
                 'type'        => 'subtotal',
                 'pct_of_net'  => $grossMarginPct,
-            ],
-            [
-                'step'        => 'waste_loss',
-                'name'        => 'Kerugian Bahan Terbuang (Waste)',
-                'amount'      => -round($totalWasteLoss, 2),
-                'type'        => 'subtraction',
-                'pct_of_net'  => $wasteRatioPct,
             ],
             [
                 'step'        => 'opex',
@@ -1312,18 +1250,22 @@ class ReportController extends Controller
                 'outlet_id' => $outletId,
             ],
             'nota_type' => $notaType,
+            'source'    => 'GENERAL_LEDGER_JOURNALS',
             'revenue' => [
-                'gross_sales'        => round($grossSales, 2),
-                'total_discount'     => round($totalDiscount, 2),
-                'net_sales'          => round($netSales, 2),
-                'cash_over'          => round($cashOver, 2),
-                'cash_over_count'    => count($cashOverShifts),
-                'cash_over_shifts'   => $cashOverShifts,
-                'net_revenue_total'  => round($netSales + $cashOver, 2),
-                'transaction_count'  => $transactionCount,
-                'item_sold_count'    => $itemCount,
-                'avg_order_value'    => $avgOrderValue,
-                'payment_breakdown'  => $paymentBreakdown,
+                'gross_sales'             => round($grossSales, 2),
+                'total_discount'          => round($totalDiscount, 2),
+                'net_sales'               => round($netSales, 2),
+                'cash_over'               => round($cashOver, 2),
+                'cash_over_count'         => count($cashOverShifts),
+                'cash_over_shifts'        => $cashOverShifts,
+                'handover_surplus'        => 0.0,
+                'handover_surplus_count'  => 0,
+                'handover_surplus_shifts' => [],
+                'net_revenue_total'       => round($netRevenueTotal, 2),
+                'transaction_count'       => $transactionCount,
+                'item_sold_count'         => $allItemCount,
+                'avg_order_value'         => $avgOrderValue,
+                'payment_breakdown'       => $allPaymentBreakdown,
                 'nota_generate'      => [
                     'gross_sales'       => round($genGross, 2),
                     'discount'          => round($genDiscount, 2),
@@ -1331,7 +1273,7 @@ class ReportController extends Controller
                     'transaction_count' => count($genOrderNumbers),
                     'item_sold_count'   => $genItemCount,
                     'avg_order_value'   => count($genOrderNumbers) > 0 ? round($genNet / count($genOrderNumbers), 0) : 0,
-                    'share_pct'         => $allNet > 0 ? round(($genNet / $allNet) * 100, 1) : 0,
+                    'share_pct'         => $netSales > 0 ? round(($genNet / $netSales) * 100, 1) : 0,
                     'payment_breakdown' => $genPaymentBreakdown,
                 ],
                 'nota_manual'        => [
@@ -1341,27 +1283,30 @@ class ReportController extends Controller
                     'transaction_count' => count($manOrderNumbers),
                     'item_sold_count'   => $manItemCount,
                     'avg_order_value'   => count($manOrderNumbers) > 0 ? round($manNet / count($manOrderNumbers), 0) : 0,
-                    'share_pct'         => $allNet > 0 ? round(($manNet / $allNet) * 100, 1) : 0,
+                    'share_pct'         => $netSales > 0 ? round(($manNet / $netSales) * 100, 1) : 0,
                     'payment_breakdown' => $manPaymentBreakdown,
                 ],
                 'combined'           => [
-                    'gross_sales'       => round($allGross, 2),
-                    'discount'          => round($allDiscount, 2),
-                    'net_sales'         => round($allNet, 2),
-                    'transaction_count' => count($allOrderNumbers),
+                    'gross_sales'       => round($grossSales, 2),
+                    'discount'          => round($totalDiscount, 2),
+                    'net_sales'         => round($netSales, 2),
+                    'transaction_count' => $transactionCount,
                     'item_sold_count'   => $allItemCount,
-                    'avg_order_value'   => count($allOrderNumbers) > 0 ? round($allNet / count($allOrderNumbers), 0) : 0,
+                    'avg_order_value'   => $avgOrderValue,
                 ],
                 'discount_summary'   => [
                     'total_discount'    => round($totalDiscount, 2),
-                    'discounted_orders' => $discOrderCount,
-                    'avg_discount'      => $discOrderCount > 0 ? round($totalDiscount / $discOrderCount, 2) : 0,
+                    'discounted_orders' => count(array_filter($transactions->toArray(), fn($t) => (float)($t['discount_amount'] ?? 0) > 0)),
                 ],
             ],
             'cogs' => [
                 'cogs_recipes'          => round($cogsRecipes, 2),
+                'cogs_bahan'            => round($cogsBahan, 2),
+                'cogs_kemasan'          => round($cogsKemasan, 2),
+                'cogs_waste'            => round($totalWasteLoss, 2),
                 'cogs_variance'         => round($cogsVariance, 2),
                 'total_cogs'            => round($totalCogs, 2),
+                'recipes_ratio_pct'     => $netSales > 0 ? round(($cogsRecipes / $netSales) * 100, 1) : 0,
                 'cogs_ratio_pct'        => $cogsRatioPct,
                 'gross_profit'          => round($grossProfit, 2),
                 'gross_margin_pct'      => $grossMarginPct,
@@ -1375,23 +1320,33 @@ class ReportController extends Controller
                 'total_records'                => $wasteLogs->count(),
             ],
             'opex' => [
-                'total_opex'          => round($totalOpex, 2),
-                'expenses_only'       => round($totalExpensesOnlyBase * $notaRatio, 2),
-                'cash_shortage'       => round($cashShort, 2),
-                'cash_short_count'    => count($cashShortShifts),
-                'cash_short_shifts'   => $cashShortShifts,
-                'opex_ratio_pct'      => $opexRatioPct,
-                'breakdown'           => $opexBreakdown,
-                'total_records'       => $expenses->count() + count($cashShortShifts),
+                'total_opex'             => round($totalOpex, 2),
+                'expenses_only'          => round($totalOpex - $cashShortageFromJournal, 2),
+                'cash_shortage'          => round($cashShortageFromJournal, 2),
+                'cash_short_count'       => count($cashShortShifts),
+                'cash_short_shifts'      => $cashShortShifts,
+                'handover_shortage'      => 0.0,
+                'handover_short_count'   => 0,
+                'handover_short_shifts'  => [],
+                'opex_ratio_pct'         => $opexRatioPct,
+                'breakdown'              => $opexBreakdown,
+                'total_records'          => count($opexBreakdown),
             ],
             'cash_discrepancy' => [
-                'cash_over'          => round($cashOver, 2),
-                'cash_over_count'    => count($cashOverShifts),
-                'cash_over_shifts'   => $cashOverShifts,
-                'cash_shortage'      => round($cashShort, 2),
-                'cash_short_count'   => count($cashShortShifts),
-                'cash_short_shifts'  => $cashShortShifts,
-                'net_discrepancy'    => round($cashOver - $cashShort, 2),
+                'cash_over'               => round($cashOver, 2),
+                'cash_over_count'         => count($cashOverShifts),
+                'cash_over_shifts'        => $cashOverShifts,
+                'cash_shortage'           => round($cashShortageFromJournal, 2),
+                'cash_short_count'        => count($cashShortShifts),
+                'cash_short_shifts'       => $cashShortShifts,
+                'handover_surplus'        => 0.0,
+                'handover_surplus_count'  => 0,
+                'handover_surplus_shifts' => [],
+                'handover_shortage'       => 0.0,
+                'handover_short_count'    => 0,
+                'handover_short_shifts'   => [],
+                'net_handover_diff'       => 0.0,
+                'net_discrepancy'         => round($cashOver - $cashShortageFromJournal, 2),
             ],
             'bottom_line' => [
                 'net_profit'     => round($netProfit, 2),
@@ -1401,65 +1356,6 @@ class ReportController extends Controller
                 'health_color'   => $healthColor,
             ],
             'waterfall' => $waterfall,
-            'nota_breakdown' => [
-                'generate' => [
-                    'gross_sales'       => round($genGross, 2),
-                    'discount'          => round($genDiscount, 2),
-                    'net_sales'         => round($genNet, 2),
-                    'transaction_count' => count($genOrderNumbers),
-                    'item_sold_count'   => $genItemCount,
-                    'avg_order_value'   => count($genOrderNumbers) > 0 ? round($genNet / count($genOrderNumbers), 0) : 0,
-                    'share_pct'         => $allNet > 0 ? round(($genNet / $allNet) * 100, 1) : 0,
-                    'cogs'              => round($cogsGen, 2),
-                    'cogs_ratio_pct'    => $genNet > 0 ? round(($cogsGen / $genNet) * 100, 1) : 0,
-                    'gross_profit'      => round($genNet - $cogsGen, 2),
-                    'gross_margin_pct'  => $genNet > 0 ? round((($genNet - $cogsGen) / $genNet) * 100, 1) : 0,
-                    'waste'             => round($wasteGen, 2),
-                    'waste_ratio_pct'   => $genNet > 0 ? round(($wasteGen / $genNet) * 100, 1) : 0,
-                    'opex'              => round($opexGen, 2),
-                    'opex_ratio_pct'    => $genNet > 0 ? round(($opexGen / $genNet) * 100, 1) : 0,
-                    'net_profit'        => round($netProfitGen, 2),
-                    'net_margin_pct'    => $netMarginGen,
-                ],
-                'manual' => [
-                    'gross_sales'       => round($manGross, 2),
-                    'discount'          => round($manDiscount, 2),
-                    'net_sales'         => round($manNet, 2),
-                    'transaction_count' => count($manOrderNumbers),
-                    'item_sold_count'   => $manItemCount,
-                    'avg_order_value'   => count($manOrderNumbers) > 0 ? round($manNet / count($manOrderNumbers), 0) : 0,
-                    'share_pct'         => $allNet > 0 ? round(($manNet / $allNet) * 100, 1) : 0,
-                    'cogs'              => round($cogsMan, 2),
-                    'cogs_ratio_pct'    => $manNet > 0 ? round(($cogsMan / $manNet) * 100, 1) : 0,
-                    'gross_profit'      => round($manNet - $cogsMan, 2),
-                    'gross_margin_pct'  => $manNet > 0 ? round((($manNet - $cogsMan) / $manNet) * 100, 1) : 0,
-                    'waste'             => round($wasteMan, 2),
-                    'waste_ratio_pct'   => $manNet > 0 ? round(($wasteMan / $manNet) * 100, 1) : 0,
-                    'opex'              => round($opexMan, 2),
-                    'opex_ratio_pct'    => $manNet > 0 ? round(($opexMan / $manNet) * 100, 1) : 0,
-                    'net_profit'        => round($netProfitMan, 2),
-                    'net_margin_pct'    => $netMarginMan,
-                ],
-                'combined' => [
-                    'gross_sales'       => round($allGross, 2),
-                    'discount'          => round($allDiscount, 2),
-                    'net_sales'         => round($allNet, 2),
-                    'transaction_count' => count($allOrderNumbers),
-                    'item_sold_count'   => $allItemCount,
-                    'avg_order_value'   => count($allOrderNumbers) > 0 ? round($allNet / count($allOrderNumbers), 0) : 0,
-                    'share_pct'         => 100.0,
-                    'cogs'              => round($cogsAll, 2),
-                    'cogs_ratio_pct'    => $allNet > 0 ? round(($cogsAll / $allNet) * 100, 1) : 0,
-                    'gross_profit'      => round($allNet - $cogsAll, 2),
-                    'gross_margin_pct'  => $allNet > 0 ? round((($allNet - $cogsAll) / $allNet) * 100, 1) : 0,
-                    'waste'             => round($totalWasteLossBase, 2),
-                    'waste_ratio_pct'   => $allNet > 0 ? round(($totalWasteLossBase / $allNet) * 100, 1) : 0,
-                    'opex'              => round($totalOpexBase, 2),
-                    'opex_ratio_pct'    => $allNet > 0 ? round(($totalOpexBase / $allNet) * 100, 1) : 0,
-                    'net_profit'        => round($netProfitAll, 2),
-                    'net_margin_pct'    => $netMarginAll,
-                ],
-            ],
         ];
     }
 

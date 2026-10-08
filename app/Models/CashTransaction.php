@@ -13,11 +13,13 @@ class CashTransaction extends Model
     protected $fillable = [
         'business_id',
         'outlet_id',
+        'shift_id',
         'transaction_no',
         'date',
         'type',
         'activity_type',
         'category',
+        'status',
         'name',
         'amount',
         'account',
@@ -25,13 +27,22 @@ class CashTransaction extends Model
         'notes',
         'receipt_img',
         'user_id',
+        'approved_by',
+        'approved_at',
+        'rejection_reason',
         'created_by',
         'updated_by',
     ];
 
     protected $casts = [
-        'amount' => 'float',
-        'date'   => 'date:Y-m-d',
+        'amount'      => 'float',
+        'date'        => 'date:Y-m-d',
+        'approved_at' => 'datetime',
+    ];
+
+    protected $attributes = [
+        'activity_type'  => 'OPERATING',
+        'payment_method' => 'CASH',
     ];
 
     protected $appends = [
@@ -40,6 +51,7 @@ class CashTransaction extends Model
         'account_label',
         'outlet_name',
         'user_name',
+        'approved_by_name',
         'created_by_name',
         'updated_by_name',
         'changed_at',
@@ -71,21 +83,24 @@ class CashTransaction extends Model
             'LOAN_RECEIPT'      => ['label' => 'Penerimaan Pinjaman Modal', 'activity' => 'FINANCING', 'default_type' => 'IN'],
             'LOAN_REPAYMENT'    => ['label' => 'Pembayaran Pokok Pinjaman', 'activity' => 'FINANCING', 'default_type' => 'OUT'],
 
-            // OPERATING
-            'SETORAN_KASIR'     => ['label' => 'Setoran Uang Kasir ke Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'IN'],
-            'SUPPLIER_PURCHASE' => ['label' => 'Belanja Bahan Baku Langsung', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
-            'OTHER_INCOME'      => ['label' => 'Pendapatan Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'IN'],
-            'OTHER_EXPENSE'     => ['label' => 'Biaya Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            // OPERATING & SETORAN
+            'SETORAN_KASIR'       => ['label' => 'Setoran Uang Kasir ke Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'IN'],
+            'SETOR_KAS_APLIKASI'  => ['label' => 'Setoran Kas Aplikasi (QRIS) ke Bank', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'TARIK_MODAL_KASIR'   => ['label' => 'Ambil Modal Kasir dari Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'SUPPLIER_PURCHASE'   => ['label' => 'Belanja Bahan Baku Langsung', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'OTHER_INCOME'        => ['label' => 'Pendapatan Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'IN'],
+            'OTHER_EXPENSE'       => ['label' => 'Biaya Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
         ];
     }
 
     public static function accounts(): array
     {
         return [
-            'KAS_BESAR'   => 'Kas Besar / Brankas Utama',
-            'BANK_MAIN'   => 'Rekening Bank Utama Resto',
-            'CASH_DRAWER' => 'Kas Toko / Laci Kasir',
-            'PETTY_CASH'  => 'Kas Kecil (Petty Cash)',
+            'KAS_BESAR'    => 'Kas Besar / Brankas Utama',
+            'BANK_MAIN'    => 'Rekening Bank Utama Resto',
+            'KAS_APLIKASI' => 'Kas Aplikasi (QRIS)',
+            'CASH_DRAWER'  => 'Kas Toko / Laci Kasir',
+            'PETTY_CASH'   => 'Kas Kecil (Petty Cash)',
         ];
     }
 
@@ -113,9 +128,24 @@ class CashTransaction extends Model
         return $this->belongsTo(Outlet::class);
     }
 
+    public function shift()
+    {
+        return $this->belongsTo(Shift::class);
+    }
+
     public function user()
     {
         return $this->belongsTo(User::class);
+    }
+
+    public function approver()
+    {
+        return $this->belongsTo(User::class, 'approved_by');
+    }
+
+    public function approvedByUser()
+    {
+        return $this->belongsTo(User::class, 'approved_by');
     }
 
     public function getCategoryLabelAttribute(): string
@@ -144,5 +174,10 @@ class CashTransaction extends Model
     public function getUserNameAttribute(): ?string
     {
         return $this->user?->name ?? $this->creator?->name ?? 'Admin';
+    }
+
+    public function getApprovedByNameAttribute(): ?string
+    {
+        return $this->relationLoaded('approver') ? $this->approver?->name : ($this->approved_by ? User::find($this->approved_by)?->name : null);
     }
 }

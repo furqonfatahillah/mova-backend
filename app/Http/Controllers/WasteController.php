@@ -7,6 +7,8 @@ use App\Models\Ingredient;
 use App\Models\Menu;
 use App\Models\OutletMenu;
 use App\Models\StockMovement;
+use App\Models\JournalEntry;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -18,11 +20,20 @@ class WasteController extends Controller
      */
     public function index(Request $request)
     {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         $query = WasteLog::with(['ingredient', 'menu', 'outlet', 'shift', 'user', 'creator', 'stockMovement'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
-        $user = $request->user();
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhereHas('outlet', fn($qo) => $qo->where('business_id', $businessId));
+            });
+        }
+
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
 
         if ($isOutletBounded) {
@@ -63,9 +74,18 @@ class WasteController extends Controller
      */
     public function analytics(Request $request)
     {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         $query = WasteLog::query();
 
-        $user = $request->user();
+        if ($businessId) {
+            $query->where(function ($q) use ($businessId) {
+                $q->where('business_id', $businessId)
+                  ->orWhereHas('outlet', fn($qo) => $qo->where('business_id', $businessId));
+            });
+        }
+
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
 
         if ($isOutletBounded) {
@@ -166,14 +186,17 @@ class WasteController extends Controller
 
         $itemType = $data['item_type'] ?? ($request->filled('menu_id') ? 'MENU' : 'INGREDIENT');
         $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
             $outletId = (int)$user->outlet_id;
         } else {
-            $outletId = $data['outlet_id'] ?? $user?->outlet_id ?? 1;
+            $outletId = (int)($data['outlet_id'] ?? $user?->outlet_id ?? Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->value('id'));
         }
 
         $datePrefix = date('Ymd', strtotime($data['date']));
-        $latest = WasteLog::where('waste_no', 'like', "WST-{$datePrefix}-%")
+        $latest = WasteLog::when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->where('waste_no', 'like', "WST-{$datePrefix}-%")
             ->orderByDesc('id')
             ->first();
 
@@ -231,6 +254,7 @@ class WasteController extends Controller
                             $ingQty = (float)$rItem->qty * $qtyPakai;
                             
                             $mov = StockMovement::create([
+                                'business_id'   => $businessId,
                                 'date'          => $data['date'],
                                 'ingredient_id' => $rItem->ingredient_id,
                                 'outlet_id'     => $outletId,
@@ -260,6 +284,7 @@ class WasteController extends Controller
                                     $bIngCost = (float)($bItem->ingredient?->harga / max((float)($bItem->ingredient?->konversi ?? 1), 1));
                                 }
                                 StockMovement::create([
+                                    'business_id'   => $businessId,
                                     'date'          => $data['date'],
                                     'ingredient_id' => $bItem->ingredient_id,
                                     'outlet_id'     => $outletId,
@@ -281,6 +306,7 @@ class WasteController extends Controller
                 }
 
                 $log = WasteLog::create([
+                    'business_id'       => $businessId,
                     'waste_no'          => $wasteNo,
                     'date'              => $data['date'],
                     'item_type'         => 'MENU',
@@ -322,6 +348,7 @@ class WasteController extends Controller
                 $lossCost = round($qtyPakai * $costPerPakai, 2);
 
                 $movement = StockMovement::create([
+                    'business_id'   => $businessId,
                     'date'          => $data['date'],
                     'ingredient_id' => $ingredient->id,
                     'outlet_id'     => $outletId,
@@ -339,6 +366,7 @@ class WasteController extends Controller
                 ]);
 
                 $log = WasteLog::create([
+                    'business_id'       => $businessId,
                     'waste_no'          => $wasteNo,
                     'date'              => $data['date'],
                     'item_type'         => 'INGREDIENT',
@@ -364,6 +392,10 @@ class WasteController extends Controller
         });
 
         $wasteLog->load(['ingredient', 'menu', 'outlet', 'shift', 'user', 'creator', 'stockMovement']);
+
+        // Auto-post double-entry journal ledger
+        AccountingService::postWaste($wasteLog);
+
         return response()->json($wasteLog, 201);
     }
 
@@ -373,6 +405,10 @@ class WasteController extends Controller
     public function destroy(WasteLog $wasteLog)
     {
         DB::transaction(function () use ($wasteLog) {
+            JournalEntry::where('reference_type', 'WASTE_LOG')
+                ->where('reference_id', $wasteLog->id)
+                ->delete();
+
             if ($wasteLog->stock_movement_id) {
                 StockMovement::where('id', $wasteLog->stock_movement_id)->delete();
             }

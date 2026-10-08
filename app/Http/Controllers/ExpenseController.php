@@ -3,6 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\OperatingExpense;
+use App\Models\JournalEntry;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -224,6 +226,9 @@ class ExpenseController extends Controller
             'created_by'     => $user->id,
         ]);
 
+        // Auto-post double-entry journal ledger
+        AccountingService::postOperatingExpense($expense);
+
         return response()->json([
             'message' => 'Biaya operasional berhasil dicatat',
             'data'    => $expense->fresh(['outlet', 'user']),
@@ -279,6 +284,9 @@ class ExpenseController extends Controller
             'updated_by'     => $request->user()->id,
         ]);
 
+        // Auto-post double-entry journal ledger
+        AccountingService::postOperatingExpense($expense);
+
         return response()->json([
             'message' => 'Data biaya operasional berhasil diperbarui',
             'data'    => $expense->fresh(['outlet', 'user']),
@@ -298,6 +306,10 @@ class ExpenseController extends Controller
                 return response()->json(['message' => 'Anda tidak memiliki hak akses untuk menghapus beban operasional di cabang lain.'], 403);
             }
         }
+
+        JournalEntry::where('reference_type', 'OPERATING_EXPENSE')
+            ->where('reference_id', $expense->id)
+            ->delete();
 
         $expense->delete();
 

@@ -6,6 +6,8 @@ use App\Models\Payable;
 use App\Models\PayablePayment;
 use App\Models\Supplier;
 use App\Models\Outlet;
+use App\Models\JournalEntry;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -16,7 +18,12 @@ class PayableController extends Controller
         $user = $request->user();
         $businessId = $user?->business_id;
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $query = Payable::with(['payments.payer', 'outlet', 'creator', 'ingredient', 'stockMovement', 'supplier'])
             ->orderBy('issue_date', 'desc')
@@ -282,8 +289,8 @@ class PayableController extends Controller
         $businessId = $payable->business_id ?? $user?->business_id;
         $paymentNo = PayablePayment::generatePaymentNo($businessId, $data['payment_date']);
 
-        DB::transaction(function () use ($payable, $data, $user, $businessId, $paymentNo, $amount) {
-            PayablePayment::create([
+        $createdPayment = DB::transaction(function () use ($payable, $data, $user, $businessId, $paymentNo, $amount) {
+            $pp = PayablePayment::create([
                 'payment_no'     => $paymentNo,
                 'payable_id'     => $payable->id,
                 'business_id'    => $businessId,
@@ -306,7 +313,14 @@ class PayableController extends Controller
                 'status'           => $newStatus,
                 'updated_by'       => $user->id,
             ]);
+
+            return $pp;
         });
+
+        // Auto-post double-entry journal ledger
+        if ($createdPayment) {
+            AccountingService::postPayablePayment($createdPayment);
+        }
 
         $payable->refresh()->load(['payments.payer', 'outlet', 'creator', 'updater', 'ingredient', 'supplier']);
         return response()->json($payable);
@@ -324,6 +338,10 @@ class PayableController extends Controller
         $user = auth()->user();
 
         DB::transaction(function () use ($payable, $payment, $user) {
+            JournalEntry::where('reference_type', 'PAYABLE_PAYMENT')
+                ->where('reference_id', $payment->id)
+                ->delete();
+
             $payment->delete();
 
             $totalPaid = (float)$payable->payments()->sum('amount');
@@ -398,7 +416,8 @@ class PayableController extends Controller
         $remainingPayment = $paymentAmount;
         $updatedPayables = [];
 
-        DB::transaction(function () use ($payables, $data, $user, &$remainingPayment, &$updatedPayables) {
+        $createdPayments = [];
+        DB::transaction(function () use ($payables, $data, $user, &$remainingPayment, &$updatedPayables, &$createdPayments) {
             foreach ($payables as $pay) {
                 if ($remainingPayment <= 0) break;
 
@@ -408,7 +427,7 @@ class PayableController extends Controller
                 $businessId = $pay->business_id ?? $user?->business_id;
                 $paymentNo = PayablePayment::generatePaymentNo($businessId, $data['payment_date']);
 
-                PayablePayment::create([
+                $pp = PayablePayment::create([
                     'payment_no'     => $paymentNo,
                     'payable_id'     => $pay->id,
                     'business_id'    => $businessId,
@@ -420,6 +439,7 @@ class PayableController extends Controller
                     'notes'          => $data['notes'] ? "Pelunasan Sekaligus: {$data['notes']}" : 'Pembayaran Sekaligus Hutang Supplier',
                     'paid_by'        => $user->id,
                 ]);
+                $createdPayments[] = $pp;
 
                 $newPaid = (float)$pay->paid_amount + $payForThis;
                 $newRemaining = max(0, (float)$pay->total_amount - $newPaid);
@@ -436,6 +456,11 @@ class PayableController extends Controller
                 $updatedPayables[] = $pay->id;
             }
         });
+
+        // Auto-post double-entry journal ledger for bulk payments
+        foreach ($createdPayments as $p) {
+            AccountingService::postPayablePayment($p);
+        }
 
         $resultList = Payable::with(['payments.payer', 'outlet', 'creator', 'ingredient', 'supplier'])
             ->whereIn('id', $updatedPayables)
@@ -454,7 +479,12 @@ class PayableController extends Controller
     {
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
-        $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->outlet_id ?? $user?->outlet_id);
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
 
         $from = $request->from ?? now()->startOfMonth()->toDateString();
         $to   = $request->to   ?? now()->endOfMonth()->toDateString();

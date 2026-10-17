@@ -1757,11 +1757,15 @@ class ShiftController extends Controller
 
         $shift->load(['outlet.business', 'user', 'closedByUser', 'depositSubmittedByUser', 'depositApprovedByUser', 'shiftSchedule']);
 
-        // Transactions within this shift
+        // Transactions within this shift (protect against equal split duplicate counting)
         $paidTransactions = $shift->transactions()
             ->where(function ($q) {
-                $q->where('status', 'PAID')
-                  ->orWhere('status', 'SPLIT_CLOSED');
+                $q->where(function ($sub) {
+                    $sub->where('status', 'PAID')
+                        ->where(function ($inner) {
+                            $inner->whereNull('split_type')->orWhere('split_type', '!=', 'EQUAL');
+                        });
+                })->orWhere('status', 'SPLIT_CLOSED');
             })
             ->with(['menu', 'customer'])
             ->get();
@@ -1774,6 +1778,7 @@ class ShiftController extends Controller
         $grabSales = 0.0;
         $gofoodSales = 0.0;
         $shopeeSales = 0.0;
+        $tiktokSales = 0.0;
         $transferSales = 0.0;
         $debitSales = 0.0;
         $kasbonSales = 0.0;
@@ -1797,16 +1802,18 @@ class ShiftController extends Controller
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'GOFOOD') || str_contains($method, 'GOJEK')) {
                 $gofoodSales += $price;
-                $grabSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'SHOPEE')) {
                 $shopeeSales += $price;
+                $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
+            } elseif (str_contains($method, 'GRAB')) {
                 $grabSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
-            } elseif (str_contains($method, 'GRAB') || str_contains($method, 'TIKTOK')) {
-                $grabSales += $price;
+            } elseif (str_contains($method, 'TIKTOK')) {
+                $tiktokSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'TRANSFER')) {
@@ -1941,7 +1948,8 @@ class ShiftController extends Controller
             'TRANSFER'    => $transferSales,
             'DEBIT / EDC' => $debitSales,
         ];
-        if ($grabSales > 0) $nonCashDetails['GRAB / TIKTOK'] = $grabSales;
+        if ($grabSales > 0) $nonCashDetails['GRAB'] = $grabSales;
+        if ($tiktokSales > 0) $nonCashDetails['TIKTOK'] = $tiktokSales;
         if ($gofoodSales > 0) $nonCashDetails['GOFOOD'] = $gofoodSales;
         if ($shopeeSales > 0) $nonCashDetails['SHOPEEFOOD'] = $shopeeSales;
         if ($kasbonSales > 0) $nonCashDetails['KASBON'] = $kasbonSales;
@@ -1970,10 +1978,17 @@ class ShiftController extends Controller
             'closed_by_name'     => $shift->closedByUser?->name ?? null,
             'order_number_range' => $orderRange,
             'initial_cash'       => (float)$shift->initial_cash,
+            'starting_cash'      => (float)$shift->initial_cash,
             'cash_total'         => $cashSales,
+            'cash_sales'         => $cashSales,
             'total_expenses'     => $expData['cash_expenses'],
+            'cash_out'           => $expData['cash_expenses'],
+            'expected_cash'      => $expectedCash,
+            'expected_ending_cash'=> $expectedCash,
             'closing_cash'       => $closingCash,
+            'actual_ending_cash' => $closingCash,
             'cash_difference'    => $cashDiff,
+            'difference'         => $cashDiff,
             'deposit_status'     => $depositStatus,
             'is_deposited'       => $depositStatus === 'APPROVED' || $depositAmount > 0,
             'is_deposit_pending' => $depositStatus === 'PENDING',

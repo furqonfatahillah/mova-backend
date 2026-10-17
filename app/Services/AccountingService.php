@@ -1704,28 +1704,41 @@ class AccountingService
         $date = $oe->date ?: now()->toDateString();
         $cat = strtoupper(trim((string)$oe->category));
 
-        // Map category to OPEX account code
-        $expCode = '6-61009'; // default BIAYA OPERASIONAL LAINNYA
-        if (str_contains($cat, 'GAJI') || str_contains($cat, 'SALARY') || str_contains($cat, 'UPAH') || str_contains($cat, 'KARYAWAN')) {
-            $expCode = '6-61001'; // BIAYA GAJI KARYAWAN
-        } elseif (str_contains($cat, 'LISTRIK') || str_contains($cat, 'PLN')) {
-            $expCode = '6-61002'; // BIAYA LISTRIK
-        } elseif (str_contains($cat, 'AIR') || str_contains($cat, 'PDAM')) {
-            $expCode = '6-61003'; // BIAYA AIR
-        } elseif (str_contains($cat, 'GAS') || str_contains($cat, 'ELPIJI') || str_contains($cat, 'LPG')) {
-            $expCode = '6-61004'; // BIAYA GAS
-        } elseif (str_contains($cat, 'PEMELIHARAAN') || str_contains($cat, 'MAINTENANCE') || str_contains($cat, 'SERVIS') || str_contains($cat, 'PERBAIKAN') || str_contains($cat, 'RENOVASI')) {
-            $expCode = '6-61005'; // BIAYA PEMELIHARAAN ASET
-        } elseif (str_contains($cat, 'MARKETING') || str_contains($cat, 'PROMOSI') || str_contains($cat, 'IKLAN') || str_contains($cat, 'ADS')) {
-            $expCode = '6-61006'; // BIAYA MARKETING
-        } elseif (str_contains($cat, 'LOGISTIK') || str_contains($cat, 'TRANSPORT') || str_contains($cat, 'ONGKIR') || str_contains($cat, 'BENSIN') || str_contains($cat, 'PENGIRIMAN')) {
-            $expCode = '6-61007'; // BIAYA LOGISTIK & TRANSPORTASI
-        } elseif (str_contains($cat, 'ADMIN') || str_contains($cat, 'APLIKASI') || str_contains($cat, 'MDR') || str_contains($cat, 'GATEWAY') || str_contains($cat, 'FEE')) {
-            $expCode = '6-61010'; // BIAYA ADMIN KAS APLIKASI
-        } elseif ((str_contains($cat, 'SELISIH') && str_contains($cat, 'KAS')) || str_contains($cat, 'LAIN')) {
-            $expCode = '6-61008'; // BIAYA LAIN-LAIN
-        } else {
-            $expCode = '6-61009'; // BIAYA OPERASIONAL LAINNYA
+        // Map category to OPEX account code based on COA
+        $expCode = null;
+
+        // 1. Cek apakah kategori merupakan Kode Akun COA langsung (misal '6-61002' atau '6-61011')
+        if (preg_match('/^[0-9]+-[0-9]+(\.[0-9]+)?$/', $cat)) {
+            $expCode = explode('.', $cat)[0];
+        }
+
+        // 2. Jika bukan kode langsung, cocokkan dengan pola kata atau legacy key
+        if (!$expCode) {
+            if (str_contains($cat, 'GAJI') || str_contains($cat, 'SALARY') || str_contains($cat, 'UPAH') || str_contains($cat, 'KARYAWAN')) {
+                $expCode = '6-61001'; // BIAYA GAJI KARYAWAN
+            } elseif (str_contains($cat, 'LISTRIK') || str_contains($cat, 'PLN')) {
+                $expCode = '6-61002'; // BIAYA LISTRIK
+            } elseif (str_contains($cat, 'AIR') || str_contains($cat, 'PDAM')) {
+                $expCode = '6-61003'; // BIAYA AIR
+            } elseif (str_contains($cat, 'GAS') || str_contains($cat, 'ELPIJI') || str_contains($cat, 'LPG')) {
+                $expCode = '6-61004'; // BIAYA GAS
+            } elseif (str_contains($cat, 'SEWA') || str_contains($cat, 'RENT') || str_contains($cat, 'KONTRAK') || str_contains($cat, 'GEDUNG') || str_contains($cat, 'BANGUNAN')) {
+                $expCode = '6-61011'; // BIAYA SEWA TEMPAT / BANGUNAN
+            } elseif (str_contains($cat, 'PEMELIHARAAN') || str_contains($cat, 'MAINTENANCE') || str_contains($cat, 'SERVIS') || str_contains($cat, 'PERBAIKAN') || str_contains($cat, 'RENOVASI') || str_contains($cat, 'SANITASI')) {
+                $expCode = '6-61005'; // BIAYA PEMELIHARAAN ASET
+            } elseif (str_contains($cat, 'MARKETING') || str_contains($cat, 'PROMOSI') || str_contains($cat, 'IKLAN') || str_contains($cat, 'ADS')) {
+                $expCode = '6-61006'; // BIAYA MARKETING
+            } elseif (str_contains($cat, 'LOGISTIK') || str_contains($cat, 'TRANSPORT') || str_contains($cat, 'ONGKIR') || str_contains($cat, 'BENSIN') || str_contains($cat, 'PENGIRIMAN')) {
+                $expCode = '6-61007'; // BIAYA LOGISTIK & TRANSPORTASI
+            } elseif (str_contains($cat, 'ADMIN') || str_contains($cat, 'APLIKASI') || str_contains($cat, 'MDR') || str_contains($cat, 'GATEWAY') || str_contains($cat, 'FEE')) {
+                $expCode = '6-61010'; // BIAYA ADMIN KAS APLIKASI
+            } elseif (str_contains($cat, 'UTILITIES')) {
+                $expCode = '6-61002'; // Default utilities ke listrik
+            } elseif ((str_contains($cat, 'SELISIH') && str_contains($cat, 'KAS')) || str_contains($cat, 'SHORTAGE') || str_contains($cat, 'TEKOR')) {
+                $expCode = '6-61008'; // BIAYA LAIN-LAIN
+            } else {
+                $expCode = '6-61009'; // BIAYA OPERASIONAL LAINNYA
+            }
         }
 
         // Source account (Kas Kecil Kasir / Kas Besar / Bank)

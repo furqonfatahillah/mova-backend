@@ -133,8 +133,11 @@ class ExpenseController extends Controller
         $totalAmount = (float)$expenses->sum('amount');
         $totalCount  = $expenses->count();
 
+        $businessId = $user->business_id ?? 1;
+
         // Breakdown by category
-        $categoryConfig = OperatingExpense::categories();
+        $categoryConfig = OperatingExpense::categories($businessId);
+        $coaCategories  = OperatingExpense::coaCategories($businessId);
         $byCategory = [];
         foreach ($categoryConfig as $catKey => $catLabel) {
             $catItems = $expenses->where('category', $catKey);
@@ -177,6 +180,7 @@ class ExpenseController extends Controller
             'by_category'       => $byCategory,
             'by_payment_method' => $byPaymentMethod,
             'all_categories'    => $categoryConfig,
+            'coa_categories'    => $coaCategories,
             'all_methods'       => $methodConfig,
         ]);
     }
@@ -186,12 +190,13 @@ class ExpenseController extends Controller
      */
     public function store(Request $request)
     {
-        $validCategories = array_keys(OperatingExpense::categories());
+        $user = $request->user();
+        $businessId = $user->business_id ?? 1;
         $validMethods = array_keys(OperatingExpense::paymentMethods());
 
         $data = $request->validate([
             'date'           => 'required|date',
-            'category'       => 'required|string|in:' . implode(',', $validCategories),
+            'category'       => 'required|string|max:100',
             'name'           => 'required|string|max:255',
             'amount'         => 'required|numeric|min:0.01',
             'payment_method' => 'nullable|string|in:' . implode(',', $validMethods),
@@ -199,9 +204,6 @@ class ExpenseController extends Controller
             'notes'          => 'nullable|string|max:1000',
             'receipt_img'    => 'nullable|string|max:255',
         ]);
-
-        $user = $request->user();
-        $businessId = $user->business_id ?? null;
         $paymentMethod = $data['payment_method'] ?? 'CASH';
 
         $canViewAllOutlets = $user->isPlatformAdmin() || $user->isOwnerBisnis();
@@ -266,7 +268,7 @@ class ExpenseController extends Controller
 
         $data = $request->validate([
             'date'           => 'sometimes|required|date',
-            'category'       => 'sometimes|required|string|in:' . implode(',', $validCategories),
+            'category'       => 'sometimes|required|string|max:100',
             'name'           => 'sometimes|required|string|max:255',
             'amount'         => 'sometimes|required|numeric|min:0.01',
             'payment_method' => 'nullable|string|in:' . implode(',', $validMethods),

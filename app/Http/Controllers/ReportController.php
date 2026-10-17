@@ -973,6 +973,7 @@ class ReportController extends Controller
             '6-61008' => ['category' => 'CASH_SHORTAGE', 'label' => 'Biaya Lain-lain / Selisih Kurang Kasir'],
             '6-61009' => ['category' => 'OTHER',         'label' => 'Beban Operasional Lainnya'],
             '6-61010' => ['category' => 'ADMIN_FEE',     'label' => 'Biaya Admin Kas Aplikasi'],
+            '6-61011' => ['category' => 'RENT',          'label' => 'Sewa Tempat / Bangunan'],
         ];
 
         $opexBreakdown = [];

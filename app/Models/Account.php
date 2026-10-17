@@ -364,6 +364,14 @@ class Account extends Model
                 'normal_balance' => 'DEBIT',
                 'description'    => 'Biaya administrasi / komisi / potongan MDR aplikasi kasir, payment gateway, QRIS, dan e-commerce / online delivery (Grab, Gojek, Shopee)',
             ],
+            [
+                'code'           => '6-61011',
+                'name'           => 'BIAYA SEWA TEMPAT / BANGUNAN',
+                'type'           => 'EXPENSE',
+                'category'       => 'OPEX',
+                'normal_balance' => 'DEBIT',
+                'description'    => 'Biaya sewa gedung, ruko, tanah, atau tempat usaha operasional',
+            ],
         ];
     }
 

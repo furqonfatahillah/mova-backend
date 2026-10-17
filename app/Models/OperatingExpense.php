@@ -45,19 +45,82 @@ class OperatingExpense extends Model
         'changed_by_name',
     ];
 
-    public static function categories(): array
+    public static function categories(?int $businessId = null): array
     {
-        return [
-            'SALARY'      => 'Gaji & Upah Karyawan',
-            'UTILITIES'   => 'Listrik, Air & Internet',
-            'GAS'         => 'Gas Masak (LPG)',
-            'RENT'        => 'Sewa Tempat / Bangunan',
-            'MAINTENANCE' => 'Pemeliharaan, Sanitasi & Servis',
-            'MARKETING'   => 'Pemasaran & Promosi',
-            'LOGISTICS'   => 'Logistik & Transportasi',
-            'ADMIN_FEE'   => 'Biaya Admin Kas Aplikasi & Merchant',
-            'OTHER'       => 'Beban Operasional Lain-lain',
+        $businessId = $businessId ?: 1;
+        $result = [];
+
+        // Ambil akun beban operasional aktif langsung dari Master Akun (COA)
+        try {
+            $accounts = Account::where('business_id', $businessId)
+                ->where('is_active', true)
+                ->where(function ($q) {
+                    $q->where('code', 'like', '6-%')
+                      ->orWhere('category', 'OPEX')
+                      ->orWhere('category', 'OTHER_EXPENSE');
+                })
+                ->where('code', 'not like', '5-%')
+                ->whereNull('parent_code')
+                ->orderBy('code', 'asc')
+                ->get(['code', 'name']);
+
+            foreach ($accounts as $acc) {
+                $result[$acc->code] = "[{$acc->code}] {$acc->name}";
+            }
+        } catch (\Throwable $e) {
+            // fallback jika belum migrasi/koneksi db
+        }
+
+        // Mapping legacy untuk data lama / backward compatibility
+        $legacy = [
+            'SALARY'      => '[6-61001] Gaji & Upah Karyawan',
+            'UTILITIES'   => '[6-61002] Listrik, Air & Internet',
+            'GAS'         => '[6-61004] Gas Masak (LPG)',
+            'RENT'        => '[6-61011] Sewa Tempat / Bangunan',
+            'MAINTENANCE' => '[6-61005] Pemeliharaan, Sanitasi & Servis',
+            'MARKETING'   => '[6-61006] Pemasaran & Promosi',
+            'LOGISTICS'   => '[6-61007] Logistik & Transportasi',
+            'ADMIN_FEE'   => '[6-61010] Biaya Admin Kas Aplikasi & Merchant',
+            'OTHER'       => '[6-61009] Beban Operasional Lain-lain',
         ];
+
+        foreach ($legacy as $k => $v) {
+            if (!isset($result[$k])) {
+                $result[$k] = $v;
+            }
+        }
+
+        return $result;
+    }
+
+    public static function coaCategories(?int $businessId = null): array
+    {
+        $businessId = $businessId ?: 1;
+        $accounts = Account::where('business_id', $businessId)
+            ->where('is_active', true)
+            ->where(function ($q) {
+                $q->where('code', 'like', '6-%')
+                  ->orWhere('category', 'OPEX')
+                  ->orWhere('category', 'OTHER_EXPENSE');
+            })
+            ->where('code', 'not like', '5-%')
+            ->whereNull('parent_code')
+            ->orderBy('code', 'asc')
+            ->get(['id', 'code', 'name', 'type', 'category']);
+
+        $list = [];
+        foreach ($accounts as $acc) {
+            $list[] = [
+                'id'       => $acc->id,
+                'code'     => $acc->code,
+                'value'    => $acc->code,
+                'name'     => $acc->name,
+                'label'    => "[{$acc->code}] {$acc->name}",
+                'category' => $acc->category,
+            ];
+        }
+
+        return $list;
     }
 
     public static function paymentMethods(): array
@@ -116,8 +179,17 @@ class OperatingExpense extends Model
 
     public function getCategoryLabelAttribute(): string
     {
-        $cats = self::categories();
-        return $cats[$this->category] ?? ($this->category ?: 'Lain-lain');
+        $cats = self::categories($this->business_id ?? 1);
+        if (isset($cats[$this->category])) {
+            return $cats[$this->category];
+        }
+
+        $acc = Account::where('code', $this->category)->first();
+        if ($acc) {
+            return "[{$acc->code}] {$acc->name}";
+        }
+
+        return $this->category ?: 'Lain-lain';
     }
 
     public function getPaymentMethodLabelAttribute(): string

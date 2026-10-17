@@ -2154,12 +2154,14 @@ class TransactionController extends Controller
                 }
 
                 // Clean up previous SALE_USAGE stock movements
-                if ($isWasted) {
-                    // Delete previous SALE_USAGE so it is replaced cleanly by the WASTE movement above
-                    StockMovement::where('transaction_id', $t->id)->where('type', 'SALE_USAGE')->delete();
-                } else {
-                    // WRONG_INPUT: Revert ingredient stock movements and restore direct retail product stock
-                    StockMovement::where('transaction_id', $t->id)->where('type', 'SALE_USAGE')->delete();
+                // Gunakan Eloquent model delete agar event static::deleted terpanggil dan current_stock di outlet_ingredients terpulihkan!
+                $saleMovements = StockMovement::where('transaction_id', $t->id)->where('type', 'SALE_USAGE')->get();
+                foreach ($saleMovements as $sm) {
+                    $sm->delete();
+                }
+
+                if (!$isWasted) {
+                    // WRONG_INPUT: Revert direct retail product stock
                     if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock && $itemQty > 0) {
                         $menu->increment('stock', $itemQty);
                         if ($outletId) {
@@ -2173,6 +2175,7 @@ class TransactionController extends Controller
 
                 $t->update([
                     'status'              => 'CANCELLED',
+                    'urgent_status'       => 'CANCELLED',
                     'void_type'           => $voidType,
                     'cancellation_reason' => $reason,
                     'cancelled_at'        => $now,
@@ -2187,7 +2190,7 @@ class TransactionController extends Controller
 
                 // Batalkan UrgentNote yang masih PENDING untuk open bill yang dibatalkan (simpan sebagai CANCELLED untuk jejak audit & jurnal)
                 UrgentNote::where('transaction_id', $t->id)
-                    ->where('status', 'PENDING')
+                    ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
                     ->update([
                         'status' => 'CANCELLED',
                         'notes'  => DB::raw("CONCAT(COALESCE(notes, ''), ' [Void " . ($isWasted ? 'Wasted' : 'Salah Input') . ": " . addslashes($reason) . "]')"),
@@ -2344,6 +2347,7 @@ class TransactionController extends Controller
                                 'business_id'    => $businessId,
                                 'ingredient_id'  => $ing->id,
                                 'outlet_id'      => $outletId,
+                                'transaction_id' => $targetTrx->id,
                                 'type'           => 'WASTE',
                                 'waste_reason'   => $wasteCategory,
                                 'qty'            => $neededQty,
@@ -2417,10 +2421,13 @@ class TransactionController extends Controller
 
             if ($voidQty >= (int)$targetTrx->qty) {
                 // Entire row voided: Clean up SALE_USAGE stock movements
-                if ($isWasted) {
-                    StockMovement::where('transaction_id', $targetTrx->id)->where('type', 'SALE_USAGE')->delete();
-                } else {
-                    StockMovement::where('transaction_id', $targetTrx->id)->where('type', 'SALE_USAGE')->delete();
+                // Gunakan Eloquent model delete agar event static::deleted terpanggil dan current_stock di outlet_ingredients terpulihkan!
+                $saleMovements = StockMovement::where('transaction_id', $targetTrx->id)->where('type', 'SALE_USAGE')->get();
+                foreach ($saleMovements as $sm) {
+                    $sm->delete();
+                }
+
+                if (!$isWasted) {
                     if ($menu && $menu->item_type === 'DIRECT' && $menu->track_stock && $voidQty > 0) {
                         $menu->increment('stock', $voidQty);
                         if ($targetTrx->outlet_id) {
@@ -2434,6 +2441,7 @@ class TransactionController extends Controller
 
                 $targetTrx->update([
                     'status'              => 'CANCELLED',
+                    'urgent_status'       => 'CANCELLED',
                     'void_type'           => $voidType,
                     'cancellation_reason' => $reason,
                     'cancelled_at'        => $now,
@@ -2446,7 +2454,7 @@ class TransactionController extends Controller
 
                 // Batalkan UrgentNote yang masih PENDING untuk transaksi yang di-void penuh (simpan sebagai CANCELLED untuk jejak audit & jurnal)
                 UrgentNote::where('transaction_id', $targetTrx->id)
-                    ->where('status', 'PENDING')
+                    ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
                     ->update([
                         'status' => 'CANCELLED',
                         'notes'  => DB::raw("CONCAT(COALESCE(notes, ''), ' [Void " . ($isWasted ? 'Wasted' : 'Salah Input') . ": " . addslashes($reason) . "]')"),

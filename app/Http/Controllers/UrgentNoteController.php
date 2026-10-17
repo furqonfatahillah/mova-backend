@@ -649,8 +649,15 @@ class UrgentNoteController extends Controller
     private function syncMissingUrgentNotesFromTransactions(int $businessId, ?int $outletId = null): void
     {
         try {
+            // Auto-clean: Pastikan UrgentNote milik transaksi yang dibatalkan / di-void tidak berstatus PENDING
+            UrgentNote::whereHas('transaction', function ($tq) {
+                $tq->whereIn('status', ['CANCELLED', 'VOID', 'REFUNDED']);
+            })->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+              ->update(['status' => 'CANCELLED']);
+
             $query = Transaction::with(['menu.recipes.items.ingredient', 'menu.bundleItems'])
                 ->where('business_id', $businessId)
+                ->whereNotIn('status', ['CANCELLED', 'VOID', 'REFUNDED'])
                 ->where(function ($q) {
                     $q->where('is_urgent_note', true)
                       ->orWhere('urgent_status', 'PENDING');
@@ -728,6 +735,7 @@ class UrgentNoteController extends Controller
             // Step 2: Auto-heal recent transactions (last 14 days) where ingredients were consumed into deficit/negative stock, but transaction was not marked as urgent
             $unflaggedTrxs = Transaction::with(['menu.recipes.items.ingredient', 'menu.bundleItems'])
                 ->where('business_id', $businessId)
+                ->whereNotIn('status', ['CANCELLED', 'VOID', 'REFUNDED'])
                 ->where('is_urgent_note', false)
                 ->whereDoesntHave('urgentNotes')
                 ->whereDate('created_at', '>=', now()->subDays(14)->toDateString())

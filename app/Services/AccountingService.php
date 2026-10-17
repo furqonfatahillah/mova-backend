@@ -7,6 +7,7 @@ use App\Models\BatchPrep;
 use App\Models\Business;
 use App\Models\CashTransaction;
 use App\Models\Ingredient;
+use App\Models\IngredientInitialBalance;
 use App\Models\JournalEntry;
 use App\Models\JournalLine;
 use App\Models\Menu;
@@ -2177,6 +2178,9 @@ class AccountingService
         ];
 
         foreach ($businesses as $biz) {
+            // -2. Heal corrupted urgent notes & stock balances before rebuilding journals
+            self::healCorruptedUrgentNotesAndStocks($biz->id);
+
             // -1. Recompute Moving Average & sync cost_before / cost_after / unit_price across all stock movements
             $outlets = \App\Models\Outlet::where('business_id', $biz->id)->get();
             $ingredients = \App\Models\Ingredient::where('business_id', $biz->id)->get();
@@ -2300,5 +2304,103 @@ class AccountingService
 
         $stats['total_journal_entries'] = JournalEntry::count();
         return $stats;
+    }
+
+    /**
+     * Otomatis memperbaiki dan menyinkronkan data histori yang tidak sinkron:
+     * 1. Saldo berjalan (current_stock) di outlet_ingredients diselaraskan dengan mutasi riil kartu stok.
+     * 2. UrgentNote milik transaksi CANCELLED / VOID dinonaktifkan (status = CANCELLED) agar tidak menggantung.
+     * 3. UrgentNote yang tercatat deducted_qty = 0 padahal saat transaksi stok fisik masih ada, diselaraskan nilainya.
+     */
+    public static function healCorruptedUrgentNotesAndStocks(?int $businessId = null): void
+    {
+        $bizQuery = $businessId ? Business::where('id', $businessId) : Business::query();
+        $businesses = $bizQuery->get();
+
+        foreach ($businesses as $biz) {
+            // A. Selaraskan current_stock di outlet_ingredients dengan akumulasi riil mutasi
+            $outlets = Outlet::where('business_id', $biz->id)->get();
+            foreach ($outlets as $outlet) {
+                $outletIngredients = OutletIngredient::where('outlet_id', $outlet->id)->get();
+                foreach ($outletIngredients as $oi) {
+                    $init = IngredientInitialBalance::where('outlet_id', $outlet->id)
+                        ->where('ingredient_id', $oi->ingredient_id)
+                        ->first();
+                    $stokAwal = $init ? (float)$init->stok_awal : 0.0;
+
+                    $movements = StockMovement::where('outlet_id', $outlet->id)
+                        ->where('ingredient_id', $oi->ingredient_id)
+                        ->where('type', '!=', 'INITIAL')
+                        ->get();
+
+                    $netMovement = 0.0;
+                    foreach ($movements as $m) {
+                        $netMovement += $m->signedQty();
+                    }
+
+                    $trueStock = round($stokAwal + $netMovement, 3);
+                    if (abs((float)$oi->current_stock - $trueStock) > 0.0001) {
+                        $oi->update(['current_stock' => $trueStock]);
+                    }
+                }
+            }
+
+            // B. Batalkan UrgentNote milik transaksi yang berstatus CANCELLED, VOID, atau REFUNDED
+            UrgentNote::where('business_id', $biz->id)
+                ->whereHas('transaction', function ($q) {
+                    $q->whereIn('status', ['CANCELLED', 'VOID', 'REFUNDED']);
+                })
+                ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                ->update(['status' => 'CANCELLED']);
+
+            Transaction::where('business_id', $biz->id)
+                ->whereIn('status', ['CANCELLED', 'VOID', 'REFUNDED'])
+                ->where('urgent_status', '!=', 'CANCELLED')
+                ->update(['urgent_status' => 'CANCELLED']);
+
+            // C. Selaraskan deducted_qty dan pending_qty pada UrgentNote yang keliru membaca 0 saat stok sebelum transaksi masih ada
+            $urgentNotes = UrgentNote::where('business_id', $biz->id)->with('transaction')->get();
+            foreach ($urgentNotes as $un) {
+                $t = $un->transaction;
+                if (!$t) continue;
+                $outletId = $un->outlet_id ?: ($t->outlet_id ?: 1);
+                $ingId = $un->ingredient_id;
+                if (!$ingId) continue;
+
+                $init = IngredientInitialBalance::where('outlet_id', $outletId)
+                    ->where('ingredient_id', $ingId)
+                    ->first();
+                $stokAwal = $init ? (float)$init->stok_awal : 0.0;
+
+                $priorMovements = StockMovement::where('outlet_id', $outletId)
+                    ->where('ingredient_id', $ingId)
+                    ->where('type', '!=', 'INITIAL')
+                    ->where(function ($q) use ($t) {
+                        $q->where('created_at', '<', $t->created_at)
+                          ->orWhere(function ($sub) use ($t) {
+                              $sub->where('created_at', '=', $t->created_at)
+                                  ->where('id', '<', $t->id);
+                          });
+                    })
+                    ->get();
+
+                $priorNet = 0.0;
+                foreach ($priorMovements as $pm) {
+                    $priorNet += $pm->signedQty();
+                }
+
+                $availableStockBefore = max(0.0, round($stokAwal + $priorNet, 3));
+                $reqQty = (float)$un->required_qty;
+                $expectedDeducted = min($reqQty, $availableStockBefore);
+                $expectedPending = max(0.0, round($reqQty - $expectedDeducted, 4));
+
+                if (abs((float)$un->deducted_qty - $expectedDeducted) > 0.001 || abs((float)$un->pending_qty - $expectedPending) > 0.001) {
+                    $un->update([
+                        'deducted_qty' => $expectedDeducted,
+                        'pending_qty'  => $expectedPending,
+                    ]);
+                }
+            }
+        }
     }
 }

@@ -411,7 +411,8 @@ class WasteController extends Controller
                 ->delete();
 
             if ($wasteLog->stock_movement_id) {
-                StockMovement::where('id', $wasteLog->stock_movement_id)->delete();
+                $sm = StockMovement::find($wasteLog->stock_movement_id);
+                if ($sm) $sm->delete();
             }
             $wasteLog->delete();
         });

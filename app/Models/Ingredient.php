@@ -682,6 +682,7 @@ class Ingredient extends Model
         $newHargaBeli = round($runningCostPerPakai * $konversi, 2);
 
         if ($outletRow) {
+            $outletRow->current_stock = round($runningStock, 3);
             $outletRow->harga = $newHargaBeli;
             $outletRow->last_purchase_price = $lastPurchasePrice;
             $outletRow->save();

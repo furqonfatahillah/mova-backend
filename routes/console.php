@@ -230,3 +230,12 @@ Artisan::command('stock:fix-adjustment-deficit-price {business_id?}', function (
     $this->info('All done! Moving averages recomputed with corrected deficit prices.');
 })->purpose('Fix ADJUSTMENT_IN movements recorded during stock deficit that used wrong (post-purchase) avg price instead of locked deficit avg, then recompute all moving averages');
 
+Artisan::command('stock:heal-void-urgent-journals {--business_id=}', function () {
+    $bizId = $this->option('business_id');
+    $this->info('Memulai pemulihan dan penyelarasan data stok, nota urgent, dan jurnal...');
+    \App\Services\AccountingService::healCorruptedUrgentNotesAndStocks($bizId ? (int)$bizId : null);
+    $stats = \App\Services\AccountingService::syncAllHistoricalData($bizId ? (int)$bizId : null);
+    $this->info("Pemulihan selesai! Total jurnal tersinkronisasi: " . ($stats['total_journal_entries'] ?? 0));
+})->purpose('Heal corrupted urgent notes, negative stock desyncs, and reconcile all journals');
+
+

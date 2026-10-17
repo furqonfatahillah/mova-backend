@@ -2515,7 +2515,16 @@ class TransactionController extends Controller
                 $cancelledTrx->void_approved_by = $approver->id;
                 $cancelledTrx->void_approved_at = $now;
                 $cancelledTrx->notes = "Void Sebagian Open Bill ({$voidQty}x dari {$targetTrx->qty}x) [{$typeLabel}]: {$reason}";
-                $cancelledTrx->save();
+            }
+
+            if ($cancelledTrx) {
+                StockMovement::where('note', 'like', "%#{$orderNumber}%")
+                    ->where('type', 'WASTE')
+                    ->where(function($q) use ($targetTrx) {
+                        $q->whereNull('transaction_id')->orWhere('transaction_id', $targetTrx->id);
+                    })
+                    ->where('created_at', '>=', $now->copy()->subSeconds(60))
+                    ->update(['transaction_id' => $cancelledTrx->id]);
             }
         });
 

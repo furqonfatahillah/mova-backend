@@ -2486,6 +2486,23 @@ class AccountingService
                     ]);
                 }
             }
+
+            // D. Selaraskan transaction_id pada StockMovement WASTE / SALE_USAGE yang masih NULL (misal dari void open bill historis)
+            $orphanMovements = StockMovement::where('business_id', $biz->id)
+                ->whereNull('transaction_id')
+                ->whereIn('type', ['SALE_USAGE', 'WASTE'])
+                ->get();
+            foreach ($orphanMovements as $om) {
+                if (preg_match('/#(TRX-\d+-\d+)/', $om->note ?? '', $m)) {
+                    $orderNum = $m[1];
+                    $matchedTx = Transaction::where('order_number', $orderNum)
+                        ->whereIn('status', ['CANCELLED', 'VOID'])
+                        ->first();
+                    if ($matchedTx) {
+                        $om->update(['transaction_id' => $matchedTx->id]);
+                    }
+                }
+            }
         }
     }
 }

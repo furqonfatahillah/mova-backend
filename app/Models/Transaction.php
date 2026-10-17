@@ -157,10 +157,16 @@ class Transaction extends Model
         if (!empty($this->is_open_bill)) {
             return true;
         }
+        if (!empty($this->parent_order_number)) {
+            return true;
+        }
         if (in_array($this->status, ['HOLD', 'SPLIT_CLOSED'])) {
             return true;
         }
         if (str_contains(strtolower($this->notes ?? ''), 'open bill')) {
+            return true;
+        }
+        if (!empty($this->order_number) && self::where('order_number', $this->order_number)->where('is_open_bill', true)->exists()) {
             return true;
         }
         $je = JournalEntry::where('reference_type', 'TRANSACTION')

@@ -146,4 +146,25 @@ class Transfer extends Model
         }
         return $this->destination_name ?: 'Lokasi Tujuan';
     }
+
+    /**
+     * Override save to ensure runtime-only virtual attributes never leak into SQL updates.
+     */
+    public function save(array $options = [])
+    {
+        $hasNeg = $this->attributes['has_negative_stock'] ?? null;
+        $negItems = $this->attributes['negative_items'] ?? null;
+        unset($this->attributes['has_negative_stock'], $this->attributes['negative_items']);
+
+        $saved = parent::save($options);
+
+        if ($hasNeg !== null) {
+            $this->attributes['has_negative_stock'] = $hasNeg;
+        }
+        if ($negItems !== null) {
+            $this->attributes['negative_items'] = $negItems;
+        }
+
+        return $saved;
+    }
 }

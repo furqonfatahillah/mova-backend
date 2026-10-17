@@ -33,10 +33,19 @@ class PaymentConfigurationController extends Controller
         }
 
         if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
-            $query->where(function ($q) use ($request) {
-                $q->where('outlet_id', $request->outlet_id)
-                  ->orWhereNull('outlet_id');
-            });
+            if ($request->outlet_id === 'GLOBAL' || $request->outlet_id === 'global') {
+                $query->whereNull('outlet_id');
+            } elseif ($request->boolean('exact_outlet')) {
+                $query->where('outlet_id', $request->outlet_id);
+            } else {
+                // POS & General query mode: Return outlet-specific QRIS + global QRIS
+                $query->where(function ($q) use ($request) {
+                    $q->where('outlet_id', $request->outlet_id)
+                      ->orWhereNull('outlet_id');
+                });
+                // Prioritize this outlet's specific QRIS first, then global
+                $query->orderByRaw('CASE WHEN outlet_id = ? THEN 0 ELSE 1 END', [$request->outlet_id]);
+            }
         }
 
         if ($request->filled('account_type') && in_array(strtoupper($request->account_type), ['BANK', 'EWALLET'])) {
@@ -62,7 +71,7 @@ class PaymentConfigurationController extends Controller
             'account_number'      => 'nullable|string|max:50',
             'account_holder'      => 'nullable|string|max:255',
             'branch'              => 'nullable|string|max:255',
-            'outlet_id'           => 'nullable|exists:outlets,id',
+            'outlet_id'           => 'nullable',
             'qr_image_url'        => 'nullable|string',
             'qr_image'            => 'nullable|image|mimes:jpeg,png,jpg,webp,gif|max:5120',
             'is_primary'          => 'nullable|boolean',
@@ -79,6 +88,27 @@ class PaymentConfigurationController extends Controller
         $targetBusinessId = ($isPlatformAdmin && !empty($validated['business_id']))
             ? $validated['business_id']
             : $user->business_id;
+
+        // Normalize outlet_id input ('', 'null', 'GLOBAL', 'ALL' => null)
+        $rawOutletId = $request->input('outlet_id');
+        if ($rawOutletId === '' || $rawOutletId === 'null' || $rawOutletId === 'GLOBAL' || $rawOutletId === 'ALL') {
+            $validated['outlet_id'] = null;
+        } else {
+            $validated['outlet_id'] = $rawOutletId ? (int)$rawOutletId : null;
+        }
+
+        // Validate outlet belongs to business
+        if ($validated['outlet_id']) {
+            $outlet = \App\Models\Outlet::where('business_id', $targetBusinessId)
+                ->where('id', $validated['outlet_id'])
+                ->first();
+            if (!$outlet) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Cabang outlet yang dipilih tidak valid atau tidak terdaftar pada bisnis ini.',
+                ], 422);
+            }
+        }
 
         if ($request->hasFile('qr_image')) {
             $file = $request->file('qr_image');
@@ -105,13 +135,24 @@ class PaymentConfigurationController extends Controller
         $validated['payout_schedule']     = $validated['payout_schedule'] ?? 'DAILY';
         $validated['created_by']          = $user->id;
 
-        // If this is set as primary, unset other accounts in the same business & account_type
+        // If this is set as primary, unset other accounts in the same business WITH THE SAME SCOPE
         if (!empty($validated['is_primary'])) {
-            BankAccount::where('business_id', $targetBusinessId)->update(['is_primary' => false]);
+            $primaryScopeQuery = BankAccount::where('business_id', $targetBusinessId);
+            if ($validated['outlet_id']) {
+                $primaryScopeQuery->where('outlet_id', $validated['outlet_id']);
+            } else {
+                $primaryScopeQuery->whereNull('outlet_id');
+            }
+            $primaryScopeQuery->update(['is_primary' => false]);
         } else {
-            // If it's the very first account, make it primary automatically
-            $existingCount = BankAccount::where('business_id', $targetBusinessId)->count();
-            if ($existingCount === 0) {
+            // If it's the very first account for this scope, make it primary automatically
+            $scopeCountQuery = BankAccount::where('business_id', $targetBusinessId);
+            if ($validated['outlet_id']) {
+                $scopeCountQuery->where('outlet_id', $validated['outlet_id']);
+            } else {
+                $scopeCountQuery->whereNull('outlet_id');
+            }
+            if ($scopeCountQuery->count() === 0) {
                 $validated['is_primary'] = true;
             }
         }
@@ -119,9 +160,10 @@ class PaymentConfigurationController extends Controller
         $account = BankAccount::create($validated);
         $account->load(['outlet', 'business']);
 
+        $scopeMsg = $account->outlet ? "Outlet {$account->outlet->name}" : 'Semua Cabang (Global)';
         return response()->json([
             'status'  => 'success',
-            'message' => ($account->account_type === 'EWALLET' ? 'E-Wallet' : 'QRIS Toko') . ' berhasil didaftarkan',
+            'message' => ($account->account_type === 'EWALLET' ? 'E-Wallet' : "QRIS Toko ({$scopeMsg})") . ' berhasil didaftarkan',
             'data'    => $account,
         ], 201);
     }
@@ -144,7 +186,7 @@ class PaymentConfigurationController extends Controller
             'account_number'      => 'nullable|string|max:50',
             'account_holder'      => 'nullable|string|max:255',
             'branch'              => 'nullable|string|max:255',
-            'outlet_id'           => 'nullable|exists:outlets,id',
+            'outlet_id'           => 'nullable',
             'qr_image_url'        => 'nullable|string',
             'qr_image'            => 'nullable|image|mimes:jpeg,png,jpg,webp,gif|max:5120',
             'is_primary'          => 'nullable|boolean',
@@ -153,6 +195,27 @@ class PaymentConfigurationController extends Controller
             'payout_schedule'     => 'nullable|string|in:INSTANT,DAILY,MANUAL',
             'notes'               => 'nullable|string|max:500',
         ]);
+
+        if ($request->has('outlet_id')) {
+            $rawOutletId = $request->input('outlet_id');
+            if ($rawOutletId === '' || $rawOutletId === 'null' || $rawOutletId === 'GLOBAL' || $rawOutletId === 'ALL') {
+                $validated['outlet_id'] = null;
+            } else {
+                $validated['outlet_id'] = $rawOutletId ? (int)$rawOutletId : null;
+            }
+
+            if ($validated['outlet_id']) {
+                $outlet = \App\Models\Outlet::where('business_id', $account->business_id)
+                    ->where('id', $validated['outlet_id'])
+                    ->first();
+                if (!$outlet) {
+                    return response()->json([
+                        'status' => 'error',
+                        'message' => 'Cabang outlet yang dipilih tidak valid atau tidak terdaftar pada bisnis ini.',
+                    ], 422);
+                }
+            }
+        }
 
         if ($request->hasFile('qr_image')) {
             $file = $request->file('qr_image');
@@ -175,8 +238,17 @@ class PaymentConfigurationController extends Controller
 
         $validated['updated_by'] = $user->id;
 
-        if (!empty($validated['is_primary']) && !$account->is_primary) {
-            BankAccount::where('business_id', $account->business_id)->update(['is_primary' => false]);
+        $targetOutletId = array_key_exists('outlet_id', $validated) ? $validated['outlet_id'] : $account->outlet_id;
+        $willBePrimary = array_key_exists('is_primary', $validated) ? (bool)$validated['is_primary'] : $account->is_primary;
+
+        if ($willBePrimary && (!$account->is_primary || $account->outlet_id !== $targetOutletId)) {
+            $scopeQuery = BankAccount::where('business_id', $account->business_id)->where('id', '!=', $account->id);
+            if ($targetOutletId) {
+                $scopeQuery->where('outlet_id', $targetOutletId);
+            } else {
+                $scopeQuery->whereNull('outlet_id');
+            }
+            $scopeQuery->update(['is_primary' => false]);
         }
 
         $account->update($validated);
@@ -184,7 +256,7 @@ class PaymentConfigurationController extends Controller
 
         return response()->json([
             'status'  => 'success',
-            'message' => 'Data rekening / e-wallet berhasil diperbarui',
+            'message' => 'Data QRIS / rekening berhasil diperbarui',
             'data'    => $account,
         ]);
     }
@@ -193,31 +265,55 @@ class PaymentConfigurationController extends Controller
     {
         $businessId = $request->user()->business_id;
         $account = BankAccount::where('business_id', $businessId)->findOrFail($id);
+        $wasPrimary = $account->is_primary;
+        $scopeOutletId = $account->outlet_id;
+
         $account->delete();
 
-        // If the deleted account was primary, set another account as primary
-        $next = BankAccount::where('business_id', $businessId)->first();
-        if ($next && $account->is_primary) {
-            $next->update(['is_primary' => true]);
+        // If the deleted account was primary, set another account in the same scope as primary
+        if ($wasPrimary) {
+            $nextQuery = BankAccount::where('business_id', $businessId);
+            if ($scopeOutletId) {
+                $nextQuery->where('outlet_id', $scopeOutletId);
+            } else {
+                $nextQuery->whereNull('outlet_id');
+            }
+            $next = $nextQuery->first();
+            if ($next) {
+                $next->update(['is_primary' => true]);
+            }
         }
 
         return response()->json([
             'status'  => 'success',
-            'message' => 'Nomor rekening berhasil dihapus',
+            'message' => 'Stiker QRIS berhasil dihapus',
         ]);
     }
 
     public function setPrimaryBankAccount(Request $request, $id)
     {
         $businessId = $request->user()->business_id;
-        BankAccount::where('business_id', $businessId)->update(['is_primary' => false]);
-
         $account = BankAccount::where('business_id', $businessId)->findOrFail($id);
-        $account->update(['is_primary' => true, 'is_active' => true]);
 
+        if ($account->outlet_id) {
+            BankAccount::where('business_id', $businessId)
+                ->where('outlet_id', $account->outlet_id)
+                ->where('id', '!=', $account->id)
+                ->update(['is_primary' => false]);
+        } else {
+            BankAccount::where('business_id', $businessId)
+                ->whereNull('outlet_id')
+                ->where('id', '!=', $account->id)
+                ->update(['is_primary' => false]);
+        }
+
+        $account->update(['is_primary' => true, 'is_active' => true]);
+        $account->load(['outlet', 'business']);
+
+        $targetName = $account->outlet ? "Outlet {$account->outlet->name}" : "Semua Cabang (Global)";
         return response()->json([
             'status'  => 'success',
-            'message' => "Rekening {$account->bank_name} - {$account->account_number} dijadikan sebagai rekening utama",
+            'message' => "QRIS {$account->bank_name} disetel sebagai QRIS Utama untuk {$targetName}",
             'data'    => $account,
         ]);
     }
@@ -230,7 +326,7 @@ class PaymentConfigurationController extends Controller
 
         return response()->json([
             'status'  => 'success',
-            'message' => 'Status aktif rekening berhasil diubah',
+            'message' => 'Status aktif QRIS berhasil diubah',
             'data'    => $account,
         ]);
     }

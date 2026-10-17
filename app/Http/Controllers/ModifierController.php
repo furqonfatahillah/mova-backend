@@ -67,6 +67,24 @@ class ModifierController extends Controller
         $user = $request->user();
         $businessId = $user ? $user->business_id : null;
 
+        // Validasi: Bahan/perlengkapan tidak boleh dipilih jika belum memiliki Saldo Awal
+        $optIngIds = array_filter(array_column($data['options'], 'ingredient_id'));
+        if (!empty($optIngIds)) {
+            $checkIngs = \App\Models\Ingredient::with(['outletIngredients', 'prepRecipe'])->whereIn('id', $optIngIds)->get()->keyBy('id');
+            foreach ($data['options'] as $opt) {
+                if (empty($opt['ingredient_id'])) continue;
+                $ing = $checkIngs->get($opt['ingredient_id']);
+                if ($ing && !$ing->hasInitialBalance()) {
+                    return response()->json([
+                        'message' => "Bahan/perlengkapan '{$ing->name}' ({$ing->code}) pada pilihan varian '{$opt['name']}' belum memiliki Saldo Awal. Silakan masukkan Saldo Awal terlebih dahulu di Master Bahan atau Kartu Stok.",
+                        'errors'  => [
+                            'options' => ["Bahan/perlengkapan '{$ing->name}' ({$ing->code}) belum memiliki Saldo Awal."]
+                        ],
+                    ], 422);
+                }
+            }
+        }
+
         return DB::transaction(function () use ($data, $request, $businessId) {
             $group = ModifierGroup::create([
                 'business_id'    => $businessId,
@@ -129,6 +147,26 @@ class ModifierController extends Controller
             'options.*.unit'          => 'nullable|string|max:20',
             'options.*.sort_order'    => 'nullable|integer',
         ]);
+
+        // Validasi: Bahan/perlengkapan tidak boleh dipilih jika belum memiliki Saldo Awal
+        if (isset($data['options'])) {
+            $optIngIds = array_filter(array_column($data['options'], 'ingredient_id'));
+            if (!empty($optIngIds)) {
+                $checkIngs = \App\Models\Ingredient::with(['outletIngredients', 'prepRecipe'])->whereIn('id', $optIngIds)->get()->keyBy('id');
+                foreach ($data['options'] as $opt) {
+                    if (empty($opt['ingredient_id'])) continue;
+                    $ing = $checkIngs->get($opt['ingredient_id']);
+                    if ($ing && !$ing->hasInitialBalance()) {
+                        return response()->json([
+                            'message' => "Bahan/perlengkapan '{$ing->name}' ({$ing->code}) pada pilihan varian '{$opt['name']}' belum memiliki Saldo Awal. Silakan masukkan Saldo Awal terlebih dahulu di Master Bahan atau Kartu Stok.",
+                            'errors'  => [
+                                'options' => ["Bahan/perlengkapan '{$ing->name}' ({$ing->code}) belum memiliki Saldo Awal."]
+                            ],
+                        ], 422);
+                    }
+                }
+            }
+        }
 
         return DB::transaction(function () use ($data, $request, $modifierGroup) {
             $modifierGroup->update([

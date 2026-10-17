@@ -6,6 +6,7 @@ use App\Models\WasteLog;
 use App\Models\Ingredient;
 use App\Models\Menu;
 use App\Models\OutletMenu;
+use App\Models\Outlet;
 use App\Models\StockMovement;
 use App\Models\JournalEntry;
 use App\Services\AccountingService;
@@ -210,7 +211,7 @@ class WasteController extends Controller
         $reasonLabel = $categories[$data['reason_category']] ?? $data['reason_category'];
 
         $wasteLog = DB::transaction(function () use (
-            $data, $itemType, $outletId, $wasteNo, $reasonLabel, $request
+            $data, $itemType, $outletId, $wasteNo, $reasonLabel, $request, $businessId
         ) {
             $movementId = null;
             $qtyPakai = (float)$data['qty'];

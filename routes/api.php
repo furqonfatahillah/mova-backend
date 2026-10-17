@@ -69,6 +69,8 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
 
     // SaaS Tenants & Business Management
     Route::apiResource('businesses', BusinessController::class);
+    Route::post('/businesses/{business}/verify', [BusinessController::class, 'verify']);
+    Route::post('/businesses/{business}/reject', [BusinessController::class, 'reject']);
     Route::get('/my-business',       [BusinessController::class, 'myBusiness']);
     Route::get('/my-business/coins', [BusinessController::class, 'myCoins']);
     Route::put('/my-business',       [BusinessController::class, 'updateMyBusiness']);
@@ -123,6 +125,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/receivables/bulk-import',    [ReceivableController::class, 'bulkImport']);
     Route::post('/outlets/bulk-import',        [OutletController::class, 'bulkImport']);
     Route::apiResource('ingredients', IngredientController::class);
+    Route::post('/ingredients/{ingredient}/outlet-balances', [IngredientController::class, 'updateOutletBalances']);
     Route::patch('/menus/{menu}/toggle-active', [MenuController::class, 'toggleActive']);
     Route::apiResource('menus', MenuController::class);
     Route::post('/menus/{menu}/recipes',                           [MenuController::class, 'storeRecipe']);
@@ -280,6 +283,10 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/reports/balance-sheet/detail', [BalanceSheetController::class, 'detail']);
     Route::post('/reports/balance-sheet/sync',   [BalanceSheetController::class, 'syncJournals']);
     Route::post('/accounting/sync-journals',    [BalanceSheetController::class, 'syncJournals']);
+    Route::get('/accounting/journals',          [JournalController::class, 'journals']);
+    Route::get('/accounting/abnormal-journals', [JournalController::class, 'abnormalJournals']);
+    Route::post('/accounting/abnormal-journals/{id}/recalculate', [JournalController::class, 'recalculateEntry']);
+    Route::delete('/accounting/abnormal-journals/{id}', [JournalController::class, 'destroyEntry']);
     Route::get('/accounting/ledger',            [JournalController::class, 'index']);
     Route::get('/accounting/ledger/{code}',      [JournalController::class, 'accountTransactions']);
     Route::get('/accounting/journal-entries/{id}', [JournalController::class, 'journalDetail']);

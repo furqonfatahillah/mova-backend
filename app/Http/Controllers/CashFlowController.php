@@ -794,11 +794,11 @@ class CashFlowController extends Controller
                 'net_change'      => round($totalDebitAll - $totalCreditAll, 2),
                 'ending_balance'  => round($totalEndingAll, 2),
             ],
-            'inflow_items'                 => $detailedInflows,
-            'outflow_items'                => $detailedOutflows,
+            'inflow_items'                 => array_values(array_reverse($detailedInflows)),
+            'outflow_items'                => array_values(array_reverse($detailedOutflows)),
             'total_inflows'                => round($totalOperatingInflows + $investingInflows + $financingInflows, 2),
             'total_outflows'               => round($totalOperatingOutflows + $investingOutflows + $financingOutflows, 2),
-            'journal_lines'                => $journalLinesAuditTrail,
+            'journal_lines'                => array_values($journalLinesAuditTrail),
             'source'                       => 'GENERAL_LEDGER_JOURNALS',
             'available_shifts'             => $availableShifts,
             'summary' => [
@@ -1028,9 +1028,18 @@ class CashFlowController extends Controller
         $transactionNo = CashTransaction::generateTransactionNo($businessId, $data['date']);
         $outletId = $isOutletBounded ? (int)$user->outlet_id : ($data['outlet_id'] ?? null);
 
+        $shiftId = $request->input('shift_id');
+        if (!$shiftId && $outletId) {
+            $shiftId = \App\Models\Shift::where('status', 'OPEN')
+                ->where('outlet_id', $outletId)
+                ->orderByDesc('opened_at')
+                ->value('id');
+        }
+
         $trx = CashTransaction::create([
             'business_id'    => $businessId,
             'outlet_id'      => $outletId,
+            'shift_id'       => $shiftId,
             'transaction_no' => $transactionNo,
             'date'           => $data['date'],
             'type'           => $data['type'],

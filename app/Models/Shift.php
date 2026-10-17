@@ -18,6 +18,7 @@ class Shift extends Model
         'outlet_id',
         'shift_schedule_id',
         'shift_name',
+        'client_shift_id',
         'user_id',
         'opened_at',
         'closed_at',
@@ -294,5 +295,19 @@ class Shift extends Model
         }
 
         return array_values($usageByIngredient);
+    }
+
+    public function calculateTotalSales(): float
+    {
+        return (float)$this->transactions()
+            ->where(function ($q) {
+                $q->where(function ($sub) {
+                    $sub->where('status', 'PAID')
+                        ->where(function ($inner) {
+                            $inner->whereNull('split_type')->orWhere('split_type', '!=', 'EQUAL');
+                        });
+                })->orWhere('status', 'SPLIT_CLOSED');
+            })
+            ->sum('total_price');
     }
 }

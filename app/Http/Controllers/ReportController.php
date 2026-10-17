@@ -18,6 +18,7 @@ use App\Models\CashTransaction;
 use App\Models\Account;
 use App\Models\JournalEntry;
 use App\Models\JournalLine;
+use App\Models\UrgentNote;
 use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -117,7 +118,36 @@ class ReportController extends Controller
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
 
-        return response()->json($this->buildVarianceArray($p['from'], $p['to'], $outletId));
+        $data = $this->buildVarianceArray($p['from'], $p['to'], $outletId);
+
+        // Jika user adalah role pegawai / staff biasa (bukan owner / manager),
+        // lakukan masking angka teoritis dan selisih untuk menjaga integritas blind stock opname.
+        if ($user && !$user->isOwnerOrManager()) {
+            $data = array_map(function ($row) {
+                return [
+                    'ingredient'          => $row['ingredient'],
+                    'cost_per_unit'       => 0,
+                    'stok_awal_periode'   => 0,
+                    'pembelian'           => 0,
+                    'pemakaian_teoritis'  => 0,
+                    'prep_usage'          => 0,
+                    'prep_output'         => 0,
+                    'waste'               => 0,
+                    'waste_value'         => 0,
+                    'transfer_in'         => 0,
+                    'transfer_out'        => 0,
+                    'adjustment'          => 0,
+                    'stok_akhir_teoritis' => 0,
+                    'nilai_teoritis'      => 0,
+                    'variance_qty'        => null,
+                    'variance_pct'        => null,
+                    'variance_value'      => null,
+                    'status'              => null,
+                ];
+            }, $data);
+        }
+
+        return response()->json($data);
     }
 
     /**
@@ -899,25 +929,29 @@ class ReportController extends Controller
         // =========================================================================
         // 3. COGS / HARGA POKOK PENJUALAN (Akun 5-xxxxx)
         // =========================================================================
-        $cogsBahan     = max(0.0, $getAccountBalance('5-51001', 'DEBIT'));
-        $cogsKemasan   = max(0.0, $getAccountBalance('5-51002', 'DEBIT'));
-        $cogsWasteLoss = max(0.0, $getAccountBalance('5-51003', 'DEBIT')) + max(0.0, $getAccountBalance('5-51006', 'DEBIT'));
-        $opnameBahan   = max(0.0, $getAccountBalance('5-51004', 'DEBIT'));
-        $opnameKemasan = max(0.0, $getAccountBalance('5-51005', 'DEBIT'));
+        $cogsBahan          = max(0.0, $getAccountBalance('5-51001', 'DEBIT'));
+        $cogsKemasan        = max(0.0, $getAccountBalance('5-51002', 'DEBIT'));
+        $cogsTeoritisBahan  = max(0.0, $getAccountBalance('5-51007', 'DEBIT'));
+        $cogsTeoritisPlk    = max(0.0, $getAccountBalance('5-51008', 'DEBIT'));
+        $cogsTeoritis       = round($cogsTeoritisBahan + $cogsTeoritisPlk, 2);
+        $cogsWasteLoss      = max(0.0, $getAccountBalance('5-51003', 'DEBIT')) + max(0.0, $getAccountBalance('5-51006', 'DEBIT'));
+        $opnameBahan        = max(0.0, $getAccountBalance('5-51004', 'DEBIT'));
+        $opnameKemasan      = max(0.0, $getAccountBalance('5-51005', 'DEBIT'));
 
         $extraCogs = 0.0;
         foreach ($allAccounts->where('category', 'COGS') as $acc) {
             if ($acc->parent_code !== null) continue;
-            if (!in_array($acc->code, ['5-51001', '5-51002', '5-51003', '5-51004', '5-51005', '5-51006'])) {
+            if (!in_array($acc->code, ['5-51001', '5-51002', '5-51003', '5-51004', '5-51005', '5-51006', '5-51007', '5-51008'])) {
                 $extraCogs += max(0.0, $getAccountBalance($acc->code, 'DEBIT'));
             }
         }
 
-        $cogsRecipes = round($cogsBahan + $cogsKemasan + $extraCogs, 2);
-        $cogsVariance = round($opnameBahan + $opnameKemasan, 2);
-        $totalWasteLoss = round($cogsWasteLoss, 2);
-        $totalCogs = round($cogsRecipes + $totalWasteLoss + $cogsVariance, 2);
-        $cogsRatioPct = $netSales > 0 ? round(($totalCogs / $netSales) * 100, 1) : 0;
+        $cogsPureRecipes = round($cogsBahan + $cogsKemasan + $extraCogs, 2);
+        $cogsRecipes     = round($cogsPureRecipes + $cogsTeoritis, 2);
+        $cogsVariance    = round($opnameBahan + $opnameKemasan, 2);
+        $totalWasteLoss  = round($cogsWasteLoss, 2);
+        $totalCogs       = round($cogsRecipes + $totalWasteLoss + $cogsVariance, 2);
+        $cogsRatioPct    = $netSales > 0 ? round(($totalCogs / $netSales) * 100, 1) : 0;
 
         $grossProfit = round($netSales - $totalCogs, 2);
         $grossMarginPct = $netSales > 0 ? round(($grossProfit / $netSales) * 100, 1) : 0;
@@ -938,6 +972,7 @@ class ReportController extends Controller
             '6-61007' => ['category' => 'LOGISTICS',     'label' => 'Logistik & Transportasi'],
             '6-61008' => ['category' => 'CASH_SHORTAGE', 'label' => 'Biaya Lain-lain / Selisih Kurang Kasir'],
             '6-61009' => ['category' => 'OTHER',         'label' => 'Beban Operasional Lainnya'],
+            '6-61010' => ['category' => 'ADMIN_FEE',     'label' => 'Biaya Admin Kas Aplikasi'],
         ];
 
         $opexBreakdown = [];
@@ -1103,28 +1138,94 @@ class ReportController extends Controller
             }
         }
 
-        // Top ingredients usage breakdown
+        // Top ingredients usage breakdown (with separated Stok Normal vs Stok Minus / 5-51007)
         $topIngredientsUsage = [];
         $varianceData = $this->buildVarianceArray($from, $to, $outletId);
+        $minusBreakdown = $this->getIngredientMinusBreakdown($from, $to, $outletId, $businessId, $cogsTeoritis);
+
+        // Ambil HPP riil historis dari StockMovement (SALE_USAGE) agar rincian bahan sinkron persis dengan Jurnal HPP POS
+        $actualUsageCosts = StockMovement::whereBetween('date', [$from, $to])
+            ->when($outletId && $outletId !== 'ALL' && $outletId !== 'all', fn($q) => $q->where('outlet_id', $outletId))
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->where('type', 'SALE_USAGE')
+            ->select('ingredient_id', DB::raw('SUM(qty) as total_qty'), DB::raw('SUM(total_price) as total_cost'))
+            ->groupBy('ingredient_id')
+            ->get()
+            ->keyBy('ingredient_id');
+
         foreach ($varianceData as $row) {
             $ing = $row['ingredient'];
             $targetOutletId = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
-            $hargaPerPakai = $ing->costPerPakaiForOutlet($targetOutletId);
-            $rowRecipeCost = (float)$row['pemakaian_teoritis'] * $hargaPerPakai;
-            if ($rowRecipeCost > 0 || (float)$row['pemakaian_teoritis'] > 0) {
+            $hargaPerPakai = (float)$ing->costPerPakaiForOutlet($targetOutletId);
+            $totalQty = (float)$row['pemakaian_teoritis'];
+            
+            // Prioritaskan nilai HPP riil dari mutasi SALE_USAGE transaksi penjualan jika tersedia
+            $actUsage = $actualUsageCosts->get($ing->id);
+            if ($actUsage && (float)$actUsage->total_cost > 0) {
+                $rowRecipeCost = (float)$actUsage->total_cost;
+                if ($totalQty <= 0 && (float)$actUsage->total_qty > 0) {
+                    $totalQty = (float)$actUsage->total_qty;
+                }
+            } else {
+                $rowRecipeCost = $totalQty * $hargaPerPakai;
+            }
+
+            if ($rowRecipeCost > 0 || $totalQty > 0) {
+                $ingMinus = $minusBreakdown[$ing->id] ?? null;
+                $costMinus = $ingMinus ? min($rowRecipeCost, (float)$ingMinus['cost_minus']) : 0.0;
+                $qtyMinus = $ingMinus ? min($totalQty, (float)$ingMinus['qty_minus']) : 0.0;
+                if ($costMinus <= 0 && $qtyMinus > 0 && $hargaPerPakai > 0) {
+                    $costMinus = min($rowRecipeCost, round($qtyMinus * $hargaPerPakai, 2));
+                } elseif ($costMinus > 0 && $qtyMinus <= 0 && $hargaPerPakai > 0) {
+                    $qtyMinus = min($totalQty, round($costMinus / $hargaPerPakai, 3));
+                }
+
+                $costNormal = max(0.0, round($rowRecipeCost - $costMinus, 2));
+                $qtyNormal = max(0.0, round($totalQty - $qtyMinus, 3));
+
                 $topIngredientsUsage[] = [
                     'ingredient_id'   => $ing->id,
                     'name'            => $ing->name,
                     'ingredient_name' => $ing->name,
                     'unit'            => $ing->unit_pakai ?: 'Pcs',
-                    'qty'             => (float)$row['pemakaian_teoritis'],
-                    'cost'            => round($rowRecipeCost, 0),
-                    'total_hpp'       => round($rowRecipeCost, 0),
+                    'qty'             => $totalQty,
+                    'qty_normal'      => $qtyNormal,
+                    'qty_minus'       => $qtyMinus,
+                    'cost'            => round($rowRecipeCost, 2),
+                    'total_hpp'       => round($rowRecipeCost, 2),
+                    'cost_normal'     => $costNormal,
+                    'cost_minus'      => round($costMinus, 2),
+                    'has_minus'       => ($costMinus > 0.001 || $qtyMinus > 0.001),
                 ];
             }
         }
+
+        // Include any ingredient with minus stock that wasn't in varianceData
+        $processedIngIds = array_column($topIngredientsUsage, 'ingredient_id');
+        foreach ($minusBreakdown as $mIngId => $mInfo) {
+            if (!in_array($mIngId, $processedIngIds) && ($mInfo['cost_minus'] > 0 || $mInfo['qty_minus'] > 0)) {
+                $extraIng = Ingredient::find($mIngId);
+                if ($extraIng) {
+                    $topIngredientsUsage[] = [
+                        'ingredient_id'   => $extraIng->id,
+                        'name'            => $extraIng->name,
+                        'ingredient_name' => $extraIng->name,
+                        'unit'            => $extraIng->unit_pakai ?: 'Pcs',
+                        'qty'             => $mInfo['qty_minus'],
+                        'qty_normal'      => 0.0,
+                        'qty_minus'       => $mInfo['qty_minus'],
+                        'cost'            => round($mInfo['cost_minus'], 2),
+                        'total_hpp'       => round($mInfo['cost_minus'], 2),
+                        'cost_normal'     => 0.0,
+                        'cost_minus'      => round($mInfo['cost_minus'], 2),
+                        'has_minus'       => true,
+                    ];
+                }
+            }
+        }
+
         usort($topIngredientsUsage, fn($a, $b) => ($b['total_hpp'] ?? 0) <=> ($a['total_hpp'] ?? 0));
-        $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 15);
+        $topIngredientsUsage = array_slice($topIngredientsUsage, 0, 20);
 
         // Waste Breakdown
         $wasteLogs = WasteLog::whereBetween('date', [$from, $to])->when($outletId, fn($q) => $q->where('outlet_id', $outletId))->get();
@@ -1201,7 +1302,7 @@ class ReportController extends Controller
         $waterfall = array_merge($waterfall, [
             [
                 'step'        => 'cogs_recipes',
-                'name'        => 'HPP Bahan & Kemasan Terjual (5-51001 & 5-51002)',
+                'name'        => 'HPP Bahan & Kemasan Terjual (5-51001, 5-51002, 5-51007 & 5-51008)',
                 'amount'      => -round($cogsRecipes, 2),
                 'type'        => 'subtraction',
                 'pct_of_net'  => $netSales > 0 ? round(($cogsRecipes / $netSales) * 100, 1) : 0,
@@ -1243,6 +1344,95 @@ class ReportController extends Controller
             ],
         ]);
 
+        // =========================================================================
+        // 5. STRUCTURED COA STATEMENT (GROUP BY COA 4, 5, 6)
+        // =========================================================================
+        $buildCoaGroup = function (string $groupPrefix, string $groupName, string $defaultNormal) use ($allAccounts, $balances, $netSales) {
+            $accountsList = [];
+            $groupTotal = 0.0;
+
+            $groupAccounts = $allAccounts->filter(function ($a) use ($groupPrefix) {
+                return str_starts_with($a->code, $groupPrefix . '-') && $a->parent_code === null;
+            })->sortBy('code');
+
+            foreach ($groupAccounts as $acc) {
+                $normal = $acc->normal_balance ?: $defaultNormal;
+                $totalDeb = 0.0;
+                $totalCrd = 0.0;
+                $subAccounts = [];
+
+                foreach ($balances as $accCode => $row) {
+                    if ($accCode === $acc->code || str_starts_with($accCode, $acc->code . '.')) {
+                        $deb = (float)$row->total_debit;
+                        $crd = (float)$row->total_credit;
+                        $totalDeb += $deb;
+                        $totalCrd += $crd;
+
+                        if ($accCode !== $acc->code) {
+                            $subAccObj = $allAccounts->get($accCode);
+                            $subBal = $normal === 'DEBIT' ? round($deb - $crd, 2) : round($crd - $deb, 2);
+                            $subAccounts[] = [
+                                'code'    => $accCode,
+                                'name'    => $subAccObj ? $subAccObj->name : $accCode,
+                                'debit'   => round($deb, 2),
+                                'credit'  => round($crd, 2),
+                                'balance' => $subBal,
+                            ];
+                        }
+                    }
+                }
+
+                $balance = $normal === 'DEBIT' ? round($totalDeb - $totalCrd, 2) : round($totalCrd - $totalDeb, 2);
+                $isContra = ($acc->code === '4-41003' || ($groupPrefix === '4' && $normal === 'DEBIT'));
+                $netEffect = $isContra ? -$balance : $balance;
+
+                $accountsList[] = [
+                    'code'           => $acc->code,
+                    'name'           => $acc->name,
+                    'description'    => $acc->description,
+                    'category'       => $acc->category,
+                    'type'           => $acc->type,
+                    'normal_balance' => $normal,
+                    'is_contra'      => $isContra,
+                    'debit'          => round($totalDeb, 2),
+                    'credit'         => round($totalCrd, 2),
+                    'balance'        => $balance,
+                    'net_balance'    => $netEffect,
+                    'pct_of_sales'   => $netSales > 0 ? round((abs($netEffect) / $netSales) * 100, 1) : 0.0,
+                    'sub_accounts'   => $subAccounts,
+                    'has_activity'   => ($totalDeb > 0 || $totalCrd > 0),
+                ];
+
+                $groupTotal += $netEffect;
+            }
+
+            return [
+                'group_code' => $groupPrefix,
+                'group_name' => $groupName,
+                'accounts'   => $accountsList,
+                'total'      => round($groupTotal, 2),
+                'ratio_pct'  => $netSales > 0 ? round(($groupTotal / $netSales) * 100, 1) : 0.0,
+            ];
+        };
+
+        $coaRevenue = $buildCoaGroup('4', 'PENDAPATAN OPERASIONAL (REVENUE)', 'CREDIT');
+        $coaCogs    = $buildCoaGroup('5', 'HARGA POKOK PENJUALAN (HPP / COGS)', 'DEBIT');
+        $coaOpex    = $buildCoaGroup('6', 'BEBAN OPERASIONAL & BIAYA LAINNYA (OPEX)', 'DEBIT');
+
+        $coaStatement = [
+            'revenue' => $coaRevenue,
+            'cogs'    => $coaCogs,
+            'gross_profit' => [
+                'amount'     => round($grossProfit, 2),
+                'margin_pct' => $grossMarginPct,
+            ],
+            'opex'    => $coaOpex,
+            'net_profit' => [
+                'amount'     => round($netProfit, 2),
+                'margin_pct' => $netMarginPct,
+            ],
+        ];
+
         return [
             'period' => [
                 'from'      => $from,
@@ -1251,6 +1441,7 @@ class ReportController extends Controller
             ],
             'nota_type' => $notaType,
             'source'    => 'GENERAL_LEDGER_JOURNALS',
+            'coa_statement' => $coaStatement,
             'revenue' => [
                 'gross_sales'             => round($grossSales, 2),
                 'total_discount'          => round($totalDiscount, 2),
@@ -1300,17 +1491,20 @@ class ReportController extends Controller
                 ],
             ],
             'cogs' => [
-                'cogs_recipes'          => round($cogsRecipes, 2),
-                'cogs_bahan'            => round($cogsBahan, 2),
-                'cogs_kemasan'          => round($cogsKemasan, 2),
-                'cogs_waste'            => round($totalWasteLoss, 2),
-                'cogs_variance'         => round($cogsVariance, 2),
-                'total_cogs'            => round($totalCogs, 2),
-                'recipes_ratio_pct'     => $netSales > 0 ? round(($cogsRecipes / $netSales) * 100, 1) : 0,
-                'cogs_ratio_pct'        => $cogsRatioPct,
-                'gross_profit'          => round($grossProfit, 2),
-                'gross_margin_pct'      => $grossMarginPct,
-                'top_ingredients_usage' => $topIngredientsUsage,
+                'cogs_recipes'                          => round($cogsPureRecipes, 2),
+                'cogs_bahan'                            => round($cogsBahan, 2),
+                'cogs_kemasan'                          => round($cogsKemasan, 2),
+                'cogs_theoretical_variance'             => round($cogsTeoritis, 2),
+                'cogs_theoretical_variance_bahan'       => round($cogsTeoritisBahan, 2),
+                'cogs_theoretical_variance_perlengkapan'=> round($cogsTeoritisPlk, 2),
+                'cogs_waste'                            => round($totalWasteLoss, 2),
+                'cogs_variance'                         => round($cogsVariance, 2),
+                'total_cogs'                            => round($totalCogs, 2),
+                'recipes_ratio_pct'                     => $netSales > 0 ? round(($cogsPureRecipes / $netSales) * 100, 1) : 0,
+                'cogs_ratio_pct'                        => $cogsRatioPct,
+                'gross_profit'                          => round($grossProfit, 2),
+                'gross_margin_pct'                      => $grossMarginPct,
+                'top_ingredients_usage'                 => $topIngredientsUsage,
             ],
             'waste' => [
                 'total_waste_loss'             => round($totalWasteLoss, 2),
@@ -1357,6 +1551,159 @@ class ReportController extends Controller
             ],
             'waterfall' => $waterfall,
         ];
+    }
+
+    /**
+     * Helper to allocate Account 5-51007 (Biaya Selisih HPP Stok Minus) down to specific ingredients
+     */
+    private function getIngredientMinusBreakdown(string $from, string $to, $outletId = null, ?int $businessId = null, float $targetTotalMinus = 0.0): array
+    {
+        $breakdown = [];
+        $numericOutletId = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
+
+        $linesQuery = JournalLine::whereBetween('entry_date', [$from, $to])
+            ->whereIn('account_code', array_merge(
+                ['5-51007', '5-51008'],
+                JournalLine::where('account_code', 'like', '5-51007.%')->pluck('account_code')->toArray(),
+                JournalLine::where('account_code', 'like', '5-51008.%')->pluck('account_code')->toArray()
+            ))
+            ->with(['journalEntry']);
+
+        if ($numericOutletId) {
+            $linesQuery->where('outlet_id', $numericOutletId);
+        }
+        if ($businessId) {
+            $linesQuery->whereHas('journalEntry', fn($q) => $q->where('business_id', $businessId));
+        }
+
+        $lines = $linesQuery->get();
+
+        foreach ($lines as $l) {
+            $entry = $l->journalEntry;
+            if (!$entry) continue;
+
+            $debit = (float)$l->debit;
+            $credit = (float)$l->credit;
+            $net = $debit - $credit;
+            if (abs($net) < 0.0001) continue;
+
+            $outId = (int)($l->outlet_id ?: ($numericOutletId ?: 1));
+
+            if ($entry->reference_type === 'URGENT_NOTE') {
+                $un = UrgentNote::find($entry->reference_id);
+                if ($un && $un->ingredient_id) {
+                    $ingId = $un->ingredient_id;
+                    if (!isset($breakdown[$ingId])) {
+                        $breakdown[$ingId] = ['cost_minus' => 0.0, 'qty_minus' => 0.0];
+                    }
+                    $breakdown[$ingId]['cost_minus'] += $net;
+                    $ing = $un->ingredient ?: Ingredient::find($ingId);
+                    $unitCost = $ing ? (float)$ing->costPerPakaiForOutlet($outId) : 0;
+                    if ($unitCost > 0) {
+                        $breakdown[$ingId]['qty_minus'] += ($net / $unitCost);
+                    }
+                }
+            } elseif ($entry->reference_type === 'TRANSACTION') {
+                $trx = Transaction::find($entry->reference_id);
+                if ($trx) {
+                    $uns = UrgentNote::where('transaction_id', $trx->id)->get();
+                    if ($uns->isNotEmpty()) {
+                        $itemWeights = [];
+                        foreach ($uns as $u) {
+                            if ($u->ingredient_id) {
+                                $ing = $u->ingredient ?: Ingredient::find($u->ingredient_id);
+                                $unitCost = $ing ? (float)$ing->costPerPakaiForOutlet($outId) : 0;
+                                $cost = (float)$u->pending_qty * $unitCost;
+                                $itemWeights[$u->ingredient_id] = [
+                                    'cost' => $cost,
+                                    'qty'  => (float)$u->pending_qty,
+                                    'unit_cost' => $unitCost,
+                                ];
+                            }
+                        }
+                        $totWeightCost = array_sum(array_column($itemWeights, 'cost'));
+                        foreach ($itemWeights as $ingId => $w) {
+                            $ratio = $totWeightCost > 0 ? ($w['cost'] / $totWeightCost) : (1.0 / max(1, count($itemWeights)));
+                            $shareCost = $net * $ratio;
+                            $shareQty = $w['unit_cost'] > 0 ? ($shareCost / $w['unit_cost']) : $w['qty'];
+
+                            if (!isset($breakdown[$ingId])) {
+                                $breakdown[$ingId] = ['cost_minus' => 0.0, 'qty_minus' => 0.0];
+                            }
+                            $breakdown[$ingId]['cost_minus'] += $shareCost;
+                            $breakdown[$ingId]['qty_minus'] += $shareQty;
+                        }
+                    } else {
+                        $sms = StockMovement::where('transaction_id', $trx->id)->where('note', 'like', '%Defisit%')->get();
+                        $smWeights = [];
+                        foreach ($sms as $sm) {
+                            if ($sm->ingredient_id && preg_match('/Defisit\s+([0-9.]+)/i', (string)$sm->note, $matches)) {
+                                $defQty = (float)$matches[1];
+                                $ing = $sm->ingredient ?: Ingredient::find($sm->ingredient_id);
+                                $unitCost = $ing ? (float)$ing->costPerPakaiForOutlet($outId) : 0;
+                                $cost = $defQty * $unitCost;
+                                $smWeights[$sm->ingredient_id] = [
+                                    'cost' => $cost,
+                                    'qty'  => $defQty,
+                                    'unit_cost' => $unitCost,
+                                ];
+                            }
+                        }
+                        $totSmCost = array_sum(array_column($smWeights, 'cost'));
+                        foreach ($smWeights as $ingId => $w) {
+                            $ratio = $totSmCost > 0 ? ($w['cost'] / $totSmCost) : (1.0 / max(1, count($smWeights)));
+                            $shareCost = $net * $ratio;
+                            $shareQty = $w['unit_cost'] > 0 ? ($shareCost / $w['unit_cost']) : $w['qty'];
+
+                            if (!isset($breakdown[$ingId])) {
+                                $breakdown[$ingId] = ['cost_minus' => 0.0, 'qty_minus' => 0.0];
+                            }
+                            $breakdown[$ingId]['cost_minus'] += $shareCost;
+                            $breakdown[$ingId]['qty_minus'] += $shareQty;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clean up negative or near-zero amounts
+        foreach ($breakdown as $ingId => &$data) {
+            $data['cost_minus'] = max(0.0, round($data['cost_minus'], 2));
+            $data['qty_minus'] = max(0.0, round($data['qty_minus'], 3));
+        }
+
+        // If targetTotalMinus > 0 but journal lines did not attribute everything:
+        $allocatedSum = array_sum(array_column($breakdown, 'cost_minus'));
+        if ($targetTotalMinus > 0 && abs($targetTotalMinus - $allocatedSum) > 0.01) {
+            // Check pending urgent notes in period
+            $pendingUns = UrgentNote::whereBetween('created_at', [$from . ' 00:00:00', $to . ' 23:59:59'])
+                ->when($numericOutletId, fn($q) => $q->where('outlet_id', $numericOutletId))
+                ->where('status', 'PENDING')
+                ->get();
+            foreach ($pendingUns as $pu) {
+                if ($pu->ingredient_id && !isset($breakdown[$pu->ingredient_id])) {
+                    $ing = $pu->ingredient ?: Ingredient::find($pu->ingredient_id);
+                    $unitCost = $ing ? (float)$ing->costPerPakaiForOutlet($numericOutletId ?: 1) : 0;
+                    $cost = (float)$pu->pending_qty * $unitCost;
+                    $breakdown[$pu->ingredient_id] = [
+                        'cost_minus' => round($cost, 2),
+                        'qty_minus'  => round((float)$pu->pending_qty, 3),
+                    ];
+                }
+            }
+
+            // Normalize or scale to exact targetTotalMinus if needed
+            $allocatedSumNow = array_sum(array_column($breakdown, 'cost_minus'));
+            if ($allocatedSumNow > 0 && abs($targetTotalMinus - $allocatedSumNow) > 0.01) {
+                $scaleFactor = $targetTotalMinus / $allocatedSumNow;
+                foreach ($breakdown as &$bItem) {
+                    $bItem['cost_minus'] = round($bItem['cost_minus'] * $scaleFactor, 2);
+                    $bItem['qty_minus'] = round($bItem['qty_minus'] * $scaleFactor, 3);
+                }
+            }
+        }
+
+        return $breakdown;
     }
 
     /** Internal helper - reuse variance computation (ALIGNED WITH KARTU STOK) */
@@ -1475,18 +1822,14 @@ class ReportController extends Controller
             $ingMovements = $movementsByIngredient[$ing->id] ?? [];
             $agg = $this->aggregateIngredientMovements($ingMovements, $from, $to);
 
-            // Opening stock calculation matching Kartu Stok (MovementController)
+            // Opening stock calculation matching Table 2 (ingredient_initial_balances)
             $stokAwalMaster = 0.0;
             if ($outletId) {
-                $outletRow = $ing->outletIngredients->first();
-                if ($outletRow && (float)$outletRow->stok_awal > 0) {
-                    $stokAwalMaster = (float)$outletRow->stok_awal;
-                } elseif ($isHoldingOutlet) {
-                    $stokAwalMaster = (float)$ing->stok_awal;
-                }
+                $initRow = \App\Models\IngredientInitialBalance::where('outlet_id', $outletId)->where('ingredient_id', $ing->id)->first();
+                $stokAwalMaster = $initRow ? (float)$initRow->stok_awal : 0.0;
             } else {
-                $sumInit = (float) $ing->outletIngredients->sum('stok_awal');
-                $stokAwalMaster = $sumInit > 0 ? $sumInit : (float) $ing->stok_awal;
+                $allInits = \App\Models\IngredientInitialBalance::where('ingredient_id', $ing->id)->get();
+                $stokAwalMaster = (float) $allInits->sum('stok_awal');
             }
 
             $opname    = $opnames->get($ing->id);
@@ -1748,10 +2091,16 @@ class ReportController extends Controller
         // 6. Barang Stok Minimum (Low Stock Items)
         $minStockItems = Ingredient::where('business_id', $businessId)
             ->where('active', true)
-            ->where('stok_min', '>', 0)
+            ->whereHas('outletIngredients', function ($q) use ($outletId) {
+                $q->where('stok_min', '>', 0);
+                if ($outletId) {
+                    $q->where('outlet_id', $outletId);
+                }
+            })
+            ->with(['outletIngredients'])
             ->get()
             ->map(function ($ing) use ($outletId) {
-                $stock = $outletId ? $ing->stockForOutlet($outletId) : (method_exists($ing, 'consolidatedStock') ? $ing->consolidatedStock() : (float)$ing->stok_awal);
+                $stock = $outletId ? $ing->stockForOutlet($outletId) : (method_exists($ing, 'consolidatedStock') ? $ing->consolidatedStock() : (float)($ing->current_stock ?? 0));
                 $minStock = (float)($ing->stok_min ?? 0);
                 return [
                     'id'            => $ing->id,

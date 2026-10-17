@@ -94,7 +94,7 @@ class CoinPlatformController extends Controller
     }
 
     /**
-     * Update rate (cost per nota/transaction).
+     * Update rate (cost per nota/transaction) or toggle unlimited mode.
      */
     public function updateRate(Request $request)
     {
@@ -102,25 +102,38 @@ class CoinPlatformController extends Controller
 
         $data = $request->validate([
             'business_id'           => 'nullable', // null or 'ALL' or specific id
-            'coins_per_transaction' => 'required|numeric|min:0',
+            'coins_per_transaction' => 'nullable|numeric|min:0',
+            'is_unlimited_coins'    => 'nullable|boolean',
         ]);
 
-        $rate = (float) $data['coins_per_transaction'];
+        $isUnlimited = isset($data['is_unlimited_coins']) ? (bool)$data['is_unlimited_coins'] : null;
+        $rate = isset($data['coins_per_transaction']) ? (float)$data['coins_per_transaction'] : ($isUnlimited ? 0.0 : 1.0);
+
+        if ($isUnlimited === true || $rate == 0.0) {
+            $isUnlimited = true;
+            $rate = 0.0;
+        }
 
         if (!empty($data['business_id']) && $data['business_id'] !== 'ALL') {
-            CoinService::updateRate((int)$data['business_id'], $rate, $request->user()->id);
+            CoinService::updateRate((int)$data['business_id'], $rate, $isUnlimited, $request->user()->id);
             $business = Business::find($data['business_id']);
+            $statusText = $business->is_unlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota";
             return response()->json([
-                'message' => "Tarif koin per nota untuk {$business->name} berhasil diubah menjadi {$rate} koin/nota.",
+                'message' => "Pengaturan koin untuk {$business->name} berhasil diubah menjadi {$statusText}.",
                 'business' => $business,
             ]);
         }
 
         // Apply to all businesses
-        Business::query()->update(['coins_per_transaction' => $rate, 'updated_by' => $request->user()->id]);
+        $updateData = ['coins_per_transaction' => $rate, 'updated_by' => $request->user()->id];
+        if ($isUnlimited !== null) {
+            $updateData['is_unlimited_coins'] = $isUnlimited;
+        }
+        Business::query()->update($updateData);
 
+        $statusText = $isUnlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota";
         return response()->json([
-            'message' => "Tarif koin per nota berhasil diperbarui menjadi {$rate} koin/nota untuk seluruh perusahaan.",
+            'message' => "Pengaturan koin berhasil diperbarui menjadi {$statusText} untuk seluruh perusahaan.",
         ]);
     }
 

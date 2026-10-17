@@ -75,9 +75,14 @@ class MenuController extends Controller
             'track_stock' => 'nullable|boolean',
             'stock'       => 'nullable|numeric|min:0',
             'min_stock'   => 'nullable|numeric|min:0',
-            'price'       => 'required|numeric|min:0',
-            'cost_price'  => 'nullable|numeric|min:0',
-            'unit'        => 'nullable|string|max:20',
+            'price'        => 'required|numeric|min:0',
+            'price_online' => 'nullable|numeric|min:0',
+            'price_grab'   => 'nullable|numeric|min:0',
+            'price_gofood' => 'nullable|numeric|min:0',
+            'price_shopeefood' => 'nullable|numeric|min:0',
+            'cost_price'   => 'nullable|numeric|min:0',
+            'estimated_hpp'=> 'nullable|numeric|min:0',
+            'unit'         => 'nullable|string|max:20',
             'active'      => 'nullable|boolean',
             'outlet_id'   => 'nullable|integer',
             'bundle_items'                  => 'nullable|array',
@@ -92,6 +97,9 @@ class MenuController extends Controller
         $data['stock'] = (float)($data['stock'] ?? 0);
         $data['min_stock'] = (float)($data['min_stock'] ?? 0);
         $data['cost_price'] = (float)($data['cost_price'] ?? 0);
+        $data['estimated_hpp'] = array_key_exists('estimated_hpp', $data) && $data['estimated_hpp'] !== null
+            ? (float)$data['estimated_hpp']
+            : (float)$data['cost_price'];
         $data['unit'] = $data['unit'] ?? ($data['item_type'] === 'DIRECT' ? 'pcs' : ($data['item_type'] === 'SERVICE' ? 'layanan' : ($data['item_type'] === 'BUNDLE' ? 'paket' : 'porsi')));
         $data['created_by'] = $request->user()?->id;
 
@@ -172,9 +180,14 @@ class MenuController extends Controller
             'track_stock' => 'nullable|boolean',
             'stock'       => 'nullable|numeric|min:0',
             'min_stock'   => 'nullable|numeric|min:0',
-            'price'       => 'sometimes|numeric|min:0',
-            'cost_price'  => 'nullable|numeric|min:0',
-            'unit'        => 'nullable|string|max:20',
+            'price'        => 'sometimes|numeric|min:0',
+            'price_online' => 'nullable|numeric|min:0',
+            'price_grab'   => 'nullable|numeric|min:0',
+            'price_gofood' => 'nullable|numeric|min:0',
+            'price_shopeefood' => 'nullable|numeric|min:0',
+            'cost_price'   => 'nullable|numeric|min:0',
+            'estimated_hpp'=> 'nullable|numeric|min:0',
+            'unit'         => 'nullable|string|max:20',
             'active'      => 'nullable|boolean',
             'outlet_id'   => 'nullable|integer',
             'bundle_items'                  => 'nullable|array',
@@ -272,8 +285,63 @@ class MenuController extends Controller
         }
     }
 
+    /**
+     * Cek apakah menu dilarang dihapus karena sudah memiliki riwayat transaksi penjualan kasir,
+     * mutasi stok, atau dibundel dalam menu paket lain.
+     */
+    protected function getMenuDeletionBlockReason(Menu $menu): ?string
+    {
+        $reasons = [];
+
+        // 1. Cek riwayat transaksi penjualan POS
+        if (\Illuminate\Support\Facades\Schema::hasTable('transactions') && \Illuminate\Support\Facades\Schema::hasColumn('transactions', 'menu_id')) {
+            $hasSales = \App\Models\Transaction::where('menu_id', $menu->id)->exists();
+            if ($hasSales) {
+                $reasons[] = 'riwayat transaksi penjualan kasir/POS';
+            }
+        }
+
+        if (\Illuminate\Support\Facades\Schema::hasTable('transaction_items')) {
+            $hasTxItems = \Illuminate\Support\Facades\DB::table('transaction_items')->where('menu_id', $menu->id)->exists();
+            if ($hasTxItems) {
+                $reasons[] = 'riwayat transaksi penjualan';
+            }
+        }
+
+        // 2. Cek mutasi kartu stok (produk jadi retail atau resep)
+        if (\Illuminate\Support\Facades\Schema::hasTable('stock_movements') && \Illuminate\Support\Facades\Schema::hasColumn('stock_movements', 'menu_id')) {
+            $hasMovements = \Illuminate\Support\Facades\DB::table('stock_movements')->where('menu_id', $menu->id)->exists();
+            if ($hasMovements) {
+                $reasons[] = 'mutasi kartu stok';
+            }
+        }
+
+        // 3. Cek paket bundle (dibundel dalam menu lain)
+        if (\Illuminate\Support\Facades\Schema::hasTable('bundle_items')) {
+            $isBundled = \Illuminate\Support\Facades\DB::table('bundle_items')->where('bundled_menu_id', $menu->id)->exists();
+            if ($isBundled) {
+                $reasons[] = 'paket menu combo/bundle';
+            }
+        }
+
+        if (!empty($reasons)) {
+            $reasonStr = implode(', ', array_unique($reasons));
+            return "Dilarang menghapus menu '{$menu->name}'! Menu ini sudah digunakan dalam {$reasonStr}. Menghapus menu ini akan merusak data historis laporan penjualan, HPP riil, dan keuangan. Jika menu ini sudah tidak lagi dijual, silakan nonaktifkan (ubah status menjadi Tidak Aktif).";
+        }
+
+        return null;
+    }
+
     public function destroy(Menu $menu)
     {
+        $blockReason = $this->getMenuDeletionBlockReason($menu);
+        if ($blockReason) {
+            return response()->json([
+                'message' => $blockReason,
+                'error'   => 'MENU_LOCKED_BY_TRANSACTIONS',
+            ], 422);
+        }
+
         \Illuminate\Support\Facades\DB::transaction(function () use ($menu) {
             $recipeIds = \Illuminate\Support\Facades\DB::table('recipes')->where('menu_id', $menu->id)->pluck('id')->toArray();
             if (!empty($recipeIds)) {
@@ -313,6 +381,29 @@ class MenuController extends Controller
 
         if ($menus->isEmpty()) {
             return response()->json(['message' => 'Tidak ada data menu yang ditemukan untuk dihapus.'], 404);
+        }
+
+        // Validasi: Cek apakah ada menu yang dilarang dihapus karena sudah memiliki transaksi
+        $blockedList = [];
+        foreach ($menus as $m) {
+            $reason = $this->getMenuDeletionBlockReason($m);
+            if ($reason) {
+                $blockedList[] = $reason;
+            }
+        }
+
+        if (!empty($blockedList)) {
+            $countBlocked = count($blockedList);
+            $sampleErrors = implode("\n\n", array_slice($blockedList, 0, 3));
+            if ($countBlocked > 3) {
+                $sampleErrors .= "\n\n... dan " . ($countBlocked - 3) . " menu lainnya juga dilarang dihapus.";
+            }
+
+            return response()->json([
+                'message'       => $sampleErrors,
+                'error'         => 'MENUS_LOCKED_BY_TRANSACTIONS',
+                'blocked_count' => $countBlocked,
+            ], 422);
         }
 
         $deletedCount = 0;
@@ -417,6 +508,24 @@ class MenuController extends Controller
             'items.*.waste_std'     => 'nullable|numeric|min:0|max:100',
         ]);
 
+        // ⚡ VALIDASI: Semua bahan & perlengkapan tidak boleh dimasukkan ke resep menu jika belum memiliki Saldo Awal
+        $ingredientIds = array_column($data['items'], 'ingredient_id');
+        $ingredients = Ingredient::with(['outletIngredients', 'prepRecipe'])->whereIn('id', $ingredientIds)->get()->keyBy('id');
+
+        foreach ($data['items'] as $item) {
+            $ing = $ingredients->get($item['ingredient_id']);
+            if (!$ing) continue;
+
+            if (!$ing->hasInitialBalance()) {
+                return response()->json([
+                    'message' => "Bahan/perlengkapan '{$ing->name}' ({$ing->code}) belum memiliki Saldo Awal. Silakan masukkan Saldo Awal terlebih dahulu di Master Bahan atau Kartu Stok sebelum memasukkannya ke dalam resep menu.",
+                    'errors'  => [
+                        'items' => ["Bahan/perlengkapan '{$ing->name}' ({$ing->code}) belum memiliki Saldo Awal. Silakan masukkan Saldo Awal terlebih dahulu di Master Bahan atau Kartu Stok sebelum memasukkannya ke dalam resep menu."]
+                    ],
+                ], 422);
+            }
+        }
+
         $oldHpp = (float)$menu->calculateHpp();
         $nextVersion = ($menu->recipes()->max('version') ?? 0) + 1;
 
@@ -461,6 +570,25 @@ class MenuController extends Controller
             return response()->json(['message' => 'Resep tidak sesuai dengan menu yang dipilih.'], 404);
         }
 
+        // Cek apakah resep versi ini sudah pernah digunakan dalam transaksi POS atau mutasi stok
+        $isUsed = \App\Models\Transaction::where('menu_id', $menu->id)
+            ->where(function ($q) use ($recipe) {
+                $q->where('recipe_version', $recipe->version)
+                  ->orWhereNull('recipe_version');
+            })
+            ->exists();
+
+        if (!$isUsed && \Illuminate\Support\Facades\Schema::hasTable('stock_movements') && \Illuminate\Support\Facades\Schema::hasColumn('stock_movements', 'menu_id')) {
+            $isUsed = \Illuminate\Support\Facades\DB::table('stock_movements')->where('menu_id', $menu->id)->exists();
+        }
+
+        if ($isUsed) {
+            return response()->json([
+                'message' => "Dilarang menghapus resep/gramasi Versi {$recipe->version} untuk menu '{$menu->name}'! Resep ini sudah tercatat dalam riwayat transaksi penjualan kasir. Untuk mengubah komposisi bahan pada penjualan berikutnya tanpa menghilangkan riwayat masa lalu, silakan simpan sebagai Resep Versi Baru.",
+                'error'   => 'RECIPE_LOCKED_BY_TRANSACTIONS',
+            ], 422);
+        }
+
         $oldHpp = (float)$menu->calculateHpp();
         $deletedVersion = $recipe->version;
 
@@ -493,6 +621,18 @@ class MenuController extends Controller
     /** Delete all recipes of a menu */
     public function destroyAllRecipes(Request $request, Menu $menu)
     {
+        $hasSales = \App\Models\Transaction::where('menu_id', $menu->id)->exists();
+        if (!$hasSales && \Illuminate\Support\Facades\Schema::hasTable('stock_movements') && \Illuminate\Support\Facades\Schema::hasColumn('stock_movements', 'menu_id')) {
+            $hasSales = \Illuminate\Support\Facades\DB::table('stock_movements')->where('menu_id', $menu->id)->exists();
+        }
+
+        if ($hasSales) {
+            return response()->json([
+                'message' => "Dilarang menghapus seluruh resep (BOM) untuk menu '{$menu->name}'! Menu ini sudah memiliki riwayat transaksi penjualan kasir. Menghapus resep akan merusak integritas HPP riil, kartu stok, dan laporan keuangan.",
+                'error'   => 'RECIPES_LOCKED_BY_TRANSACTIONS',
+            ], 422);
+        }
+
         $oldHpp = (float)$menu->calculateHpp();
 
         \Illuminate\Support\Facades\DB::transaction(function () use ($menu) {
@@ -528,6 +668,25 @@ class MenuController extends Controller
     {
         if ((int)$recipe->menu_id !== (int)$menu->id) {
             return response()->json(['message' => 'Resep tidak sesuai dengan menu yang dipilih.'], 404);
+        }
+
+        // Cek apakah resep versi ini sudah pernah digunakan dalam transaksi POS atau mutasi stok
+        $isUsed = \App\Models\Transaction::where('menu_id', $menu->id)
+            ->where(function ($q) use ($recipe) {
+                $q->where('recipe_version', $recipe->version)
+                  ->orWhereNull('recipe_version');
+            })
+            ->exists();
+
+        if (!$isUsed && \Illuminate\Support\Facades\Schema::hasTable('stock_movements') && \Illuminate\Support\Facades\Schema::hasColumn('stock_movements', 'menu_id')) {
+            $isUsed = \Illuminate\Support\Facades\DB::table('stock_movements')->where('menu_id', $menu->id)->exists();
+        }
+
+        if ($isUsed) {
+            return response()->json([
+                'message' => "Dilarang menghapus bahan dari resep Versi {$recipe->version} untuk menu '{$menu->name}'! Resep ini sudah tercatat dalam riwayat transaksi penjualan. Silakan perbarui resep dengan membuat Versi Baru agar riwayat transaksi lama tidak hilang.",
+                'error'   => 'RECIPE_ITEM_LOCKED_BY_TRANSACTIONS',
+            ], 422);
         }
 
         $recipeItem = RecipeItem::where('recipe_id', $recipe->id)->where('id', $item)->first();
@@ -623,6 +782,9 @@ class MenuController extends Controller
     {
         $user = $request->user();
         $businessId = $user?->business_id;
+        if ($user?->isSuperadminPlatform()) {
+            $businessId = $request->header('X-Business-Id') ?? $request->query('business_id') ?? $request->input('business_id') ?? $businessId;
+        }
 
         $items = $request->input('items', []);
         if (empty($items) || !is_array($items)) {
@@ -645,14 +807,30 @@ class MenuController extends Controller
                         str_contains($lowerName, 'template import') ||
                         str_contains($lowerName, 'petunjuk') ||
                         str_contains($lowerName, 'daftar menu') ||
-                        in_array($lowerName, ['kode menu', 'nama menu', 'nama menu*', 'kategori', 'kategori*', 'tipe item', 'harga jual'])
+                        in_array($lowerName, ['kode menu', 'nama menu', 'nama menu*', 'kategori', 'kategori*', 'tipe item', 'harga jual', 'kode menu (otomatis)'])
                     ) {
                         continue;
                     }
 
                     $code = !empty($row['code']) ? trim((string)$row['code']) : null;
 
-                    // If user didn't specify a code, auto-generate next safe code for this business without collision
+                    // 1. Try to find existing menu by code first
+                    $existingMenu = null;
+                    if (!empty($code)) {
+                        $existingMenu = Menu::where('business_id', $businessId)->where('code', $code)->first();
+                    }
+
+                    // 2. If not found by code, try to find existing menu by name (case-insensitive)
+                    if (!$existingMenu) {
+                        $existingMenu = Menu::where('business_id', $businessId)
+                            ->where(\Illuminate\Support\Facades\DB::raw('LOWER(name)'), $lowerName)
+                            ->first();
+                        if ($existingMenu && empty($code)) {
+                            $code = $existingMenu->code;
+                        }
+                    }
+
+                    // 3. If still no code, auto-generate next safe code for this business without collision
                     if (empty($code)) {
                         $seq = Menu::where('business_id', $businessId)->count() + 1;
                         do {
@@ -669,25 +847,63 @@ class MenuController extends Controller
                         ['slug' => \Illuminate\Support\Str::slug($categoryName), 'color' => '#7C3AED', 'icon' => 'Utensils']
                     );
 
-                    Menu::updateOrCreate(
-                        [
-                            'business_id' => $businessId,
-                            'code'        => substr($code, 0, 20),
-                        ],
-                        [
-                            'name'         => $name,
-                            'barcode'      => $row['barcode'] ?? null,
-                            'category_id'  => $cat->id,
-                            'category'     => $cat->name,
-                            'item_type'    => !empty($row['item_type']) ? strtoupper((string)$row['item_type']) : 'RECIPE',
-                            'price'        => (float)($row['price'] ?? 0),
-                            'cost_price'   => (float)($row['cost_price'] ?? 0),
-                            'description'  => $row['description'] ?? null,
-                            'is_available' => isset($row['is_available']) ? (bool)$row['is_available'] : true,
-                            'created_by'   => $user?->id,
-                            'updated_by'   => $user?->id,
-                        ]
-                    );
+                    $costPrice = isset($row['cost_price']) ? (float)$row['cost_price'] : 0.0;
+                    $estimatedHpp = isset($row['estimated_hpp']) ? (float)$row['estimated_hpp'] : (isset($row['estimasi_hpp']) ? (float)$row['estimasi_hpp'] : $costPrice);
+                    $price = isset($row['price']) ? (float)$row['price'] : 0.0;
+                    $itemType = !empty($row['item_type']) ? strtoupper((string)$row['item_type']) : ($existingMenu?->item_type ?? 'RECIPE');
+                    $activeStatus = isset($row['active']) ? (bool)$row['active'] : (isset($row['is_available']) ? (bool)$row['is_available'] : true);
+
+                    $oldCost = $existingMenu ? (float)$existingMenu->cost_price : 0.0;
+
+                    $menuData = [
+                        'name'         => $name,
+                        'barcode'      => $row['barcode'] ?? ($existingMenu?->barcode),
+                        'category_id'  => $cat->id,
+                        'category'     => $cat->name,
+                        'item_type'    => $itemType,
+                        'price'        => $price > 0 ? $price : ($existingMenu?->price ?? 0),
+                        'cost_price'   => $costPrice > 0 ? $costPrice : ($existingMenu?->cost_price ?? $costPrice),
+                        'estimated_hpp'=> $estimatedHpp > 0 ? $estimatedHpp : ($existingMenu?->estimated_hpp ?? ($costPrice > 0 ? $costPrice : 0)),
+                        'description'  => $row['description'] ?? ($existingMenu?->description),
+                        'active'       => $activeStatus,
+                        'updated_by'   => $user?->id,
+                    ];
+
+                    if (!$existingMenu) {
+                        $menuData['business_id'] = $businessId;
+                        $menuData['code'] = substr($code, 0, 20);
+                        $menuData['created_by'] = $user?->id;
+                        $menu = Menu::create($menuData);
+                    } else {
+                        $existingMenu->update($menuData);
+                        $menu = $existingMenu;
+                    }
+
+                    // Record initial or updated HPP history if table exists and cost is set
+                    if (\Illuminate\Support\Facades\Schema::hasTable('menu_hpp_histories') && $costPrice > 0 && abs($costPrice - $oldCost) > 0.001) {
+                        $sellingPrice = (float)($menu->price ?? 0);
+                        $marginBefore = $sellingPrice > 0 ? round((($sellingPrice - $oldCost) / $sellingPrice) * 100, 2) : 0.0;
+                        $marginAfter  = $sellingPrice > 0 ? round((($sellingPrice - $costPrice) / $sellingPrice) * 100, 2) : 0.0;
+                        $diff = round($costPrice - $oldCost, 2);
+                        $pctChange = $oldCost > 0 ? round(($diff / $oldCost) * 100, 2) : 100.0;
+
+                        \App\Models\MenuHppHistory::create([
+                            'business_id'       => $businessId,
+                            'menu_id'           => $menu->id,
+                            'outlet_id'         => null,
+                            'date'              => now()->toDateString(),
+                            'hpp_before'        => $oldCost,
+                            'hpp_after'         => $costPrice,
+                            'diff'              => $diff,
+                            'percentage_change' => $pctChange,
+                            'selling_price'     => $sellingPrice,
+                            'margin_before_pct' => $marginBefore,
+                            'margin_after_pct'  => $marginAfter,
+                            'trigger_type'      => 'EXCEL_IMPORT',
+                            'notes'             => "Estimasi HPP Dasar di-set via Import Master Menu Excel: Rp " . number_format($costPrice, 0, ',', '.'),
+                            'user_id'           => $user?->id,
+                        ]);
+                    }
 
                     $importedCount++;
                 }
@@ -921,10 +1137,14 @@ class MenuController extends Controller
                                 'konversi'      => $konversi,
                                 'harga'         => 0,
                                 'stok_min'      => 0,
-                                'stok_awal'     => 0,
                                 'created_by'    => $user?->id,
                                 'updated_by'    => $user?->id,
                             ]);
+                        }
+
+                        // Validasi: Semua bahan & perlengkapan tidak boleh di-import ke resep menu jika belum memiliki Saldo Awal
+                        if (!$ingredient->hasInitialBalance()) {
+                            throw new \Exception("Bahan/perlengkapan '{$ingredient->name}' ({$ingredient->code}) belum memiliki Saldo Awal. Silakan masukkan Saldo Awal terlebih dahulu di Master Bahan atau Kartu Stok sebelum mengimpor resep menu.");
                         }
 
                         // Kunci otomatis ke Satuan Pakai Master Bahan (Auto-bind to Master unit_pakai)
@@ -947,6 +1167,13 @@ class MenuController extends Controller
 
                     $newHpp = (float)$menu->calculateHpp();
                     $menu->cost_price = $newHpp;
+                    // Jaga agar target Estimasi HPP Dasar (estimated_hpp) TIDAK BERUBAH saat resep/gramasi diisi atau di-import.
+                    // Hanya setel fallback jika estimated_hpp belum pernah diisi (null atau 0).
+                    if (empty($menu->estimated_hpp) || (float)$menu->estimated_hpp <= 0) {
+                        if ($oldHpp > 0) {
+                            $menu->estimated_hpp = $oldHpp;
+                        }
+                    }
                     $menu->save();
 
                     try {

@@ -14,16 +14,24 @@ class OutletMenu extends Model
         'stock',
         'min_stock',
         'price',
+        'price_online',
+        'price_grab',
+        'price_gofood',
+        'price_shopeefood',
         'cost_price',
         'active',
     ];
 
     protected $casts = [
-        'stock'      => 'float',
-        'min_stock'  => 'float',
-        'price'      => 'float',
-        'cost_price' => 'float',
-        'active'     => 'boolean',
+        'stock'            => 'float',
+        'min_stock'        => 'float',
+        'price'            => 'float',
+        'price_online'     => 'float',
+        'price_grab'       => 'float',
+        'price_gofood'     => 'float',
+        'price_shopeefood' => 'float',
+        'cost_price'       => 'float',
+        'active'           => 'boolean',
     ];
 
     public function outlet()

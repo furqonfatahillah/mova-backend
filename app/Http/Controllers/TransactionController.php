@@ -10,12 +10,14 @@ use App\Models\TransactionModifier;
 use App\Models\Discount;
 use App\Models\UrgentNote;
 use App\Models\OutletMenu;
+use App\Models\Outlet;
 use App\Models\Customer;
 use App\Models\PointRedemption;
 use App\Services\CoinService;
 use App\Models\User;
 use App\Models\WasteLog;
 use App\Services\AccountingService;
+use App\Services\OrderNumberService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -24,8 +26,7 @@ class TransactionController extends Controller
 {
     /**
      * Helper to process ingredient stock deduction with Urgent Note support.
-     * If available stock is less than required, deducts available portion (if > 0)
-     * and records the shortfall as a pending Urgent Note.
+     * Delegates to StockDeductionService for clean domain separation.
      */
     private function processIngredientStockDeduction(
         int $businessId,
@@ -43,41 +44,27 @@ class TransactionController extends Controller
         int $userId,
         ?string $unit = null
     ): array {
-        $unit = $unit ?: $ing->unit_pakai ?: 'satuan';
-        $deductedQty = $requiredQty;
-        $costPerPakai = $ing->costPerPakaiForOutlet($outletId);
-        $totalCost = round($deductedQty * $costPerPakai, 2);
-
-        // Langsung potong stok fisik via StockMovement (stok minus langsung memotong sistem tanpa proses pelunasan)
-        if ($isPaid && $deductedQty > 0) {
-            StockMovement::create([
-                'business_id'    => $businessId,
-                'outlet_id'      => $outletId,
-                'ingredient_id'  => $ing->id,
-                'date'           => $date,
-                'type'           => 'SALE_USAGE',
-                'qty'            => $deductedQty,
-                'unit_price'     => $costPerPakai * max((float)$ing->konversi, 1),
-                'total_price'    => $totalCost,
-                'cost_before'    => $costPerPakai,
-                'cost_after'     => $costPerPakai,
-                'note'           => "{$orderNumber} – {$itemName}",
-                'transaction_id' => $trx->id,
-                'shift_id'       => $trx->shift_id,
-                'user_id'        => $userId,
-                'created_by'     => $userId,
-            ]);
-        }
-
-        return [
-            'is_deficit'   => false,
-            'deducted_qty' => $deductedQty,
-            'pending_qty'  => 0.0,
-        ];
+        return \App\Services\StockDeductionService::processIngredientStockDeduction(
+            $businessId,
+            $outletId,
+            $trx,
+            $orderNumber,
+            $date,
+            $ing,
+            $requiredQty,
+            $itemName,
+            $itemType,
+            $menuId,
+            $isShiftActive,
+            $isPaid,
+            $userId,
+            $unit
+        );
     }
 
     /**
      * Helper to process direct retail product stock deduction with Urgent Note support.
+     * Delegates to StockDeductionService for clean domain separation.
      */
     private function processDirectProductStockDeduction(
         int $businessId,
@@ -88,24 +75,15 @@ class TransactionController extends Controller
         int $qty,
         int $userId
     ): void {
-        if ($menu->item_type !== 'DIRECT' || !$menu->track_stock) {
-            return;
-        }
-
-        $om = null;
-        if ($outletId) {
-            try {
-                $om = OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
-            } catch (\Throwable $e) {}
-        }
-
-        $deductedQty = (float)$qty;
-        if ($deductedQty > 0) {
-            $menu->decrement('stock', $deductedQty);
-            if ($om) {
-                $om->decrement('stock', $deductedQty);
-            }
-        }
+        \App\Services\StockDeductionService::processDirectProductStockDeduction(
+            $businessId,
+            $outletId,
+            $trx,
+            $orderNumber,
+            $menu,
+            $qty,
+            $userId
+        );
     }
 
     /**
@@ -192,29 +170,12 @@ class TransactionController extends Controller
 
     /**
      * Generate the next unique order number for today: e.g. TRX-20260906-0001
-     * Only inspects parent orders to prevent collisions with sub-order splits.
+     * Utilizes thread-safe atomic sequence generator with tenant isolation.
      */
-    private function generateOrderNumber(string $date): string
+    private function generateOrderNumber(string $date, ?int $businessId = null): string
     {
-        $datePrefix = date('Ymd', strtotime($date));
-        $existing = Transaction::where('order_number', 'like', "TRX-{$datePrefix}-%")
-            ->orWhere('parent_order_number', 'like', "TRX-{$datePrefix}-%")
-            ->get(['order_number', 'parent_order_number']);
-
-        $maxSeq = 0;
-        foreach ($existing as $t) {
-            foreach ([$t->order_number, $t->parent_order_number] as $str) {
-                if ($str && preg_match("/TRX-{$datePrefix}-(\d{4})/", $str, $matches)) {
-                    $seq = (int)$matches[1];
-                    if ($seq > $maxSeq) {
-                        $maxSeq = $seq;
-                    }
-                }
-            }
-        }
-
-        $nextSeq = $maxSeq + 1;
-        return sprintf("TRX-%s-%04d", $datePrefix, $nextSeq);
+        $bizId = $businessId ?: (int)(request()->user()?->business_id ?: 1);
+        return OrderNumberService::generateNextOrderNumber($bizId, $date);
     }
 
     public function index(Request $request)
@@ -222,7 +183,7 @@ class TransactionController extends Controller
         $user = $request->user();
         $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
 
-        $query = Transaction::with(['menu', 'user', 'outlet', 'shift', 'creator', 'updater', 'cancelledByUser', 'voidRequestedByUser', 'voidApprovedByUser', 'voidRejectedByUser', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient', 'customer'])
+        $query = Transaction::with(['menu', 'user', 'outlet', 'shift', 'creator', 'updater', 'cancelledByUser', 'voidRequestedByUser', 'voidApprovedByUser', 'voidRejectedByUser', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient', 'customer', 'receivable'])
             ->orderByDesc('date')
             ->orderByDesc('id');
 
@@ -369,6 +330,7 @@ class TransactionController extends Controller
                 'items'                        => 'required|array|min:1',
                 'items.*.menu_id'              => 'required|exists:menus,id',
                 'items.*.qty'                  => 'required|integer|min:1',
+                'items.*.price'                => 'nullable|numeric|min:0',
                 'items.*.notes'                => 'nullable|string|max:255',
                 'items.*.is_urgent'            => 'nullable|boolean',
                 'items.*.modifier_option_ids'  => 'nullable|array',
@@ -377,7 +339,7 @@ class TransactionController extends Controller
                 'is_urgent_note'               => 'nullable|boolean',
                 'status'                       => 'nullable|string|in:PAID,HOLD',
                 'date'                         => 'required|date',
-                'shift_id'                     => 'nullable|exists:shifts,id',
+                'shift_id'                     => 'nullable',
                 'outlet_id'                    => 'nullable|exists:outlets,id',
                 'customer_name'                => 'nullable|string|max:100',
                 'customer_id'                  => 'nullable|exists:customers,id',
@@ -395,6 +357,7 @@ class TransactionController extends Controller
                 'discount_name'                => 'nullable|string|max:100',
                 'discount_type'                => 'nullable|string|max:30',
                 'discount_rate'                => 'nullable|numeric|min:0',
+                'client_order_id'              => 'nullable|string|max:100',
             ]);
 
             $orderStatus = $data['status'] ?? 'PAID';
@@ -413,6 +376,41 @@ class TransactionController extends Controller
                 $outletId = \App\Models\Outlet::where('business_id', $businessId)->where('is_main', true)->value('id')
                          ?? \App\Models\Outlet::where('business_id', $businessId)->value('id')
                          ?? 1;
+            }
+
+            // =========================================================================
+            // IDEMPOTENCY PROTECTION (Pencegahan Duplikasi Order Offline / Retries)
+            // =========================================================================
+            $clientOrderId = $data['client_order_id'] ?? $request->input('client_order_id');
+            if (!$clientOrderId && !empty($data['notes'])) {
+                if (preg_match('/\[Offline ID:\s*([^\]]+)\]/i', $data['notes'], $matches)) {
+                    $clientOrderId = trim($matches[1]);
+                }
+            }
+
+            if (!empty($clientOrderId)) {
+                $existingTx = Transaction::where('business_id', $businessId)
+                    ->where(function ($q) use ($clientOrderId) {
+                        $q->where('client_order_id', $clientOrderId)
+                          ->orWhere('notes', 'like', "%[Offline ID: {$clientOrderId}]%");
+                    })
+                    ->first();
+
+                if ($existingTx) {
+                    $existingOrderNo = $existingTx->order_number;
+                    $existingRows = Transaction::where('business_id', $businessId)
+                        ->where('order_number', $existingOrderNo)
+                        ->with(['menu', 'user', 'customer'])
+                        ->get();
+
+                    return response()->json([
+                        'message'            => "Transaksi offline [{$clientOrderId}] sudah tercatat sebelumnya (idempotent).",
+                        'order_number'       => $existingOrderNo,
+                        'is_idempotent_sync' => true,
+                        'transaction'        => $existingTx,
+                        'items'              => $existingRows,
+                    ], 200);
+                }
             }
 
             // Pre-check SaaS coin balance if order is finalized as PAID
@@ -434,7 +432,13 @@ class TransactionController extends Controller
             $shiftId = $data['shift_id'] ?? null;
             $activeShift = null;
             if ($shiftId) {
-                $activeShift = \App\Models\Shift::find($shiftId);
+                if (is_numeric($shiftId)) {
+                    $activeShift = \App\Models\Shift::find($shiftId);
+                } else {
+                    $activeShift = \App\Models\Shift::where('business_id', $businessId)
+                        ->where('client_shift_id', $shiftId)
+                        ->first();
+                }
             }
             if (!$activeShift) {
                 $activeShift = \App\Models\Shift::where('status', 'OPEN')
@@ -446,8 +450,8 @@ class TransactionController extends Controller
                         ->orderByDesc('opened_at')
                         ->first();
                 }
-                $shiftId = $activeShift?->id;
             }
+            $shiftId = $activeShift?->id;
 
             // Dilarang melakukan transaksi kalau belum buka shift (berlaku untuk semua pengguna termasuk Owner)
             if (!$shiftId || !$activeShift) {
@@ -462,12 +466,12 @@ class TransactionController extends Controller
                 ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
                 : ($data['date'] ?? now()->toDateString());
 
-            // Generate Unique Order Number based on shift operational date: e.g. TRX-20260906-0001
-            $orderNumber = $this->generateOrderNumber($shiftDate);
-
             // Pre-validate recipes & resolve modifiers for all items
             $preparedItems = [];
             $orderTotal = 0;
+
+            $paymentMethod = strtoupper($data['payment_method'] ?? 'CASH');
+            $isOnlinePayment = in_array($paymentMethod, ['GRAB', 'GRABFOOD', 'GOFOOD', 'GOJEK', 'SHOPEEFOOD', 'SHOPEE', 'APLIKASI']);
 
             foreach ($data['items'] as $it) {
                 $menu = Menu::findOrFail($it['menu_id']);
@@ -475,7 +479,50 @@ class TransactionController extends Controller
 
                 $options = $this->resolveModifierOptions($it);
                 $modifierUnitPrice = (float)$options->sum('price');
-                $itemUnitPrice = (float)$menu->price + $modifierUnitPrice;
+
+                $basePrice = (float)$menu->price;
+                if ($isOnlinePayment) {
+                    $appPrice = null;
+                    if (in_array($paymentMethod, ['GRAB', 'GRABFOOD'])) {
+                        $appPrice = $menu->price_grab;
+                    } elseif (in_array($paymentMethod, ['GOFOOD', 'GOJEK'])) {
+                        $appPrice = $menu->price_gofood;
+                    } elseif (in_array($paymentMethod, ['SHOPEEFOOD', 'SHOPEE'])) {
+                        $appPrice = $menu->price_shopeefood;
+                    }
+                    if ($appPrice !== null && (float)$appPrice > 0) {
+                        $basePrice = (float)$appPrice;
+                    } elseif ($menu->price_online !== null && (float)$menu->price_online > 0) {
+                        $basePrice = (float)$menu->price_online;
+                    }
+                }
+
+                $om = OutletMenu::where('outlet_id', $outletId)->where('menu_id', $menu->id)->first();
+                if ($om) {
+                    if ($isOnlinePayment) {
+                        $omAppPrice = null;
+                        if (in_array($paymentMethod, ['GRAB', 'GRABFOOD'])) {
+                            $omAppPrice = $om->price_grab;
+                        } elseif (in_array($paymentMethod, ['GOFOOD', 'GOJEK'])) {
+                            $omAppPrice = $om->price_gofood;
+                        } elseif (in_array($paymentMethod, ['SHOPEEFOOD', 'SHOPEE'])) {
+                            $omAppPrice = $om->price_shopeefood;
+                        }
+                        if ($omAppPrice !== null && (float)$omAppPrice > 0) {
+                            $basePrice = (float)$omAppPrice;
+                        } elseif ($om->price_online !== null && (float)$om->price_online > 0) {
+                            $basePrice = (float)$om->price_online;
+                        }
+                    } elseif ($om->price !== null && (float)$om->price > 0) {
+                        $basePrice = (float)$om->price;
+                    }
+                }
+
+                if (isset($it['price']) && $it['price'] !== null && (float)$it['price'] > 0) {
+                    $basePrice = (float)$it['price'];
+                }
+
+                $itemUnitPrice = $basePrice + $modifierUnitPrice;
                 $reqQty = (int)$it['qty'];
 
                 $isExplicitUrgent = isset($it['is_urgent']) ? (bool)$it['is_urgent'] : false;
@@ -569,9 +616,12 @@ class TransactionController extends Controller
             }
             unset($prep);
 
+            $orderNumber = null;
             $createdTransactions = DB::transaction(function () use (
-                $preparedItems, $data, $orderNumber, $orderStatus, $shiftId, $shiftDate, $outletId, $businessId, $request, $discInfo, $isUrgentOrder, $customerId, $orderNetTotal
+                $preparedItems, $data, &$orderNumber, $orderStatus, $shiftId, $shiftDate, $outletId, $businessId, $request, $discInfo, $isUrgentOrder, $customerId, $orderNetTotal, $clientOrderId
             ) {
+                // Thread-safe atomic order number generation inside active database transaction
+                $orderNumber = OrderNumberService::generateNextOrderNumber($businessId, $shiftDate);
                 $results = [];
 
                 foreach ($preparedItems as $prep) {
@@ -582,6 +632,7 @@ class TransactionController extends Controller
                     $trx = Transaction::create([
                         'business_id'     => $businessId,
                         'order_number'    => $orderNumber,
+                        'client_order_id' => $clientOrderId,
                         'status'          => $orderStatus,
                         'date'            => $shiftDate,
                         'menu_id'         => $menu->id,
@@ -601,8 +652,8 @@ class TransactionController extends Controller
                         'order_type'      => $data['order_type'] ?? 'DINE_IN',
                         'table_number'    => $data['table_number'] ?? null,
                         'payment_method'  => $data['payment_method'] ?? 'CASH',
-                        'dp_payment_method'=> in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_payment_method'] ?? 'CASH') : null,
-                        'dp_reference_no'  => in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_reference_no'] ?? null) : null,
+                        'dp_payment_method'=> (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null,
+                        'dp_reference_no'  => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null,
                         'is_urgent_note'  => !empty($prep['is_urgent']),
                         'urgent_status'   => !empty($prep['is_urgent']) ? 'PENDING' : 'NONE',
                         'notes'           => $prep['item_notes'] ?: ($data['notes'] ?? null),
@@ -892,17 +943,23 @@ class TransactionController extends Controller
                     CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
                 }
 
+                // Auto-post double-entry journal ledger inside the database transaction
+                foreach ($results as $cTrx) {
+                    AccountingService::postTransaction($cTrx);
+                }
+
                 return $results;
             });
 
-            // Auto-post double-entry journal ledger
-            foreach ($createdTransactions as $cTrx) {
-                AccountingService::postTransaction($cTrx);
-            }
+            $targetOutlet = Outlet::with('business')->find($outletId);
 
             return response()->json([
                 'order_number'    => $orderNumber,
                 'status'          => $orderStatus,
+                'business_name'   => $targetOutlet?->business?->name ?? 'MOVA POS',
+                'outlet_name'     => $targetOutlet?->name ?? 'Outlet',
+                'outlet_address'  => $targetOutlet?->address,
+                'outlet_phone'    => $targetOutlet?->phone,
                 'date'            => $shiftDate,
                 'customer_name'   => $data['customer_name'] ?? null,
                 'customer_id'     => $customerId,
@@ -910,8 +967,8 @@ class TransactionController extends Controller
                 'order_type'      => $data['order_type'] ?? 'DINE_IN',
                 'table_number'    => $data['table_number'] ?? null,
                 'payment_method'  => $data['payment_method'] ?? 'CASH',
-                'dp_payment_method'=> in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_payment_method'] ?? 'CASH') : null,
-                'dp_reference_no'  => in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_reference_no'] ?? null) : null,
+                'dp_payment_method'=> (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null,
+                'dp_reference_no'  => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null,
                 'subtotal'        => $orderGrossSubtotal,
                 'discount_id'     => $discInfo['discount_id'],
                 'discount_name'   => $discInfo['discount_name'],
@@ -964,7 +1021,7 @@ class TransactionController extends Controller
             'status'                      => 'nullable|string|in:PAID,HOLD',
             'is_urgent_note'              => 'nullable|boolean',
             'date'                        => 'required|date',
-            'shift_id'                    => 'nullable|exists:shifts,id',
+            'shift_id'                    => 'nullable',
             'outlet_id'                   => 'nullable|exists:outlets,id',
             'customer_name'               => 'nullable|string|max:100',
             'customer_id'                 => 'nullable|exists:customers,id',
@@ -976,6 +1033,7 @@ class TransactionController extends Controller
             'amount_paid'                 => 'nullable|numeric|min:0',
             'change_amount'               => 'nullable|numeric|min:0',
             'notes'                       => 'nullable|string|max:500',
+            'client_order_id'             => 'nullable|string|max:100',
             'modifier_option_ids'         => 'nullable|array',
             'modifier_option_ids.*'       => 'exists:modifier_options,id',
             'modifiers'                   => 'nullable|array',
@@ -1000,6 +1058,31 @@ class TransactionController extends Controller
                      ?? 1;
         }
 
+        // Idempotency check for single-item order
+        $clientOrderId = $data['client_order_id'] ?? $request->input('client_order_id');
+        if (!$clientOrderId && !empty($data['notes'])) {
+            if (preg_match('/\[Offline ID:\s*([^\]]+)\]/i', $data['notes'], $matches)) {
+                $clientOrderId = trim($matches[1]);
+            }
+        }
+        if (!empty($clientOrderId)) {
+            $existingTx = Transaction::where('business_id', $businessId)
+                ->where(function ($q) use ($clientOrderId) {
+                    $q->where('client_order_id', $clientOrderId)
+                      ->orWhere('notes', 'like', "%[Offline ID: {$clientOrderId}]%");
+                })
+                ->first();
+
+            if ($existingTx) {
+                return response()->json([
+                    'message'            => "Transaksi offline [{$clientOrderId}] sudah tercatat sebelumnya (idempotent).",
+                    'order_number'       => $existingTx->order_number,
+                    'is_idempotent_sync' => true,
+                    'transaction'        => $existingTx,
+                ], 200);
+            }
+        }
+
         // Pre-check SaaS coin balance if order is finalized as PAID
         if ($orderStatus === 'PAID') {
             $coinCheck = CoinService::canTransact($businessId);
@@ -1019,15 +1102,21 @@ class TransactionController extends Controller
         $shiftId = $data['shift_id'] ?? null;
         $activeShift = null;
         if ($shiftId) {
-            $activeShift = \App\Models\Shift::find($shiftId);
+            if (is_numeric($shiftId)) {
+                $activeShift = \App\Models\Shift::find($shiftId);
+            } else {
+                $activeShift = \App\Models\Shift::where('business_id', $businessId)
+                    ->where('client_shift_id', $shiftId)
+                    ->first();
+            }
         }
         if (!$activeShift) {
             $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $outletId)->orderByDesc('opened_at')->first();
             if (!$activeShift) {
                 $activeShift = \App\Models\Shift::where('status', 'OPEN')->orderByDesc('opened_at')->first();
             }
-            $shiftId = $activeShift?->id;
         }
+        $shiftId = $activeShift?->id;
 
         // Dilarang melakukan transaksi kalau belum buka shift, KECUALI Owner
         if (!$isOwner && (!$shiftId || !$activeShift)) {
@@ -1042,8 +1131,7 @@ class TransactionController extends Controller
             ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
             : ($data['date'] ?? now()->toDateString());
 
-        // Generate Unique Order Number: e.g. TRX-20260906-0001
-        $orderNumber = $this->generateOrderNumber($shiftDate);
+        // Pre-resolve recipe and pricing
         $recipe = $menu->activeRecipe($shiftDate);
 
         $options = $this->resolveModifierOptions($data);
@@ -1051,12 +1139,15 @@ class TransactionController extends Controller
         $itemUnitPrice = (float)$menu->price + $modifierUnitPrice;
         $totalItemPrice = $itemUnitPrice * (int)$data['qty'];
 
-        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $shiftDate, $outletId, $businessId, $orderNumber, $orderStatus, $isUrgentOrder) {
+        $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $shiftDate, $outletId, $businessId, $orderStatus, $isUrgentOrder, $clientOrderId) {
+            // Thread-safe atomic order number generation inside active transaction
+            $orderNumber = OrderNumberService::generateNextOrderNumber($businessId, $shiftDate);
             $qty = (int)$data['qty'];
             $trx = Transaction::create([
-                'business_id'    => $businessId,
-                'order_number'   => $orderNumber,
-                'status'         => $orderStatus,
+                'business_id'     => $businessId,
+                'order_number'    => $orderNumber,
+                'client_order_id' => $clientOrderId,
+                'status'          => $orderStatus,
                 'date'           => $shiftDate,
                 'menu_id'        => $menu->id,
                 'qty'            => $qty,
@@ -1069,8 +1160,8 @@ class TransactionController extends Controller
                 'order_type'     => $data['order_type'] ?? 'DINE_IN',
                 'table_number'   => $data['table_number'] ?? null,
                 'payment_method' => $data['payment_method'] ?? 'CASH',
-                'dp_payment_method'=> in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_payment_method'] ?? 'CASH') : null,
-                'dp_reference_no'  => in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_reference_no'] ?? null) : null,
+                'dp_payment_method'=> (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null,
+                'dp_reference_no'  => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null,
                 'is_urgent_note' => $isUrgentOrder,
                 'urgent_status'  => $isUrgentOrder ? 'PENDING' : 'NONE',
                 'notes'          => $data['notes'] ?? null,
@@ -1166,12 +1257,13 @@ class TransactionController extends Controller
                 CoinService::deductForOrder($businessId, $orderNumber, $outletId, $request->user()->id);
             }
 
+            // Auto-post double-entry journal ledger inside the database transaction
+            AccountingService::postTransaction($trx);
+
             return $trx;
         });
 
         $trx->load(['menu', 'modifiers.ingredient', 'urgentNotes.ingredient']);
-        // Auto-post double-entry journal ledger
-        AccountingService::postTransaction($trx);
         return response()->json($trx, 201);
     }
 
@@ -1425,8 +1517,8 @@ class TransactionController extends Controller
                 $t->customer_id = $customerId;
                 $t->payment_method = $data['payment_method'];
                 $isKasbon = in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']);
-                $t->dp_payment_method = $isKasbon ? ($data['dp_payment_method'] ?? 'CASH') : null;
-                $t->dp_reference_no   = $isKasbon ? ($data['dp_reference_no'] ?? null) : null;
+                $t->dp_payment_method = ($isKasbon && floatval($amountPaid ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null;
+                $t->dp_reference_no   = ($isKasbon && floatval($amountPaid ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null;
                 $t->amount_paid = $amountPaid;
                 $t->change_amount = $changeAmount;
                 $t->notes = !empty($data['notes']) ? $data['notes'] : $t->notes;
@@ -1641,17 +1733,23 @@ class TransactionController extends Controller
         }
 
         $first = $transactions->first();
+        $payOutlet = $first?->outlet ? $first->outlet->loadMissing('business') : null;
+
         return response()->json([
             'message'        => 'Pembayaran tagihan berhasil diselesaikan.',
             'order_number'   => $orderNumber,
+            'business_name'  => $payOutlet?->business?->name ?? 'MOVA POS',
+            'outlet_name'    => $payOutlet?->name ?? 'Outlet',
+            'outlet_address' => $payOutlet?->address,
+            'outlet_phone'   => $payOutlet?->phone,
             'status'         => 'PAID',
             'table_number'   => $first->table_number,
             'customer_name'  => $first->customer_name,
             'customer_id'    => $customerId,
             'customer'       => $customerId ? Customer::find($customerId) : null,
             'payment_method' => $data['payment_method'],
-            'dp_payment_method' => in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_payment_method'] ?? 'CASH') : null,
-            'dp_reference_no'   => in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) ? ($data['dp_reference_no'] ?? null) : null,
+            'dp_payment_method' => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($amountPaid ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null,
+            'dp_reference_no'   => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($amountPaid ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null,
             'subtotal'       => $grossSubtotal,
             'discount_amount'=> $discInfo ? $discInfo['discount_amount'] : (float)$transactions->sum('discount_amount'),
             'discount_name'  => $discInfo ? $discInfo['discount_name'] : $first->discount_name,
@@ -1726,10 +1824,11 @@ class TransactionController extends Controller
         $tableNumber = $existing->table_number;
         $customerName = $existing->customer_name;
         $orderType = $existing->order_type;
+        $existingPaymentMethod = $existing->payment_method ?: 'CASH';
 
         $businessId = (int)($request->user()->business_id ?: ($existing->business_id ?: ($existing->outlet?->business_id ?: 1)));
         $addedTransactions = DB::transaction(function () use (
-            $data, $orderNumber, $date, $shiftId, $outletId, $businessId, $tableNumber, $customerName, $orderType, $request
+            $data, $orderNumber, $date, $shiftId, $outletId, $businessId, $tableNumber, $customerName, $orderType, $existingPaymentMethod, $request
         ) {
             $created = [];
             foreach ($data['items'] as $it) {
@@ -1753,7 +1852,9 @@ class TransactionController extends Controller
                     'customer_name'  => $customerName,
                     'order_type'     => $orderType,
                     'table_number'   => $tableNumber,
-                    'payment_method' => 'CASH',
+                    'payment_method' => $existingPaymentMethod,
+                    'amount_paid'    => 0,
+                    'change_amount'  => 0,
                     'notes'          => $it['notes'] ?? null,
                     'user_id'        => $request->user()->id,
                     'created_by'     => $request->user()->id,
@@ -1834,7 +1935,7 @@ class TransactionController extends Controller
                     }
                 }
 
-                $trx->load(['menu', 'modifiers.ingredient']);
+                $trx->load(['menu', 'modifiers.ingredient', 'urgentNotes.ingredient']);
                 $created[] = $trx;
             }
             return $created;
@@ -1959,8 +2060,27 @@ class TransactionController extends Controller
                             foreach ($recipe->items as $rItem) {
                                 $ing = $rItem->ingredient;
                                 if (!$ing) continue;
-                                $neededQty = (float)$rItem->qty * $itemQty;
-                                $ingCost = (float)($ing->cost_per_unit ?: $ing->price ?: 0);
+                                $neededQty = abs((float)$rItem->qty * $itemQty);
+
+                                // Calculate real cost per unit pakai (supporting batch cooked / semi-finished products)
+                                $ingCost = (float)$ing->costPerPakaiForOutlet($outletId);
+                                $lastMovement = StockMovement::where('ingredient_id', $ing->id)
+                                    ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+                                    ->whereIn('type', ['PURCHASE', 'TRANSFER_IN', 'INITIAL', 'PREP_OUTPUT', 'ADJUSTMENT_IN'])
+                                    ->latest('date')
+                                    ->latest('id')
+                                    ->first();
+                                if ($lastMovement) {
+                                    if ((float)$lastMovement->cost_after > 0) {
+                                        $ingCost = (float)$lastMovement->cost_after;
+                                    } elseif ((float)$lastMovement->unit_price > 0) {
+                                        $ingCost = (float)$lastMovement->unit_price;
+                                    }
+                                }
+                                if ($ingCost <= 0) {
+                                    $ingCost = (float)($ing->harga / max((float)$ing->konversi, 1));
+                                }
+
                                 $itemTotalCost = round($neededQty * $ingCost, 2);
                                 $realCost += $itemTotalCost;
 
@@ -1970,9 +2090,11 @@ class TransactionController extends Controller
                                     'outlet_id'      => $outletId,
                                     'type'           => 'WASTE',
                                     'waste_reason'   => $wasteCategory,
-                                    'qty'            => -$neededQty,
+                                    'qty'            => $neededQty,
                                     'unit_price'     => $ingCost,
                                     'total_price'    => $itemTotalCost,
+                                    'cost_before'    => $ingCost,
+                                    'cost_after'     => $ingCost,
                                     'date'           => $dateStr,
                                     'note'           => "Void Wasted Open Bill #{$orderNumber} ({$menu->name} {$itemQty}x) [{$wasteCategory}]: {$reason}",
                                     'created_by'     => $approver->id,
@@ -2053,9 +2175,23 @@ class TransactionController extends Controller
                     'status'              => 'CANCELLED',
                     'void_type'           => $voidType,
                     'cancellation_reason' => $reason,
+                    'cancelled_at'        => $now,
+                    'cancelled_by'        => $approver->id,
+                    'void_requested_by'   => $user->id,
+                    'void_requested_at'   => $now,
+                    'void_approved_by'    => $approver->id,
+                    'void_approved_at'    => $now,
                     'notes'               => ($t->notes ? $t->notes . ' | ' : '') . "[VOID: {$voidType} - {$reason} (Oleh: {$approver->name})]",
                     'updated_by'          => $user->id,
                 ]);
+
+                // Batalkan UrgentNote yang masih PENDING untuk open bill yang dibatalkan (simpan sebagai CANCELLED untuk jejak audit & jurnal)
+                UrgentNote::where('transaction_id', $t->id)
+                    ->where('status', 'PENDING')
+                    ->update([
+                        'status' => 'CANCELLED',
+                        'notes'  => DB::raw("CONCAT(COALESCE(notes, ''), ' [Void " . ($isWasted ? 'Wasted' : 'Salah Input') . ": " . addslashes($reason) . "]')"),
+                    ]);
             }
         });
 
@@ -2156,8 +2292,9 @@ class TransactionController extends Controller
         $now = now();
 
         $createdWasteLogs = [];
+        $cancelledTrx = null;
 
-        DB::transaction(function () use ($targetTrx, $voidQty, $voidType, $isWasted, $wasteCategory, $reason, $approver, $user, $now, &$createdWasteLogs) {
+        DB::transaction(function () use ($targetTrx, $voidQty, $voidType, $isWasted, $wasteCategory, $reason, $approver, $user, $now, &$createdWasteLogs, &$cancelledTrx) {
             $menu = $targetTrx->menu;
             $unitPrice = (float)$targetTrx->qty > 0 ? ((float)$targetTrx->total_price / (float)$targetTrx->qty) : (float)($menu?->price ?? 0);
             $unitSubtotal = (float)$targetTrx->qty > 0 ? ((float)$targetTrx->subtotal / (float)$targetTrx->qty) : $unitPrice;
@@ -2178,8 +2315,27 @@ class TransactionController extends Controller
                         foreach ($recipe->items as $rItem) {
                             $ing = $rItem->ingredient;
                             if (!$ing) continue;
-                            $neededQty = (float)$rItem->qty * $voidQty;
-                            $ingCost = (float)($ing->cost_per_unit ?: $ing->price ?: 0);
+                            $neededQty = abs((float)$rItem->qty * $voidQty);
+
+                            // Calculate real cost per unit pakai (supporting batch cooked / semi-finished products)
+                            $ingCost = (float)$ing->costPerPakaiForOutlet($outletId);
+                            $lastMovement = StockMovement::where('ingredient_id', $ing->id)
+                                ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+                                ->whereIn('type', ['PURCHASE', 'TRANSFER_IN', 'INITIAL', 'PREP_OUTPUT', 'ADJUSTMENT_IN'])
+                                ->latest('date')
+                                ->latest('id')
+                                ->first();
+                            if ($lastMovement) {
+                                if ((float)$lastMovement->cost_after > 0) {
+                                    $ingCost = (float)$lastMovement->cost_after;
+                                } elseif ((float)$lastMovement->unit_price > 0) {
+                                    $ingCost = (float)$lastMovement->unit_price;
+                                }
+                            }
+                            if ($ingCost <= 0) {
+                                $ingCost = (float)($ing->harga / max((float)$ing->konversi, 1));
+                            }
+
                             $itemTotalCost = round($neededQty * $ingCost, 2);
                             $realCost += $itemTotalCost;
 
@@ -2190,9 +2346,11 @@ class TransactionController extends Controller
                                 'outlet_id'      => $outletId,
                                 'type'           => 'WASTE',
                                 'waste_reason'   => $wasteCategory,
-                                'qty'            => -$neededQty,
+                                'qty'            => $neededQty,
                                 'unit_price'     => $ingCost,
                                 'total_price'    => $itemTotalCost,
+                                'cost_before'    => $ingCost,
+                                'cost_after'     => $ingCost,
                                 'date'           => $dateStr,
                                 'note'           => "Void Wasted Open Bill #{$targetTrx->order_number} ({$menu->name} {$voidQty}x) [{$wasteCategory}]: {$reason}",
                                 'created_by'     => $approver->id,
@@ -2285,6 +2443,14 @@ class TransactionController extends Controller
                     'notes'               => trim(($targetTrx->notes ?? '') . " [VOID ITEM {$typeLabel} ({$approver->name}): {$reason}]"),
                     'updated_by'          => $approver->id,
                 ]);
+
+                // Batalkan UrgentNote yang masih PENDING untuk transaksi yang di-void penuh (simpan sebagai CANCELLED untuk jejak audit & jurnal)
+                UrgentNote::where('transaction_id', $targetTrx->id)
+                    ->where('status', 'PENDING')
+                    ->update([
+                        'status' => 'CANCELLED',
+                        'notes'  => DB::raw("CONCAT(COALESCE(notes, ''), ' [Void " . ($isWasted ? 'Wasted' : 'Salah Input') . ": " . addslashes($reason) . "]')"),
+                    ]);
             } else {
                 // Partial void: reduce qty on original HOLD row, create CANCELLED row for audit trail
                 $remainingQty = (int)$targetTrx->qty - $voidQty;
@@ -2298,6 +2464,22 @@ class TransactionController extends Controller
                         $sm->update([
                             'qty'         => $newQty,
                             'total_price' => round($newQty * (float)$sm->unit_price, 2),
+                        ]);
+                    }
+                }
+
+                // Adjust UrgentNotes proportionally
+                $unList = UrgentNote::where('transaction_id', $targetTrx->id)->where('status', 'PENDING')->get();
+                foreach ($unList as $un) {
+                    if ($remainingQty <= 0) {
+                        $un->update([
+                            'status' => 'CANCELLED',
+                            'notes'  => DB::raw("CONCAT(COALESCE(notes, ''), ' [Void " . ($isWasted ? 'Wasted' : 'Salah Input') . ": " . addslashes($reason) . "]')"),
+                        ]);
+                    } elseif ($originalQty > 0) {
+                        $un->update([
+                            'required_qty' => round(((float)$un->required_qty / $originalQty) * $remainingQty, 4),
+                            'pending_qty'  => round(((float)$un->pending_qty / $originalQty) * $remainingQty, 4),
                         ]);
                     }
                 }
@@ -2341,6 +2523,9 @@ class TransactionController extends Controller
 
         // Auto-post / update double-entry journal for voided item
         AccountingService::postTransaction($targetTrx);
+        if ($cancelledTrx) {
+            AccountingService::postTransaction($cancelledTrx);
+        }
 
         // Auto-post waste loss journals if void type is WASTED
         foreach ($createdWasteLogs as $wl) {
@@ -3155,7 +3340,9 @@ class TransactionController extends Controller
         $pendingOrderNumbers = $pendingTrx->pluck('order_number')->unique()->count();
         $pendingTotalAmount = (float)$pendingTrx->sum('total_price');
 
-        $approvedTrx = (clone $statsQuery)->where('status', 'CANCELLED')->whereNotNull('void_approved_at')->get();
+        $approvedTrx = (clone $statsQuery)->where('status', 'CANCELLED')->where(function ($q) {
+            $q->whereNotNull('void_approved_at')->orWhereNotNull('cancellation_reason');
+        })->get();
         $approvedOrderNumbers = $approvedTrx->pluck('order_number')->unique()->count();
         $approvedTotalAmount = (float)$approvedTrx->sum('total_price');
         $approvedWastedCount = $approvedTrx->where('void_type', 'WASTED')->pluck('order_number')->unique()->count();
@@ -3484,13 +3671,13 @@ class TransactionController extends Controller
             // Deduct SaaS platform coins for completed split sub-nota
             CoinService::deductForOrder($businessId, $subOrderNumber, $outletId, $request->user()->id);
 
+            // Auto-post double-entry journal ledger inside the database transaction
+            foreach ($paidRows as $pTrx) {
+                AccountingService::postTransaction($pTrx);
+            }
+
             return $paidRows;
         });
-
-        // Auto-post double-entry journal ledger for split items
-        foreach ($paidResult as $pTrx) {
-            AccountingService::postTransaction($pTrx);
-        }
 
         // Check remaining items on the table
         $remainingHold = Transaction::where('order_number', $orderNumber)
@@ -3501,10 +3688,17 @@ class TransactionController extends Controller
         $remainingTotal = (float)$remainingHold->sum('total_price');
         $remainingItemsCount = (int)$remainingHold->sum('qty');
 
+        $splitFirst = $targetTransactions->first();
+        $splitOutlet = $splitFirst?->outlet ? $splitFirst->outlet->loadMissing('business') : null;
+
         return response()->json([
             'message'              => "Pembayaran Split Bill Bagian {$splitIndex} ({$subOrderNumber}) berhasil!",
             'order_number'         => $subOrderNumber,
             'parent_order_number'  => $orderNumber,
+            'business_name'        => $splitOutlet?->business?->name ?? 'MOVA POS',
+            'outlet_name'          => $splitOutlet?->name ?? 'Outlet',
+            'outlet_address'       => $splitOutlet?->address,
+            'outlet_phone'         => $splitOutlet?->phone,
             'split_index'          => $splitIndex,
             'split_type'           => 'BY_ITEM',
             'table_number'         => $tableNumber,
@@ -3643,7 +3837,7 @@ class TransactionController extends Controller
                 : ($first->date ?: now()->toDateString());
 
             // Create a payment record for this equal split installment
-            Transaction::create([
+            $splitTrx = Transaction::create([
                 'order_number'        => $subOrderNumber,
                 'parent_order_number' => $orderNumber,
                 'split_index'         => $splitIndex,
@@ -3684,20 +3878,23 @@ class TransactionController extends Controller
 
             // Deduct SaaS platform coins for completed split sub-nota
             CoinService::deductForOrder($businessId, $subOrderNumber, $first->outlet_id, $request->user()->id);
+
+            // Auto-post double-entry journal ledger inside the database transaction
+            AccountingService::postTransaction($splitTrx);
         });
 
-        // Auto-post double-entry journal ledger for split evenly
-        $splitTrxs = Transaction::where('order_number', $subOrderNumber)->get();
-        foreach ($splitTrxs as $st) {
-            AccountingService::postTransaction($st);
-        }
-
         $remainingTotal = max(0, $tableTotal - ($splitAmount * $newPaidSplitsCount));
+
+        $splitOutlet = $first?->outlet ? $first->outlet->loadMissing('business') : null;
 
         return response()->json([
             'message'              => "Pembayaran Patungan Bagian {$splitIndex}/{$totalSplits} berhasil!",
             'order_number'         => $subOrderNumber,
             'parent_order_number'  => $orderNumber,
+            'business_name'        => $splitOutlet?->business?->name ?? 'MOVA POS',
+            'outlet_name'          => $splitOutlet?->name ?? 'Outlet',
+            'outlet_address'       => $splitOutlet?->address,
+            'outlet_phone'         => $splitOutlet?->phone,
             'split_index'          => $splitIndex,
             'split_total'          => $totalSplits,
             'split_type'           => 'EQUAL',
@@ -3729,12 +3926,9 @@ class TransactionController extends Controller
 
     public function destroy(Transaction $transaction)
     {
-        DB::transaction(function () use ($transaction) {
-            $transaction->stockMovements()->delete();
-            AccountingService::postTransaction($transaction);
-            $transaction->delete();
-        });
-
-        return response()->json(['message' => 'Transaksi dibatalkan']);
+        return response()->json([
+            'message' => 'Dilarang menghapus transaksi penjualan! Data transaksi yang sudah tercatat tidak boleh dihapus secara permanen agar riwayat keuangan, laporan kasir, kartu stok, dan audit trail tidak hilang. Silakan gunakan fitur Void / Pembatalan resmi kasir melalui otorisasi supervisor jika transaksi perlu dibatalkan.',
+            'error'   => 'TRANSACTION_DELETION_FORBIDDEN',
+        ], 422);
     }
 }

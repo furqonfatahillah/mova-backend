@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\BatchPrep;
 use App\Models\Ingredient;
 use App\Models\Outlet;
+use App\Models\OutletIngredient;
 use App\Models\PrepRecipe;
 use App\Models\PrepRecipeItem;
 use App\Models\StockMovement;
@@ -24,6 +25,13 @@ class BatchPrepController extends Controller
     {
         $user = $request->user();
         $businessId = $user ? $user->business_id : null;
+
+        // Auto-heal units between prep recipes and semi-finished ingredients
+        try {
+            self::syncSemiFinishedUnits($businessId);
+        } catch (\Throwable $e) {
+            // non-blocking
+        }
 
         $query = PrepRecipe::with([
             'ingredient.outletIngredients',
@@ -58,9 +66,9 @@ class BatchPrepController extends Controller
 
         $recipes = $query->get();
         $recipes->each(function ($r) {
-            $r->ingredient?->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+            $r->ingredient?->append(['current_stock', 'current_stok_min', 'outlet_stocks', 'has_initial_balance']);
             $r->items?->each(function ($it) {
-                $it->ingredient?->append(['current_stock', 'current_stok_min', 'outlet_stocks']);
+                $it->ingredient?->append(['current_stock', 'current_stok_min', 'outlet_stocks', 'has_initial_balance']);
             });
         });
 
@@ -92,15 +100,46 @@ class BatchPrepController extends Controller
         $user = $request->user();
         $businessId = $user ? $user->business_id : null;
 
+        // Validasi: Bahan mentah pendukung resep olahan wajib memiliki Saldo Awal
+        $itemIngIds = array_column($data['items'], 'ingredient_id');
+        $rawIngs = Ingredient::with(['outletIngredients'])->whereIn('id', $itemIngIds)->get()->keyBy('id');
+        foreach ($data['items'] as $it) {
+            $rawIng = $rawIngs->get($it['ingredient_id']);
+            if ($rawIng && !$rawIng->hasInitialBalance()) {
+                return response()->json([
+                    'message' => "Bahan '{$rawIng->name}' ({$rawIng->code}) belum memiliki Saldo Awal. Silakan masukkan Saldo Awal terlebih dahulu di Master Bahan atau Kartu Stok sebelum membuat/mengubah resep olahan.",
+                    'errors'  => [
+                        'items' => ["Bahan '{$rawIng->name}' ({$rawIng->code}) belum memiliki Saldo Awal."]
+                    ],
+                ], 422);
+            }
+        }
+
         return DB::transaction(function () use ($data, $request, $businessId) {
+            $unitInfo = IngredientController::resolveUnit($data['output_unit'], $businessId, 'gram');
+            $canonicalOutputUnit = $unitInfo['symbol'];
+
             if (!empty($data['ingredient_id'])) {
                 $ingredient = Ingredient::findOrFail($data['ingredient_id']);
+                $oldUnitPakai = $ingredient->unit_pakai;
                 $ingredient->type = 'SEMI_FINISHED';
                 $ingredient->yield_qty = $data['output_qty'];
-                $ingredient->yield_unit = $data['output_unit'];
+                $ingredient->yield_unit = $canonicalOutputUnit;
+                $ingredient->unit_pakai = $canonicalOutputUnit;
+                if (!empty($unitInfo['id'])) {
+                    $ingredient->unit_pakai_id = $unitInfo['id'];
+                }
+
+                if (empty($ingredient->unit_beli) || strtolower((string)$ingredient->unit_beli) === strtolower((string)$oldUnitPakai) || (float)$ingredient->konversi <= 1) {
+                    $ingredient->unit_beli = $canonicalOutputUnit;
+                    if (!empty($unitInfo['id'])) {
+                        $ingredient->unit_beli_id = $unitInfo['id'];
+                    }
+                    $ingredient->konversi = 1;
+                }
+
                 if (isset($data['name'])) $ingredient->name = $data['name'];
                 if (isset($data['category'])) $ingredient->category = $data['category'];
-                if (isset($data['stok_min'])) $ingredient->stok_min = $data['stok_min'];
                 if ($businessId && !$ingredient->business_id) $ingredient->business_id = $businessId;
                 $ingredient->save();
             } else {
@@ -117,23 +156,43 @@ class BatchPrepController extends Controller
                 }
 
                 $ingredient = Ingredient::create([
-                    'business_id' => $businessId,
-                    'code'        => $code,
-                    'name'        => $data['name'],
-                    'category'    => $data['category'] ?? 'Bahan Olahan',
-                    'type'        => 'SEMI_FINISHED',
-                    'unit_beli'   => $data['output_unit'],
-                    'unit_pakai'  => $data['output_unit'],
-                    'konversi'    => 1,
-                    'harga'       => 0,
-                    'stok_awal'   => 0,
-                    'stok_min'    => $data['stok_min'] ?? 0,
-                    'tolerance'   => 0,
-                    'yield_qty'   => $data['output_qty'],
-                    'yield_unit'  => $data['output_unit'],
-                    'active'      => true,
-                    'created_by'  => $request->user()?->id,
+                    'business_id'   => $businessId,
+                    'code'          => $code,
+                    'name'          => $data['name'],
+                    'category'      => $data['category'] ?? 'Bahan Olahan',
+                    'type'          => 'SEMI_FINISHED',
+                    'unit_beli'     => $canonicalOutputUnit,
+                    'unit_beli_id'  => $unitInfo['id'] ?? null,
+                    'unit_pakai'    => $canonicalOutputUnit,
+                    'unit_pakai_id' => $unitInfo['id'] ?? null,
+                    'konversi'      => 1,
+                    'harga'         => 0,
+                    'tolerance'     => 0,
+                    'yield_qty'     => $data['output_qty'],
+                    'yield_unit'    => $canonicalOutputUnit,
+                    'active'        => true,
+                    'created_by'    => $request->user()?->id,
                 ]);
+            }
+
+            // Ensure OutletIngredient (Table 3) and IngredientInitialBalance (Table 2) initialized for all outlets
+            $outlets = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->get();
+            if ($outlets->isEmpty()) {
+                $outlets = Outlet::all();
+            }
+            foreach ($outlets as $ot) {
+                $oi = OutletIngredient::firstOrCreate(
+                    ['outlet_id' => $ot->id, 'ingredient_id' => $ingredient->id],
+                    ['current_stock' => 0, 'stok_min' => (float)($data['stok_min'] ?? 0)]
+                );
+                if (isset($data['stok_min'])) {
+                    $oi->stok_min = (float)$data['stok_min'];
+                    $oi->save();
+                }
+                \App\Models\IngredientInitialBalance::firstOrCreate(
+                    ['outlet_id' => $ot->id, 'ingredient_id' => $ingredient->id],
+                    ['stok_awal' => 0, 'saldo_awal_nominal' => 0, 'business_id' => $businessId]
+                );
             }
 
             // Find existing prep recipe or create new
@@ -149,7 +208,7 @@ class BatchPrepController extends Controller
 
             $prepRecipe->name = $data['name'];
             $prepRecipe->output_qty = $data['output_qty'];
-            $prepRecipe->output_unit = $data['output_unit'];
+            $prepRecipe->output_unit = $canonicalOutputUnit;
             $prepRecipe->notes = $data['notes'] ?? null;
             $prepRecipe->updated_by = $request->user()?->id;
             $prepRecipe->save();
@@ -218,18 +277,45 @@ class BatchPrepController extends Controller
         ]);
 
         return DB::transaction(function () use ($data, $request, $prepRecipe) {
+            $businessId = $prepRecipe->business_id ?? $request->user()?->business_id;
+
             if (isset($data['name'])) $prepRecipe->name = $data['name'];
             if (isset($data['output_qty'])) $prepRecipe->output_qty = $data['output_qty'];
-            if (isset($data['output_unit'])) $prepRecipe->output_unit = $data['output_unit'];
+            $unitInfo = null;
+            if (isset($data['output_unit'])) {
+                $unitInfo = IngredientController::resolveUnit($data['output_unit'], $businessId, 'gram');
+                $prepRecipe->output_unit = $unitInfo['symbol'];
+            }
             if (array_key_exists('notes', $data)) $prepRecipe->notes = $data['notes'];
             $prepRecipe->updated_by = $request->user()?->id;
             $prepRecipe->save();
 
-            // Update associated ingredient yield info if changed
+            // Update associated ingredient yield info and usage units
             if ($prepRecipe->ingredient) {
-                $prepRecipe->ingredient->yield_qty = $prepRecipe->output_qty;
-                $prepRecipe->ingredient->yield_unit = $prepRecipe->output_unit;
-                $prepRecipe->ingredient->save();
+                $ingredient = $prepRecipe->ingredient;
+                $oldUnitPakai = $ingredient->unit_pakai;
+
+                $ingredient->type = 'SEMI_FINISHED';
+                $ingredient->yield_qty = $prepRecipe->output_qty;
+                $ingredient->yield_unit = $prepRecipe->output_unit;
+                $ingredient->unit_pakai = $prepRecipe->output_unit;
+
+                if ($unitInfo && !empty($unitInfo['id'])) {
+                    $ingredient->unit_pakai_id = $unitInfo['id'];
+                }
+
+                if (empty($ingredient->unit_beli) || strtolower((string)$ingredient->unit_beli) === strtolower((string)$oldUnitPakai) || (float)$ingredient->konversi <= 1) {
+                    $ingredient->unit_beli = $prepRecipe->output_unit;
+                    if ($unitInfo && !empty($unitInfo['id'])) {
+                        $ingredient->unit_beli_id = $unitInfo['id'];
+                    }
+                    $ingredient->konversi = 1;
+                }
+
+                if (isset($data['name'])) {
+                    $ingredient->name = $data['name'];
+                }
+                $ingredient->save();
             }
 
             if (isset($data['items'])) {
@@ -255,8 +341,151 @@ class BatchPrepController extends Controller
      */
     public function destroyRecipe(PrepRecipe $prepRecipe)
     {
+        $reasons = [];
+        if (\App\Models\BatchPrep::where('prep_recipe_id', $prepRecipe->id)->exists()) {
+            $reasons[] = 'riwayat produksi batch prep';
+        }
+        if (\App\Models\RecipeItem::where('ingredient_id', $prepRecipe->ingredient_id)->exists()) {
+            $reasons[] = 'resep Master Menu';
+        }
+        if (\App\Models\StockMovement::where('ingredient_id', $prepRecipe->ingredient_id)->exists()) {
+            $reasons[] = 'mutasi kartu stok bahan olahan';
+        }
+
+        if (!empty($reasons)) {
+            $reasonStr = implode(', ', $reasons);
+            return response()->json([
+                'message' => "Dilarang menghapus resep olahan '{$prepRecipe->name}'! Resep ini sudah digunakan dalam {$reasonStr}. Menghapus resep ini akan merusak integritas riwayat produksi dan kartu stok.",
+                'error'   => 'PREP_RECIPE_LOCKED_BY_USAGE',
+            ], 422);
+        }
+
+        $prepRecipe->items()->delete();
         $prepRecipe->delete();
         return response()->json(['message' => 'Resep olahan berhasil dihapus']);
+    }
+
+    /**
+     * Synchronize and heal unit consistency between prep recipes and semi-finished ingredients.
+     * Ensures output_unit == unit_pakai == yield_unit == unit_beli (when konversi <= 1).
+     */
+    public static function syncSemiFinishedUnits($businessId = null)
+    {
+        $recipes = PrepRecipe::with('ingredient')
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->get();
+
+        foreach ($recipes as $recipe) {
+            $ingredient = $recipe->ingredient;
+            if (!$ingredient) continue;
+
+            $changed = false;
+            if ($ingredient->type !== 'SEMI_FINISHED') {
+                $ingredient->type = 'SEMI_FINISHED';
+                $changed = true;
+            }
+
+            $outputUnit = trim($recipe->output_unit ?? '');
+            if (!empty($outputUnit)) {
+                $unitPakaiInfo = IngredientController::resolveUnit($outputUnit, $ingredient->business_id, 'gram');
+                $canonicalUnit = $unitPakaiInfo['symbol'];
+
+                if ($recipe->output_unit !== $canonicalUnit) {
+                    $recipe->output_unit = $canonicalUnit;
+                    $recipe->saveQuietly();
+                }
+
+                if (strtolower((string)$ingredient->unit_pakai) !== strtolower($canonicalUnit)) {
+                    $oldPakai = $ingredient->unit_pakai;
+                    $ingredient->unit_pakai = $canonicalUnit;
+                    $ingredient->unit_pakai_id = $unitPakaiInfo['id'] ?? null;
+                    $ingredient->yield_unit = $canonicalUnit;
+                    if (empty($ingredient->unit_beli) || strtolower((string)$ingredient->unit_beli) === strtolower((string)$oldPakai) || (float)$ingredient->konversi <= 1) {
+                        $ingredient->unit_beli = $canonicalUnit;
+                        $ingredient->unit_beli_id = $unitPakaiInfo['id'] ?? null;
+                        $ingredient->konversi = 1;
+                    }
+                    $changed = true;
+                } elseif ($ingredient->yield_unit !== $canonicalUnit) {
+                    $ingredient->yield_unit = $canonicalUnit;
+                    $changed = true;
+                }
+            }
+
+            if (!empty($recipe->output_qty) && (float)$ingredient->yield_qty !== (float)$recipe->output_qty) {
+                $ingredient->yield_qty = $recipe->output_qty;
+                $changed = true;
+            }
+
+            if ($changed) {
+                $ingredient->saveQuietly();
+            }
+        }
+
+        // Also heal any orphan or direct SEMI_FINISHED ingredients where unit_pakai != yield_unit
+        $semiIngredients = Ingredient::where('type', 'SEMI_FINISHED')
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->get();
+        foreach ($semiIngredients as $sf) {
+            $u = $sf->yield_unit ?: $sf->unit_pakai;
+            if ($u) {
+                $uInfo = IngredientController::resolveUnit($u, $sf->business_id, 'gram');
+                $sym = $uInfo['symbol'];
+                $c = false;
+                if ($sf->unit_pakai !== $sym) {
+                    $sf->unit_pakai = $sym;
+                    $sf->unit_pakai_id = $uInfo['id'] ?? null;
+                    $c = true;
+                }
+                if ($sf->yield_unit !== $sym) {
+                    $sf->yield_unit = $sym;
+                    $c = true;
+                }
+                if ((float)$sf->konversi <= 1 && $sf->unit_beli !== $sym) {
+                    $sf->unit_beli = $sym;
+                    $sf->unit_beli_id = $uInfo['id'] ?? null;
+                    $sf->konversi = 1;
+                    $c = true;
+                }
+                if ($c) {
+                    $sf->saveQuietly();
+                }
+            }
+        }
+
+        // Auto-heal OutletIngredient rows and isolated current_stock for all semi-finished goods
+        $allOutlets = Outlet::when($businessId, fn($q) => $q->where('business_id', $businessId))->get();
+        if ($allOutlets->isEmpty()) {
+            $allOutlets = Outlet::all();
+        }
+
+        foreach ($semiIngredients as $sf) {
+            $totalConsolidated = 0.0;
+            foreach ($allOutlets as $ot) {
+                $oi = OutletIngredient::firstOrCreate(
+                    ['outlet_id' => $ot->id, 'ingredient_id' => $sf->id],
+                    ['current_stock' => 0]
+                );
+
+                if ($oi->current_stock === null) {
+                    $movNet = (float)StockMovement::where('ingredient_id', $sf->id)
+                        ->where('outlet_id', $ot->id)
+                        ->where('type', '!=', 'INITIAL')
+                        ->selectRaw("SUM(CASE WHEN type IN ('PURCHASE','TRANSFER_IN','ADJUSTMENT_IN','ADJUSTMENT_PLUS','PREP_OUTPUT') THEN qty ELSE -qty END) as net_qty")
+                        ->value('net_qty') ?? 0.0;
+                    $initStock = (float)($oi->initialBalance?->stok_awal ?? 0);
+                    $oi->current_stock = round($initStock + $movNet, 3);
+                    $oi->saveQuietly();
+                }
+                $totalConsolidated += (float)$oi->current_stock;
+            }
+
+            // Sync consolidated stock at ingredient level
+            if (isset($sf->attributes['current_stock'])) {
+                $sf->current_stock = round($totalConsolidated, 3);
+                $sf->saveQuietly();
+            }
+        }
     }
 
     // ==========================================
@@ -606,11 +835,21 @@ class BatchPrepController extends Controller
                 'created_by'    => $request->user()?->id,
             ]);
 
+            // Hitung ulang moving average dan biaya pokok olahan
+            $semiFinishedIng->recomputeMovingAverageFromHistory($outletId);
+
             // Finalize BatchPrep with calculated costs
             $batchPrep->update([
                 'total_cost' => round($totalBatchCost, 2),
                 'unit_cost'  => $unitCost,
             ]);
+
+            // Catat jurnal akuntansi untuk batch prep (Persediaan Olahan pada Persediaan Bahan Baku)
+            try {
+                \App\Services\AccountingService::postBatchPrep($batchPrep);
+            } catch (\Throwable $e) {
+                \Illuminate\Support\Facades\Log::warning("Gagal mencatat jurnal batch prep: " . $e->getMessage());
+            }
 
             $batchPrep->load([
                 'ingredient',
@@ -645,6 +884,13 @@ class BatchPrepController extends Controller
     {
         return DB::transaction(function () use ($batchPrep) {
             $batchNo = $batchPrep->batch_no;
+            // Delete journal entries associated with this batch prep or its movements
+            $movIds = StockMovement::where('batch_prep_id', $batchPrep->id)->pluck('id');
+            if ($movIds->isNotEmpty()) {
+                \App\Models\JournalEntry::where('reference_type', 'STOCK_MOVEMENT')->whereIn('reference_id', $movIds)->delete();
+            }
+            \App\Models\JournalEntry::where('reference_type', 'BATCH_PREP')->where('reference_id', $batchPrep->id)->delete();
+
             // Delete all stock movements associated with this batch
             StockMovement::where('batch_prep_id', $batchPrep->id)->delete();
             $batchPrep->delete();

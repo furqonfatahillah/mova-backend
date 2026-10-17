@@ -44,10 +44,19 @@ class UserController extends Controller
             $query->where('business_id', $currentUser->business_id)
                   ->whereNotIn('role', $excludedRoles);
             if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
-                $query->where('outlet_id', $request->outlet_id);
+                $query->where(function ($q) use ($request) {
+                    $q->where('outlet_id', $request->outlet_id)
+                      ->orWhere('status', 'pending');
+                });
             }
             $baseCount = User::where('business_id', $currentUser->business_id)
                 ->whereNotIn('role', $excludedRoles);
+            if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+                $baseCount->where(function ($q) use ($request) {
+                    $q->where('outlet_id', $request->outlet_id)
+                      ->orWhere('status', 'pending');
+                });
+            }
             $counts = [
                 'total'     => (clone $baseCount)->count(),
                 'pending'   => (clone $baseCount)->where('status', 'pending')->count(),
@@ -121,6 +130,7 @@ class UserController extends Controller
             $query->whereIn('name', [
                 Role::OWNER_OUTLET,
                 Role::MANAGER_OUTLET,
+                Role::MANAGER,
                 Role::PEGAWAI,
                 Role::KASIR,
             ]);
@@ -135,6 +145,26 @@ class UserController extends Controller
         }
 
         return response()->json($query->get());
+    }
+
+    private function getAllowedRolesRule(User $currentUser): string
+    {
+        if ($currentUser->isPlatformAdmin()) {
+            return 'in:owner_bisnis,owner_website,superadmin_platform,owner_outlet,manager_outlet,manager,pegawai,kasir,admin,owner';
+        }
+        if ($currentUser->isOwnerBisnis()) {
+            return 'in:owner_outlet,manager_outlet,manager,pegawai,kasir,admin,owner';
+        }
+        return 'in:pegawai,kasir,manager,manager_outlet';
+    }
+
+    private function getValidationMessages(): array
+    {
+        return [
+            'role.in'       => 'Role yang dipilih tidak valid untuk hak akses Anda.',
+            'role.required' => 'Role akses wajib dipilih.',
+            'email.unique'  => 'Alamat email sudah terdaftar di sistem.',
+        ];
     }
 
     public function store(Request $request)
@@ -152,30 +182,30 @@ class UserController extends Controller
             }
         }
 
-        $allowedRoles = $currentUser->isPlatformAdmin()
-            ? 'in:owner_bisnis,owner_website,superadmin_platform,owner_outlet,pegawai,kasir,manager,admin,owner'
-            : ($currentUser->isOwnerBisnis()
-                ? 'in:owner_outlet,pegawai,kasir,manager'
-                : 'in:pegawai,kasir,manager');
-
         $data = $request->validate([
             'name'      => 'required|string|max:255',
             'email'     => 'required|email|unique:users',
             'password'  => 'required|string|min:6',
-            'role'      => 'required|' . $allowedRoles,
+            'role'      => 'required|' . $this->getAllowedRolesRule($currentUser),
             'outlet_id' => 'nullable|exists:outlets,id',
             'status'    => 'nullable|in:pending,active,rejected,suspended',
-        ]);
+        ], $this->getValidationMessages());
 
         // If Owner Outlet, force their own outlet_id
         if ($currentUser->isOwnerOutlet()) {
             $data['outlet_id'] = $currentUser->outlet_id;
-            if ($data['role'] === 'kasir' || $data['role'] === 'manager') {
+            if ($data['role'] === 'kasir' || $data['role'] === 'manager' || $data['role'] === 'manager_outlet') {
                 $data['role'] = 'pegawai';
             }
         }
 
         $status = $data['status'] ?? 'active';
+
+        $roleId = null;
+        if (!empty($data['role'])) {
+            $roleObj = Role::where('name', $data['role'])->first();
+            $roleId = $roleObj?->id;
+        }
 
         $user = User::create([
             'business_id' => $currentUser->business_id ?? $request->business_id ?? null,
@@ -183,6 +213,7 @@ class UserController extends Controller
             'email'       => $data['email'],
             'password'    => Hash::make($data['password']),
             'role'        => $data['role'],
+            'role_id'     => $roleId,
             'outlet_id'   => $data['outlet_id'] ?? null,
             'status'      => $status,
             'approved_by' => $status === 'active' ? $currentUser->id : null,
@@ -218,20 +249,14 @@ class UserController extends Controller
             }
         }
 
-        $allowedRoles = $currentUser->isPlatformAdmin()
-            ? 'in:owner_bisnis,owner_website,superadmin_platform,owner_outlet,pegawai,kasir,manager,admin,owner'
-            : ($currentUser->isOwnerBisnis()
-                ? 'in:owner_outlet,pegawai,kasir,manager'
-                : 'in:pegawai,kasir,manager');
-
         $data = $request->validate([
             'name'      => 'sometimes|string|max:255',
             'email'     => 'sometimes|email|unique:users,email,' . $user->id,
             'password'  => 'nullable|string|min:6',
-            'role'      => 'sometimes|' . $allowedRoles,
+            'role'      => 'sometimes|' . $this->getAllowedRolesRule($currentUser),
             'outlet_id' => 'nullable|exists:outlets,id',
             'status'    => 'sometimes|in:pending,active,rejected,suspended',
-        ]);
+        ], $this->getValidationMessages());
 
         if ($currentUser->isOwnerOutlet()) {
             unset($data['outlet_id']); // Cannot change outlet
@@ -248,6 +273,13 @@ class UserController extends Controller
             $data['approved_at'] = now();
         }
 
+        if (!empty($data['role'])) {
+            $roleObj = Role::where('name', $data['role'])->first();
+            if ($roleObj) {
+                $data['role_id'] = $roleObj->id;
+            }
+        }
+
         $user->update($data);
         $user->load(['approver', 'outlet']);
         return response()->json($user);
@@ -260,29 +292,40 @@ class UserController extends Controller
             return response()->json(['message' => 'Anda tidak berwenang menyetujui akun ini.'], 403);
         }
 
-        $allowedRoles = $currentUser->isPlatformAdmin()
-            ? 'in:owner_bisnis,owner_website,superadmin_platform,owner_outlet,pegawai,kasir,manager,admin,owner'
-            : ($currentUser->isOwnerBisnis()
-                ? 'in:owner_outlet,pegawai,kasir,manager'
-                : 'in:pegawai,kasir,manager');
-
         $data = $request->validate([
-            'role'      => 'nullable|' . $allowedRoles,
+            'role'      => 'nullable|' . $this->getAllowedRolesRule($currentUser),
             'outlet_id' => 'nullable|exists:outlets,id',
-        ]);
+        ], $this->getValidationMessages());
 
         $outletId = $currentUser->isOwnerOutlet() ? $currentUser->outlet_id : ($data['outlet_id'] ?? $user->outlet_id);
         $role = $currentUser->isOwnerOutlet() ? 'pegawai' : ($data['role'] ?? $user->role);
+        $roleId = $user->role_id;
+        if (!empty($role)) {
+            $roleObj = Role::where('name', $role)->first();
+            if ($roleObj) {
+                $roleId = $roleObj->id;
+            }
+        }
 
         $user->update([
             'status'      => 'active',
             'approved_by' => $currentUser->id,
             'approved_at' => now(),
             'role'        => $role,
+            'role_id'     => $roleId,
             'outlet_id'   => $outletId,
         ]);
 
-        $user->load(['approver', 'outlet']);
+        // Jika user adalah owner_bisnis dan bisnisnya masih pending, aktifkan bisnisnya
+        if ($user->role === 'owner_bisnis' && $user->business && $user->business->status === 'pending') {
+            $user->business->update([
+                'status'     => 'active',
+                'expires_at' => $user->business->expires_at && $user->business->expires_at->isFuture() ? $user->business->expires_at : now()->addMonths(1),
+                'updated_by' => $currentUser->id,
+            ]);
+        }
+
+        $user->load(['approver', 'outlet', 'business']);
         return response()->json([
             'message' => "Akun {$user->name} berhasil disetujui dan diaktifkan.",
             'user'    => $user,
@@ -302,8 +345,16 @@ class UserController extends Controller
             'approved_at' => now(),
         ]);
 
+        // Jika user adalah owner_bisnis dan bisnisnya masih pending, tolak juga bisnisnya
+        if ($user->role === 'owner_bisnis' && $user->business && $user->business->status === 'pending') {
+            $user->business->update([
+                'status'     => 'rejected',
+                'updated_by' => $currentUser->id,
+            ]);
+        }
+
         $user->tokens()->delete();
-        $user->load(['approver', 'outlet']);
+        $user->load(['approver', 'outlet', 'business']);
         return response()->json([
             'message' => "Permohonan akun {$user->name} telah ditolak.",
             'user'    => $user,

@@ -13,6 +13,7 @@ class OperatingExpense extends Model
     protected $fillable = [
         'business_id',
         'outlet_id',
+        'shift_id',
         'expense_no',
         'date',
         'category',
@@ -54,6 +55,7 @@ class OperatingExpense extends Model
             'MAINTENANCE' => 'Pemeliharaan, Sanitasi & Servis',
             'MARKETING'   => 'Pemasaran & Promosi',
             'LOGISTICS'   => 'Logistik & Transportasi',
+            'ADMIN_FEE'   => 'Biaya Admin Kas Aplikasi & Merchant',
             'OTHER'       => 'Beban Operasional Lain-lain',
         ];
     }
@@ -100,6 +102,11 @@ class OperatingExpense extends Model
     public function outlet()
     {
         return $this->belongsTo(Outlet::class);
+    }
+
+    public function shift()
+    {
+        return $this->belongsTo(Shift::class);
     }
 
     public function user()

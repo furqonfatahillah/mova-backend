@@ -206,6 +206,7 @@ class AccountController extends Controller
 
         $data = $request->validate([
             'code' => [
+                'sometimes',
                 'required',
                 'string',
                 'max:20',
@@ -215,10 +216,10 @@ class AccountController extends Controller
                     })
                     ->ignore($account->id),
             ],
-            'name'           => 'required|string|max:120',
-            'type'           => 'required|in:ASSET,LIABILITY,EQUITY,REVENUE,EXPENSE',
+            'name'           => 'sometimes|required|string|max:120',
+            'type'           => 'sometimes|required|in:ASSET,LIABILITY,EQUITY,REVENUE,EXPENSE',
             'category'       => 'nullable|string|max:50',
-            'normal_balance' => 'required|in:DEBIT,CREDIT',
+            'normal_balance' => 'sometimes|required|in:DEBIT,CREDIT',
             'description'    => 'nullable|string|max:2000',
             'is_active'      => 'nullable|boolean',
         ], [
@@ -226,16 +227,16 @@ class AccountController extends Controller
         ]);
 
         // If system account and code is modified, prevent changing system core code to maintain automation integrity
-        $newCode = trim($data['code']);
+        $newCode = isset($data['code']) ? trim($data['code']) : $account->code;
         if ($account->is_system && $account->code !== $newCode) {
             return response()->json([
                 'message' => "Kode akun bawaan sistem ({$account->code}) tidak dapat diubah agar tidak mengganggu posting jurnal otomatis. Anda dapat mengubah nama, kategori, atau deskripsinya.",
             ], 422);
         }
 
-        $parentCode = null;
-        $outletId = null;
-        if (str_contains($newCode, '.')) {
+        $parentCode = $account->parent_code;
+        $outletId = $account->outlet_id;
+        if (isset($data['code']) && str_contains($newCode, '.')) {
             $parts = explode('.', $newCode, 2);
             $parentCode = $parts[0];
             $sIdx = (int)$parts[1];
@@ -251,11 +252,11 @@ class AccountController extends Controller
             'parent_code'    => $parentCode,
             'outlet_id'      => $outletId,
             'code'           => $newCode,
-            'name'           => strtoupper(trim($data['name'])),
-            'type'           => strtoupper(trim($data['type'])),
-            'category'       => !empty($data['category']) ? strtoupper(trim($data['category'])) : null,
-            'normal_balance' => strtoupper(trim($data['normal_balance'])),
-            'description'    => !empty($data['description']) ? trim($data['description']) : null,
+            'name'           => isset($data['name']) ? strtoupper(trim($data['name'])) : $account->name,
+            'type'           => isset($data['type']) ? strtoupper(trim($data['type'])) : $account->type,
+            'category'       => array_key_exists('category', $data) ? (!empty($data['category']) ? strtoupper(trim($data['category'])) : null) : $account->category,
+            'normal_balance' => isset($data['normal_balance']) ? strtoupper(trim($data['normal_balance'])) : $account->normal_balance,
+            'description'    => array_key_exists('description', $data) ? (!empty($data['description']) ? trim($data['description']) : null) : $account->description,
             'is_active'      => $request->has('is_active') ? $request->boolean('is_active') : $account->is_active,
         ]);
 

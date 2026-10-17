@@ -496,6 +496,113 @@ class JournalController extends Controller
     }
 
     /**
+     * List Chronological Journal Entries (Jurnal Umum)
+     */
+    public function journals(Request $request)
+    {
+        $from = $request->input('from', date('Y-m-01'));
+        $to   = $request->input('to', date('Y-m-d'));
+
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
+
+        $query = JournalEntry::with(['lines.account', 'lines.outlet', 'outlet', 'creator'])
+            ->whereBetween('entry_date', [$from, $to]);
+
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
+
+        if ($outletId) {
+            $query->where(function ($q) use ($outletId) {
+                $q->where('outlet_id', $outletId)
+                  ->orWhereHas('lines', fn($l) => $l->where('outlet_id', $outletId));
+            });
+        }
+
+        if ($request->filled('entry_type') && $request->entry_type !== 'ALL') {
+            $query->where('entry_type', $request->entry_type);
+        }
+
+        if ($request->filled('search')) {
+            $search = '%' . trim($request->search) . '%';
+            $query->where(function ($q) use ($search) {
+                $q->where('entry_no', 'like', $search)
+                  ->orWhere('description', 'like', $search)
+                  ->orWhereHas('lines', function ($l) use ($search) {
+                      $l->where('account_code', 'like', $search)
+                        ->orWhere('memo', 'like', $search)
+                        ->orWhereHas('account', fn($a) => $a->where('name', 'like', $search));
+                  });
+            });
+        }
+
+        // Summary metrics
+        $summaryQuery = clone $query;
+        $totalEntries = $summaryQuery->count();
+        $totalDebit   = (float)$summaryQuery->sum('total_debit');
+        $totalCredit  = (float)$summaryQuery->sum('total_credit');
+        $balancedCount = (clone $summaryQuery)->where('is_balanced', true)->count();
+
+        $limit = (int)$request->input('limit', 200);
+        $entries = $query->orderBy('entry_date', 'desc')
+            ->orderBy('id', 'desc')
+            ->limit($limit)
+            ->get();
+
+        $items = $entries->map(function ($entry) {
+            return [
+                'id'             => $entry->id,
+                'entry_no'       => $entry->entry_no,
+                'entry_date'     => (string)$entry->entry_date,
+                'entry_type'     => $entry->entry_type,
+                'reference_type' => $entry->reference_type,
+                'reference_id'   => $entry->reference_id,
+                'description'    => $entry->description,
+                'total_debit'    => (float)$entry->total_debit,
+                'total_credit'   => (float)$entry->total_credit,
+                'difference'     => round((float)$entry->total_debit - (float)$entry->total_credit, 2),
+                'is_balanced'    => (bool)$entry->is_balanced,
+                'outlet_id'      => $entry->outlet_id,
+                'outlet_name'    => $entry->outlet?->name ?: 'Maroa – Cabang Utama (Pusat)',
+                'creator_name'   => $entry->creator?->name ?: 'Sistem Akuntansi',
+                'created_at'     => $entry->created_at?->toDateTimeString(),
+                'lines'          => $entry->lines->map(fn($l) => [
+                    'id'           => $l->id,
+                    'account_code' => $l->account_code,
+                    'account_name' => $l->account?->name ?: "Akun {$l->account_code}",
+                    'debit'        => (float)$l->debit,
+                    'credit'       => (float)$l->credit,
+                    'memo'         => $l->memo,
+                    'outlet_name'  => $l->outlet?->name ?: '',
+                ]),
+            ];
+        });
+
+        return response()->json([
+            'period' => [
+                'from' => $from,
+                'to'   => $to,
+            ],
+            'summary' => [
+                'total_entries'  => $totalEntries,
+                'total_debit'    => round($totalDebit, 2),
+                'total_credit'   => round($totalCredit, 2),
+                'balanced_count' => $balancedCount,
+                'is_balanced'    => round($totalDebit - $totalCredit, 2) === 0.0,
+            ],
+            'entries' => $items,
+        ]);
+    }
+
+    /**
      * Resynchronize & Re-post All Journals from Operational Data
      */
     public function syncAllJournals(Request $request)
@@ -513,4 +620,411 @@ class JournalController extends Controller
             'stats'   => $stats,
         ]);
     }
+
+    /**
+     * List Abnormal / Anomalous Journal Entries for Audit & Monitoring
+     */
+    public function abnormalJournals(Request $request)
+    {
+        $from = $request->input('from', date('Y-m-01'));
+        $to   = $request->input('to', date('Y-m-d'));
+
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
+        $outletId = null;
+        if ($isOutletBounded) {
+            $outletId = (int)$user->outlet_id;
+        } elseif ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
+            $outletId = (int)$request->outlet_id;
+        }
+
+        // Fetch candidate entries in period (also include any unbalanced entries in history)
+        $query = JournalEntry::with(['lines.account', 'lines.outlet', 'outlet', 'creator'])
+            ->where(function ($q) use ($from, $to) {
+                $q->whereBetween('entry_date', [$from, $to])
+                  ->orWhere('is_balanced', false);
+            });
+
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        }
+
+        if ($outletId) {
+            $query->where(function ($q) use ($outletId) {
+                $q->where('outlet_id', $outletId)
+                  ->orWhereHas('lines', fn($l) => $l->where('outlet_id', $outletId));
+            });
+        }
+
+        $entries = $query->orderBy('entry_date', 'desc')->orderBy('id', 'desc')->get();
+
+        // Total journals count for health score ratio
+        $totalJournalsCount = JournalEntry::when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
+            ->whereBetween('entry_date', [$from, $to])
+            ->count();
+
+        // Also identify duplicate references across the business
+        $duplicateRefKeys = JournalEntry::whereNotNull('reference_type')
+            ->whereNotNull('reference_id')
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->select('reference_type', 'reference_id', DB::raw('count(*) as count'))
+            ->groupBy('reference_type', 'reference_id')
+            ->havingRaw('count(*) > 1')
+            ->pluck('count', DB::raw("CONCAT(reference_type, ':', reference_id)"))
+            ->toArray();
+
+        // Get all active account codes for this business
+        $validAccountCodes = Account::when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->pluck('code')
+            ->map(fn($c) => strtoupper(trim((string)$c)))
+            ->toArray();
+        $validAccountCodeSet = array_flip($validAccountCodes);
+
+        $abnormalItems = [];
+        $unbalancedCount = 0;
+        $zeroCount = 0;
+        $negativeCount = 0;
+        $missingAccountCount = 0;
+        $duplicateCount = 0;
+        $orphanCount = 0;
+        $singleSidedCount = 0;
+        $lineSumMismatchCount = 0;
+        $theoreticalDeficitCount = 0;
+        $totalDiscrepancyAmount = 0.0;
+
+        foreach ($entries as $entry) {
+            $anomalies = [];
+            $lines = $entry->lines;
+            $lineCount = $lines->count();
+
+            $sumDebit = round((float)$lines->sum('debit'), 2);
+            $sumCredit = round((float)$lines->sum('credit'), 2);
+            $diffDebitCredit = round(abs((float)$entry->total_debit - (float)$entry->total_credit), 2);
+            $diffLines = round(abs($sumDebit - $sumCredit), 2);
+
+            // 1. Unbalanced Check
+            if (!$entry->is_balanced || $diffDebitCredit > 0.01 || $diffLines > 0.01) {
+                $maxDiff = max($diffDebitCredit, $diffLines);
+                $anomalies[] = [
+                    'code'          => 'UNBALANCED',
+                    'severity'      => 'CRITICAL',
+                    'label'         => 'Debit & Kredit Tidak Seimbang',
+                    'description'   => "Terdapat selisih Rp " . number_format($maxDiff, 0, ',', '.') . " antara Total Debit (Rp " . number_format($sumDebit, 0, ',', '.') . ") dan Total Kredit (Rp " . number_format($sumCredit, 0, ',', '.') . ").",
+                    'action_advice' => 'Periksa akun jurnal atau jalankan Sinkronisasi Ulang Jurnal untuk memulihkan keseimbangan buku.',
+                ];
+                $unbalancedCount++;
+                $totalDiscrepancyAmount += $maxDiff;
+            }
+
+            // 2. Zero or Empty Check
+            if ($lineCount === 0) {
+                $anomalies[] = [
+                    'code'          => 'ZERO_OR_EMPTY',
+                    'severity'      => 'HIGH',
+                    'label'         => 'Jurnal Kosong (Tanpa Baris Akun)',
+                    'description'   => 'Header entri jurnal tercatat tetapi tidak memiliki satupun baris detail akun debit/kredit.',
+                    'action_advice' => 'Hapus entri kosong atau jurnalkan ulang dari data operasional.',
+                ];
+                $zeroCount++;
+            } elseif ($entry->total_debit <= 0 && $entry->total_credit <= 0 && $sumDebit <= 0 && $sumCredit <= 0) {
+                $anomalies[] = [
+                    'code'          => 'ZERO_OR_EMPTY',
+                    'severity'      => 'HIGH',
+                    'label'         => 'Nilai Transaksi Nol (Rp 0)',
+                    'description'   => 'Entri jurnal memiliki total nominal Rp 0 tanpa mutasi keuangan riil.',
+                    'action_advice' => 'Verifikasi apakah transaksi operasional bernilai Rp 0 atau terjadi kesalahan kalkulasi.',
+                ];
+                $zeroCount++;
+            }
+
+            // 3. Single Sided Entry Check
+            if ($lineCount === 1) {
+                $anomalies[] = [
+                    'code'          => 'SINGLE_SIDED',
+                    'severity'      => 'CRITICAL',
+                    'label'         => 'Jurnal Tunggal (Single-Sided)',
+                    'description'   => 'Jurnal hanya memiliki satu baris akun sehingga melanggar kaidah pembukuan berpasangan (double-entry).',
+                    'action_advice' => 'Lengkapi akun pasangan (kontra) agar debit dan kredit seimbang.',
+                ];
+                $singleSidedCount++;
+            }
+
+            // 4. Line Sum vs Header Mismatch
+            if (abs($sumDebit - (float)$entry->total_debit) > 0.05 || abs($sumCredit - (float)$entry->total_credit) > 0.05) {
+                $anomalies[] = [
+                    'code'          => 'LINE_SUM_MISMATCH',
+                    'severity'      => 'HIGH',
+                    'label'         => 'Selisih Rincian Baris vs Header',
+                    'description'   => "Jumlah baris (D: Rp " . number_format($sumDebit, 0, ',', '.') . ", K: Rp " . number_format($sumCredit, 0, ',', '.') . ") berbeda dengan rekap header (D: Rp " . number_format($entry->total_debit, 0, ',', '.') . ", K: Rp " . number_format($entry->total_credit, 0, ',', '.') . ").",
+                    'action_advice' => 'Kalkulasi ulang total header jurnal sesuai akumulasi baris transaksi.',
+                ];
+                $lineSumMismatchCount++;
+            }
+
+            // 5. Negative Values & Missing Account Check
+            $hasNegative = false;
+            $missingAccounts = [];
+            $hasTheoreticalDeficit = false;
+
+            foreach ($lines as $line) {
+                if ((float)$line->debit < 0 || (float)$line->credit < 0) {
+                    $hasNegative = true;
+                }
+
+                $rawCode = (string)$line->account_code;
+                $cleanCode = strtoupper(trim(explode('.', $rawCode)[0]));
+                if (!empty($cleanCode) && !isset($validAccountCodeSet[$cleanCode]) && !isset($validAccountCodeSet[$rawCode]) && !$line->account) {
+                    $missingAccounts[] = $line->account_code;
+                }
+
+                if (
+                    str_contains($rawCode, '5-51007') ||
+                    str_contains($rawCode, '5-51008')
+                ) {
+                    $hasTheoreticalDeficit = true;
+                }
+            }
+
+            if ($hasNegative) {
+                $anomalies[] = [
+                    'code'          => 'NEGATIVE_VALUES',
+                    'severity'      => 'HIGH',
+                    'label'         => 'Terdapat Nominal Negatif',
+                    'description'   => 'Salah satu atau lebih baris akun memiliki nilai debit atau kredit di bawah 0 (negatif).',
+                    'action_advice' => 'Gunakan sisi berlawanan (Kredit untuk membalik Debit) alih-alih nilai negatif.',
+                ];
+                $negativeCount++;
+            }
+
+            if (!empty($missingAccounts)) {
+                $anomalies[] = [
+                    'code'          => 'MISSING_ACCOUNT',
+                    'severity'      => 'HIGH',
+                    'label'         => 'Akun Tidak Terdaftar di Bagan Akun (COA)',
+                    'description'   => 'Kode akun [' . implode(', ', array_unique($missingAccounts)) . '] tidak ditemukan pada Master Bagan Akun bisnis ini.',
+                    'action_advice' => 'Tambahkan kode akun tersebut ke Bagan Akun (COA) atau sinkronkan ulang akun.',
+                ];
+                $missingAccountCount++;
+            }
+
+            // 6. Duplicate Reference Check
+            $refKey = $entry->reference_type && $entry->reference_id ? "{$entry->reference_type}:{$entry->reference_id}" : null;
+            if ($refKey && isset($duplicateRefKeys[$refKey]) && $duplicateRefKeys[$refKey] > 1) {
+                $anomalies[] = [
+                    'code'          => 'DUPLICATE_REFERENCE',
+                    'severity'      => 'MEDIUM',
+                    'label'         => 'Potensi Jurnal Ganda (Duplikasi)',
+                    'description'   => "Ditemukan {$duplicateRefKeys[$refKey]} entri jurnal dengan referensi sumber yang sama ({$entry->reference_type} #{$entry->reference_id}).",
+                    'action_advice' => 'Periksa apakah terjadi penjurnalan ganda dan hapus entri duplikat yang berlebih.',
+                ];
+                $duplicateCount++;
+            }
+
+            // 7. Theoretical Stock Deficit (Warning)
+            if ($hasTheoreticalDeficit) {
+                $anomalies[] = [
+                    'code'          => 'THEORETICAL_DEFICIT',
+                    'severity'      => 'WARNING',
+                    'label'         => 'Beban Selisih Stok Minus (Nota Urgent)',
+                    'description'   => 'Jurnal ini mencatat Beban Selisih HPP Teoritis akibat penjualan saat stok bahan di sistem berstatus defisit/minus.',
+                    'action_advice' => 'Pastikan nota urgent telah diselesaikan (restock) agar persediaan dinormalisasi kembali.',
+                ];
+                $theoreticalDeficitCount++;
+            }
+
+            // 8. Orphan Reference Check
+            if ($entry->reference_type && $entry->reference_id) {
+                $isOrphan = false;
+                switch ($entry->reference_type) {
+                    case 'TRANSACTION':
+                    case 'SALE':
+                        if (!\App\Models\Transaction::where('id', $entry->reference_id)->exists()) {
+                            $isOrphan = true;
+                        }
+                        break;
+                    case 'STOCK_MOVEMENT':
+                        if (!\App\Models\StockMovement::where('id', $entry->reference_id)->exists()) {
+                            $isOrphan = true;
+                        }
+                        break;
+                    case 'CASH_TRANSACTION':
+                        if (!\App\Models\CashTransaction::where('id', $entry->reference_id)->exists()) {
+                            $isOrphan = true;
+                        }
+                        break;
+                    case 'OPERATING_EXPENSE':
+                        if (!\App\Models\OperatingExpense::where('id', $entry->reference_id)->exists()) {
+                            $isOrphan = true;
+                        }
+                        break;
+                }
+                if ($isOrphan) {
+                    $anomalies[] = [
+                        'code'          => 'ORPHAN_REFERENCE',
+                        'severity'      => 'MEDIUM',
+                        'label'         => 'Data Asal (Sumber) Terhapus',
+                        'description'   => "Data sumber {$entry->reference_type} #{$entry->reference_id} sudah tidak ditemukan di database operasional.",
+                        'action_advice' => 'Jurnal ini merupakan data sisa (orphan record). Lakukan verifikasi sebelum menghapus.',
+                    ];
+                    $orphanCount++;
+                }
+            }
+
+            // If entry has ANY anomaly, add to result
+            if (!empty($anomalies)) {
+                $severities = array_column($anomalies, 'severity');
+                $highestSeverity = in_array('CRITICAL', $severities) ? 'CRITICAL'
+                    : (in_array('HIGH', $severities) ? 'HIGH'
+                    : (in_array('MEDIUM', $severities) ? 'MEDIUM' : 'WARNING'));
+
+                $abnormalItems[] = [
+                    'id'               => $entry->id,
+                    'entry_no'         => $entry->entry_no,
+                    'entry_date'       => (string)$entry->entry_date,
+                    'entry_type'       => $entry->entry_type,
+                    'reference_type'   => $entry->reference_type,
+                    'reference_id'     => $entry->reference_id,
+                    'description'      => $entry->description,
+                    'total_debit'      => (float)$entry->total_debit,
+                    'total_credit'     => (float)$entry->total_credit,
+                    'difference'       => round(abs((float)$entry->total_debit - (float)$entry->total_credit), 2),
+                    'is_balanced'      => (bool)$entry->is_balanced,
+                    'highest_severity' => $highestSeverity,
+                    'anomalies'        => $anomalies,
+                    'outlet_id'        => $entry->outlet_id,
+                    'outlet_name'      => $entry->outlet?->name ?: 'Maroa – Cabang Utama (Pusat)',
+                    'creator_name'     => $entry->creator?->name ?: 'Sistem Akuntansi',
+                    'created_at'       => $entry->created_at?->toDateTimeString(),
+                    'lines_count'      => $lineCount,
+                    'lines'            => $lines->map(fn($l) => [
+                        'id'           => $l->id,
+                        'account_code' => $l->account_code,
+                        'account_name' => $l->account?->name ?: "Akun {$l->account_code}",
+                        'debit'        => (float)$l->debit,
+                        'credit'       => (float)$l->credit,
+                        'memo'         => $l->memo,
+                        'outlet_name'  => $l->outlet?->name ?: '',
+                    ]),
+                ];
+            }
+        }
+
+        // Apply filters on the detected abnormal items
+        $filteredItems = $abnormalItems;
+
+        if ($request->filled('anomaly_type') && $request->anomaly_type !== 'ALL') {
+            $typeFilter = $request->anomaly_type;
+            $filteredItems = array_values(array_filter($filteredItems, function ($item) use ($typeFilter) {
+                return in_array($typeFilter, array_column($item['anomalies'], 'code'));
+            }));
+        }
+
+        if ($request->filled('severity') && $request->severity !== 'ALL') {
+            $sevFilter = $request->severity;
+            $filteredItems = array_values(array_filter($filteredItems, function ($item) use ($sevFilter) {
+                return $item['highest_severity'] === $sevFilter || in_array($sevFilter, array_column($item['anomalies'], 'severity'));
+            }));
+        }
+
+        if ($request->filled('search')) {
+            $search = strtolower(trim($request->search));
+            $filteredItems = array_values(array_filter($filteredItems, function ($item) use ($search) {
+                return str_contains(strtolower($item['entry_no']), $search) ||
+                       str_contains(strtolower($item['description']), $search) ||
+                       str_contains(strtolower($item['reference_type'] ?? ''), $search);
+            }));
+        }
+
+        $totalAnomalies = count($abnormalItems);
+        $healthScore = $totalJournalsCount > 0
+            ? max(0, min(100, round((($totalJournalsCount - min($totalJournalsCount, $totalAnomalies)) / $totalJournalsCount) * 100, 1)))
+            : 100.0;
+
+        return response()->json([
+            'period' => [
+                'from' => $from,
+                'to'   => $to,
+            ],
+            'summary' => [
+                'total_journals_audited'   => $totalJournalsCount,
+                'total_anomalies'          => $totalAnomalies,
+                'health_score'             => $healthScore,
+                'total_discrepancy_amount' => round($totalDiscrepancyAmount, 2),
+                'unbalanced_count'         => $unbalancedCount,
+                'zero_count'               => $zeroCount,
+                'negative_count'           => $negativeCount,
+                'missing_account_count'    => $missingAccountCount,
+                'duplicate_count'          => $duplicateCount,
+                'orphan_count'             => $orphanCount,
+                'single_sided_count'       => $singleSidedCount,
+                'line_sum_mismatch_count'  => $lineSumMismatchCount,
+                'theoretical_deficit_count'=> $theoreticalDeficitCount,
+            ],
+            'entries' => $filteredItems,
+        ]);
+    }
+
+    /**
+     * Recalculate a single Journal Entry from its lines
+     */
+    public function recalculateEntry(Request $request, $id)
+    {
+        $user = $request->user();
+        $businessId = $user ? $user->business_id : null;
+
+        $entry = JournalEntry::with('lines')->findOrFail($id);
+        if ($businessId && (int)$entry->business_id !== (int)$businessId && !$user->isPlatformAdmin()) {
+            return response()->json(['message' => 'Akses ditolak.'], 403);
+        }
+
+        $lines = $entry->lines;
+        $totalDebit = round((float)$lines->sum('debit'), 2);
+        $totalCredit = round((float)$lines->sum('credit'), 2);
+        $diff = round(abs($totalDebit - $totalCredit), 2);
+        $isBalanced = ($diff <= 0.01) && ($lines->count() > 0);
+
+        $entry->update([
+            'total_debit'  => $totalDebit,
+            'total_credit' => $totalCredit,
+            'is_balanced'  => $isBalanced,
+            'updated_by'   => $user?->id,
+        ]);
+
+        return response()->json([
+            'message' => "Jurnal {$entry->entry_no} berhasil dikalkulasi ulang.",
+            'entry'   => [
+                'id'           => $entry->id,
+                'entry_no'     => $entry->entry_no,
+                'total_debit'  => $totalDebit,
+                'total_credit' => $totalCredit,
+                'is_balanced'  => $isBalanced,
+            ]
+        ]);
+    }
+
+    /**
+     * Delete an unwanted / orphan / broken journal entry
+     */
+    public function destroyEntry(Request $request, $id)
+    {
+        $user = $request->user();
+        if ($user && !$user->isOwnerBisnis() && !$user->isPlatformAdmin() && !$user->isOwnerWebsite()) {
+            return response()->json(['message' => 'Hanya Owner Bisnis yang dapat menghapus entri jurnal abnormal.'], 403);
+        }
+
+        $entry = JournalEntry::findOrFail($id);
+        if ($user && $user->business_id && (int)$entry->business_id !== (int)$user->business_id && !$user->isPlatformAdmin()) {
+            return response()->json(['message' => 'Akses ditolak.'], 403);
+        }
+
+        $entry->lines()->delete();
+        $entry->delete();
+
+        return response()->json([
+            'message' => "Entri jurnal #{$id} ({$entry->entry_no}) berhasil dihapus beserta barisnya.",
+        ]);
+    }
 }
+

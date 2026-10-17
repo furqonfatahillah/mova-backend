@@ -129,6 +129,9 @@ class OutletController extends Controller
     {
         $user = $request->user();
         $businessId = $user?->business_id;
+        if ($user?->isSuperadminPlatform()) {
+            $businessId = $request->header('X-Business-Id') ?? $request->query('business_id') ?? $request->input('business_id');
+        }
 
         $items = $request->input('items', []);
         if (empty($items) || !is_array($items)) {

@@ -8,6 +8,8 @@ use App\Models\Outlet;
 use App\Models\StockMovement;
 use App\Models\Transaction;
 use App\Models\ReceivablePayment;
+use App\Models\UrgentNote;
+use App\Services\AccountingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -114,9 +116,51 @@ class ShiftController extends Controller
             ->select('shift_id', 'payment_method', 'dp_payment_method', 'total_price', 'amount_paid')
             ->get();
 
-        // Fetch receivable payments collected during these shifts
-        $receivablePayments = ReceivablePayment::whereIn('shift_id', $shiftIds)->get();
-        $recPaymentsByShift = $receivablePayments->groupBy('shift_id');
+        // Fetch receivable payments collected during these shifts (supporting both shift_id and time-window fallback)
+        $receivablePayments = ReceivablePayment::with('receivable')
+            ->where(function ($query) use ($shiftIds, $shifts) {
+                $query->whereIn('shift_id', $shiftIds);
+                foreach ($shifts as $s) {
+                    $query->orWhere(function ($sub) use ($s) {
+                        $sub->whereNull('shift_id')
+                            ->where('outlet_id', $s->outlet_id);
+                        if ($s->opened_at && $s->closed_at) {
+                            $sub->whereBetween('created_at', [$s->opened_at, $s->closed_at]);
+                        } elseif ($s->opened_at) {
+                            $sub->where('created_at', '>=', $s->opened_at);
+                        }
+                    });
+                }
+            })
+            ->get();
+
+        $recPaymentsByShift = [];
+        foreach ($receivablePayments as $rp) {
+            $sId = $rp->shift_id;
+            if (!$sId) {
+                foreach ($shifts as $s) {
+                    if ($s->outlet_id == $rp->outlet_id) {
+                        if ($s->opened_at && $s->closed_at && $rp->created_at >= $s->opened_at && $rp->created_at <= $s->closed_at) {
+                            $sId = $s->id;
+                            break;
+                        } elseif ($s->opened_at && !$s->closed_at && $rp->created_at >= $s->opened_at) {
+                            $sId = $s->id;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ($sId) {
+                if (!isset($recPaymentsByShift[$sId])) $recPaymentsByShift[$sId] = collect();
+                $recPaymentsByShift[$sId]->push($rp);
+            }
+        }
+
+        // Fetch Kasbon records originated by these shifts to know their settlement status
+        $kasbonReceivables = \App\Models\Receivable::whereIn('shift_id', $shiftIds)
+            ->with(['payments'])
+            ->get()
+            ->groupBy('shift_id');
 
         $breakdownByShift = [];
         foreach ($shiftIds as $sId) {
@@ -128,6 +172,7 @@ class ShiftController extends Controller
                 'shopee'      => 0.0,
                 'transfer'    => 0.0,
                 'debit'       => 0.0,
+                'kasbon'      => 0.0,
                 'other'       => 0.0,
                 'total_sales' => 0.0,
                 'details'     => [],
@@ -149,15 +194,16 @@ class ShiftController extends Controller
                 $breakdownByShift[$sId]['qris'] += $price;
                 $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'GOFOOD') || str_contains($method, 'GOJEK')) {
-                $breakdownByShift[$sId]['gofood'] += $price;
-                $breakdownByShift[$sId]['grab'] += $price;
+                $breakdownByShift[$sId]['gofood'] = ($breakdownByShift[$sId]['gofood'] ?? 0.0) + $price;
                 $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'SHOPEE')) {
-                $breakdownByShift[$sId]['shopee'] += $price;
-                $breakdownByShift[$sId]['grab'] += $price;
+                $breakdownByShift[$sId]['shopee'] = ($breakdownByShift[$sId]['shopee'] ?? 0.0) + $price;
                 $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
-            } elseif (str_contains($method, 'GRAB') || str_contains($method, 'TIKTOK')) {
-                $breakdownByShift[$sId]['grab'] += $price;
+            } elseif (str_contains($method, 'GRAB')) {
+                $breakdownByShift[$sId]['grab'] = ($breakdownByShift[$sId]['grab'] ?? 0.0) + $price;
+                $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
+            } elseif (str_contains($method, 'TIKTOK')) {
+                $breakdownByShift[$sId]['tiktok'] = ($breakdownByShift[$sId]['tiktok'] ?? 0.0) + $price;
                 $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'TRANSFER')) {
                 $breakdownByShift[$sId]['transfer'] += $price;
@@ -165,7 +211,9 @@ class ShiftController extends Controller
             } elseif (str_contains($method, 'DEBIT') || str_contains($method, 'EDC') || str_contains($method, 'CREDIT') || str_contains($method, 'KARTU')) {
                 $breakdownByShift[$sId]['debit'] += $price;
                 $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
-            } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
+            } elseif (in_array($method, ['KASBON', 'PIUTANG']) || str_contains($method, 'KASBON') || str_contains($method, 'PIUTANG')) {
+                $breakdownByShift[$sId]['kasbon'] = ($breakdownByShift[$sId]['kasbon'] ?? 0.0) + $price;
+                $breakdownByShift[$sId]['details'][$method] = ($breakdownByShift[$sId]['details'][$method] ?? 0.0) + $price;
                 // If there are NO receivable payment records for this shift, fallback to amount_paid
                 $hasRp = isset($recPaymentsByShift[$sId]) && $recPaymentsByShift[$sId]->count() > 0;
                 if (!$hasRp) {
@@ -186,7 +234,7 @@ class ShiftController extends Controller
             }
         }
 
-        // Add collections from kasbon payments received during each shift
+        // Add collections from kasbon payments received during each shift into their respective payment method
         foreach ($recPaymentsByShift as $sId => $rpList) {
             if (!isset($breakdownByShift[$sId])) continue;
             foreach ($rpList as $rp) {
@@ -202,6 +250,12 @@ class ShiftController extends Controller
                     $breakdownByShift[$sId]['cash'] += $rpAmt;
                 } elseif (str_contains($rpMethod, 'QRIS')) {
                     $breakdownByShift[$sId]['qris'] += $rpAmt;
+                } elseif (str_contains($rpMethod, 'GOFOOD') || str_contains($rpMethod, 'GOJEK')) {
+                    $breakdownByShift[$sId]['gofood'] = ($breakdownByShift[$sId]['gofood'] ?? 0.0) + $rpAmt;
+                } elseif (str_contains($rpMethod, 'SHOPEE')) {
+                    $breakdownByShift[$sId]['shopee'] = ($breakdownByShift[$sId]['shopee'] ?? 0.0) + $rpAmt;
+                } elseif (str_contains($rpMethod, 'GRAB')) {
+                    $breakdownByShift[$sId]['grab'] = ($breakdownByShift[$sId]['grab'] ?? 0.0) + $rpAmt;
                 } elseif (str_contains($rpMethod, 'TRANSFER')) {
                     $breakdownByShift[$sId]['transfer'] += $rpAmt;
                 } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
@@ -209,19 +263,6 @@ class ShiftController extends Controller
                 } else {
                     $breakdownByShift[$sId]['other'] += $rpAmt;
                 }
-            }
-        }
-
-        // Ensure total_sales is at least the sum of payments received
-        foreach ($shiftIds as $sId) {
-            $totalPayments = $breakdownByShift[$sId]['cash'] +
-                             $breakdownByShift[$sId]['qris'] +
-                             $breakdownByShift[$sId]['grab'] +
-                             $breakdownByShift[$sId]['transfer'] +
-                             $breakdownByShift[$sId]['debit'] +
-                             $breakdownByShift[$sId]['other'];
-            if ($breakdownByShift[$sId]['total_sales'] < $totalPayments) {
-                $breakdownByShift[$sId]['total_sales'] = $totalPayments;
             }
         }
 
@@ -242,18 +283,10 @@ class ShiftController extends Controller
 
         // Fetch deposits for these shifts and closed shifts
         $allRelevantShiftIds = $shiftIds->concat($allClosedShifts->pluck('id'))->unique()->filter()->values();
-        $depositTransactions = \App\Models\CashTransaction::where(function ($q) use ($allRelevantShiftIds) {
-            $q->whereIn('shift_id', $allRelevantShiftIds)
-              ->orWhere(function ($sub) use ($allRelevantShiftIds) {
-                  $sub->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
-                      ->where(function ($inner) use ($allRelevantShiftIds) {
-                          foreach ($allRelevantShiftIds as $sId) {
-                              $inner->orWhere('name', 'like', "%Shift #{$sId}%")
-                                    ->orWhere('notes', 'like', "%Shift #{$sId}%");
-                          }
-                      });
-              });
-        })->get();
+        $depositTransactions = \App\Models\CashTransaction::whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
+            ->whereIn('status', ['APPROVED', 'PENDING'])
+            ->whereIn('shift_id', $allRelevantShiftIds)
+            ->get();
 
         // Fetch modal kas besar transactions for these shifts
         $modalKasBesarTxs = \App\Models\CashTransaction::whereIn('shift_id', $allRelevantShiftIds)
@@ -265,11 +298,6 @@ class ShiftController extends Controller
         $depositsByShift = [];
         foreach ($depositTransactions as $dtx) {
             $sId = $dtx->shift_id;
-            if (!$sId) {
-                if (preg_match('/Shift #(\d+)/i', ($dtx->name ?? '') . ' ' . ($dtx->notes ?? ''), $m)) {
-                    $sId = (int)$m[1];
-                }
-            }
             if ($sId) {
                 if (!isset($depositsByShift[$sId])) {
                     $depositsByShift[$sId] = collect();
@@ -283,29 +311,87 @@ class ShiftController extends Controller
                 'cash'        => 0.0,
                 'qris'        => 0.0,
                 'grab'        => 0.0,
+                'gofood'      => 0.0,
+                'shopee'      => 0.0,
+                'tiktok'      => 0.0,
                 'transfer'    => 0.0,
                 'debit'       => 0.0,
+                'kasbon'      => 0.0,
                 'other'       => 0.0,
                 'total_sales' => 0.0,
                 'details'     => [],
             ];
             $s->cash_sales = $bd['cash'];
             $s->qris_sales = $bd['qris'];
-            $s->grab_sales = $bd['grab'];
+            $s->grab_sales = $bd['grab'] ?? 0.0;
             $s->gofood_sales = $bd['gofood'] ?? 0.0;
             $s->shopee_sales = $bd['shopee'] ?? 0.0;
+            $s->tiktok_sales = $bd['tiktok'] ?? 0.0;
+            $s->delivery_sales = ($bd['grab'] ?? 0.0) + ($bd['gofood'] ?? 0.0) + ($bd['shopee'] ?? 0.0) + ($bd['tiktok'] ?? 0.0);
             $s->transfer_sales = $bd['transfer'];
             $s->debit_sales = $bd['debit'];
+            
+            // Kasbon settlement status for this shift
+            $shiftRecs = $kasbonReceivables[$s->id] ?? collect();
+            $kbTotal = (float)$shiftRecs->sum('total_amount');
+            $kbPaid = (float)$shiftRecs->sum('paid_amount');
+            $kbRemaining = (float)$shiftRecs->sum('remaining_amount');
+
+            $kbSettlementMethods = [];
+            foreach ($shiftRecs as $rec) {
+                foreach ($rec->payments as $p) {
+                    $pm = strtoupper(trim($p->payment_method ?? 'CASH'));
+                    $kbSettlementMethods[$pm] = ($kbSettlementMethods[$pm] ?? 0.0) + (float)$p->amount;
+                }
+            }
+
+            // Collections received during this shift (money entering via cash/qris/transfer to settle kasbon)
+            $shiftRpList = $recPaymentsByShift[$s->id] ?? collect();
+            $rpCollections = [
+                'total'    => (float)$shiftRpList->sum('amount'),
+                'cash'     => 0.0,
+                'qris'     => 0.0,
+                'transfer' => 0.0,
+                'debit'    => 0.0,
+                'other'    => 0.0,
+            ];
+            foreach ($shiftRpList as $rp) {
+                $amt = (float)$rp->amount;
+                $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+                if ($m === 'CASH' || $m === 'TUNAI') $rpCollections['cash'] += $amt;
+                elseif (str_contains($m, 'QRIS')) $rpCollections['qris'] += $amt;
+                elseif (str_contains($m, 'TRANSFER')) $rpCollections['transfer'] += $amt;
+                elseif (str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'CREDIT')) $rpCollections['debit'] += $amt;
+                else $rpCollections['other'] += $amt;
+            }
+
+            $s->kasbon_sales = (float)($bd['kasbon'] ?? 0.0);
+            if ($s->kasbon_sales == 0 && $kbTotal > 0) {
+                $s->kasbon_sales = $kbTotal;
+            }
+            $s->kasbon_settled = $kbPaid;
+            $s->kasbon_remaining = $kbRemaining;
+            $s->kasbon_settlement_methods = $kbSettlementMethods;
+            $s->receivable_collections = $rpCollections;
+
             $s->other_sales = $bd['other'];
             $s->payment_breakdown = $bd['details'];
             $s->system_cash = $bd['total_sales'];
+
+            // Uang Keluar / Biaya Operasional Kasir pada Sesi Shift
+            $expData = $this->getShiftExpenses($s);
+            $s->total_expenses = $expData['total_expenses'];
+            $s->cash_expenses = $expData['cash_expenses'];
+            $s->non_cash_expenses = $expData['non_cash_expenses'];
 
             // Deposit data
             $sDepositTxs = $depositsByShift[$s->id] ?? collect();
             $lastDepositTx = $sDepositTxs->last();
 
             $depositStatus = $s->deposit_status ?: ($lastDepositTx ? ($lastDepositTx->status ?: 'APPROVED') : 'NONE');
-            $depositAmount = $s->deposit_amount !== null ? (float)$s->deposit_amount : (float)$sDepositTxs->sum('amount');
+            $depositAmount = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING')
+                ? ($s->deposit_amount !== null ? (float)$s->deposit_amount : (float)$sDepositTxs->sum('amount'))
+                : 0.0;
             $depositAccount = $s->deposit_account ?: ($lastDepositTx?->account ?? ($depositAmount > 0 ? 'KAS_BESAR' : null));
             $depositAccountLabel = $s->deposit_account_label ?: ($lastDepositTx?->account_label ?? ($depositAmount > 0 ? 'Kas Besar / Brankas' : null));
 
@@ -350,11 +436,13 @@ class ShiftController extends Controller
 
                 // Ambil setoran shift sebelumnya
                 $prevDepTxs = $depositsByShift[$prev->id] ?? collect();
-                $prevDepAmt = $prev->deposit_amount !== null ? (float)$prev->deposit_amount : (float)$prevDepTxs->sum('amount');
                 $prevDepStatus = $prev->deposit_status ?: ($prevDepTxs->last()?->status ?: 'NONE');
+                $prevDepAmt = ($prevDepStatus === 'APPROVED' || $prevDepStatus === 'PENDING')
+                    ? ($prev->deposit_amount !== null ? (float)$prev->deposit_amount : (float)$prevDepTxs->sum('amount'))
+                    : 0.0;
 
-                // Jika setoran shift lalu APPROVED, PENDING, atau jumlah > 0, hitung sisa kas fisik riil di laci setelah disetor
-                $prevDepDeducted = ($prevDepStatus === 'APPROVED' || $prevDepStatus === 'PENDING' || $prevDepAmt > 0) ? $prevDepAmt : 0.0;
+                // Jika setoran shift lalu APPROVED atau PENDING, kurangi dari kas fisik laci
+                $prevDepDeducted = ($prevDepStatus === 'APPROVED' || $prevDepStatus === 'PENDING') ? $prevDepAmt : 0.0;
                 $prevRemainingInDrawer = max(0.0, round($prevClosing - $prevDepDeducted, 2));
 
                 $s->previous_shift_id = $prev->id;
@@ -475,19 +563,17 @@ class ShiftController extends Controller
             $lastClosedData = null;
             if ($lastShift) {
                 $depositTxs = \App\Models\CashTransaction::where('shift_id', $lastShift->id)
-                    ->orWhere(function ($sub) use ($lastShift) {
-                        $sub->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
-                            ->where(function ($inner) use ($lastShift) {
-                                $inner->where('name', 'like', "%Shift #{$lastShift->id}%")
-                                      ->orWhere('notes', 'like', "%Shift #{$lastShift->id}%");
-                            });
-                    })->get();
+                    ->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
+                    ->whereIn('status', ['APPROVED', 'PENDING'])
+                    ->get();
                 $totalDeposited = (float)$depositTxs->sum('amount');
                 $lastDeposit = $depositTxs->last();
 
                 $depositStatus = $lastShift->deposit_status ?: ($lastDeposit ? ($lastDeposit->status ?: 'APPROVED') : 'NONE');
-                $depositAmount = $lastShift->deposit_amount !== null ? (float)$lastShift->deposit_amount : $totalDeposited;
-                $depositAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING' || $depositAmount > 0) ? (float)$depositAmount : 0.0;
+                $depositAmount = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING')
+                    ? ($lastShift->deposit_amount !== null ? (float)$lastShift->deposit_amount : $totalDeposited)
+                    : 0.0;
+                $depositAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING') ? (float)$depositAmount : 0.0;
                 $remainingCashInDrawer = $lastShift->closing_cash !== null ? max(0, round((float)$lastShift->closing_cash - $depositAmt, 2)) : 0.0;
 
                 $kasBesarBalance = 0.0;
@@ -560,6 +646,7 @@ class ShiftController extends Controller
         $shopeeSales = 0.0;
         $transferSales = 0.0;
         $debitSales = 0.0;
+        $kasbonSales = 0.0;
         $otherSales = 0.0;
         $nonCashSales = 0.0;
         $paymentBreakdown = [];
@@ -577,16 +664,18 @@ class ShiftController extends Controller
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'GOFOOD') || str_contains($method, 'GOJEK')) {
                 $gofoodSales += $price;
-                $grabSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'SHOPEE')) {
                 $shopeeSales += $price;
+                $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
+            } elseif (str_contains($method, 'GRAB')) {
                 $grabSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
-            } elseif (str_contains($method, 'GRAB') || str_contains($method, 'TIKTOK')) {
-                $grabSales += $price;
+            } elseif (str_contains($method, 'TIKTOK')) {
+                $tiktokSales = ($tiktokSales ?? 0.0) + $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'TRANSFER')) {
@@ -597,7 +686,10 @@ class ShiftController extends Controller
                 $debitSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
-            } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
+            } elseif (in_array($method, ['KASBON', 'PIUTANG']) || str_contains($method, 'KASBON') || str_contains($method, 'PIUTANG')) {
+                $kasbonSales += $price;
+                $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
                 if (!$hasShiftRecPayments) {
                     $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
                     $dpPaid = (float)($t->amount_paid ?? 0);
@@ -719,6 +811,40 @@ class ShiftController extends Controller
             $shift->initial_cash_source = str_contains($shift->notes ?? '', 'Kas Besar') ? 'KAS_BESAR' : 'DRAWER';
         }
 
+        $shiftRecs = \App\Models\Receivable::where('shift_id', $shift->id)->with('payments')->get();
+        $kbTotal = (float)$shiftRecs->sum('total_amount');
+        $kbPaid = (float)$shiftRecs->sum('paid_amount');
+        $kbRemaining = (float)$shiftRecs->sum('remaining_amount');
+        $kbSettlementMethods = [];
+        foreach ($shiftRecs as $rec) {
+            foreach ($rec->payments as $p) {
+                $pm = strtoupper(trim($p->payment_method ?? 'CASH'));
+                $kbSettlementMethods[$pm] = ($kbSettlementMethods[$pm] ?? 0.0) + (float)$p->amount;
+            }
+        }
+
+        $rpCollections = [
+            'total'    => (float)$shiftRecPayments->sum('amount'),
+            'cash'     => 0.0,
+            'qris'     => 0.0,
+            'transfer' => 0.0,
+            'debit'    => 0.0,
+            'other'    => 0.0,
+        ];
+        foreach ($shiftRecPayments as $rp) {
+            $amt = (float)$rp->amount;
+            $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            if ($m === 'CASH' || $m === 'TUNAI') $rpCollections['cash'] += $amt;
+            elseif (str_contains($m, 'QRIS')) $rpCollections['qris'] += $amt;
+            elseif (str_contains($m, 'TRANSFER')) $rpCollections['transfer'] += $amt;
+            elseif (str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'CREDIT')) $rpCollections['debit'] += $amt;
+            else $rpCollections['other'] += $amt;
+        }
+
+        if ($kasbonSales == 0 && $kbTotal > 0) {
+            $kasbonSales = $kbTotal;
+        }
+
         return response()->json([
             'shift'              => $shift,
             'total_transactions' => $totalTransactions,
@@ -731,6 +857,11 @@ class ShiftController extends Controller
             'transfer_sales'     => $transferSales,
             'debit_sales'        => $debitSales,
             'other_sales'        => $otherSales,
+            'kasbon_sales'       => $kasbonSales,
+            'kasbon_settled'     => $kbPaid,
+            'kasbon_remaining'   => $kbRemaining,
+            'kasbon_settlement_methods' => $kbSettlementMethods,
+            'receivable_collections'    => $rpCollections,
             'non_cash_sales'     => $nonCashSales,
             'payment_breakdown'  => $paymentBreakdown,
             'expenses'           => $expData['expenses'],
@@ -769,21 +900,19 @@ class ShiftController extends Controller
         }
 
         $depositTxs = \App\Models\CashTransaction::where('shift_id', $lastShift->id)
-            ->orWhere(function ($sub) use ($lastShift) {
-                $sub->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
-                    ->where(function ($inner) use ($lastShift) {
-                        $inner->where('name', 'like', "%Shift #{$lastShift->id}%")
-                              ->orWhere('notes', 'like', "%Shift #{$lastShift->id}%");
-                    });
-            })->get();
+            ->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
+            ->whereIn('status', ['APPROVED', 'PENDING'])
+            ->get();
         $totalDeposited = (float)$depositTxs->sum('amount');
         $lastDeposit = $depositTxs->last();
 
         $depositStatus = $lastShift->deposit_status ?: ($lastDeposit ? ($lastDeposit->status ?: 'APPROVED') : 'NONE');
-        $depositAmount = $lastShift->deposit_amount !== null ? (float)$lastShift->deposit_amount : $totalDeposited;
+        $depositAmount = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING')
+            ? ($lastShift->deposit_amount !== null ? (float)$lastShift->deposit_amount : $totalDeposited)
+            : 0.0;
 
         // Hitung sisa kas fisik di laci setelah setoran kasir:
-        $depositAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING' || $depositAmount > 0) ? (float)$depositAmount : 0.0;
+        $depositAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING') ? (float)$depositAmount : 0.0;
         $remainingCashInDrawer = $lastShift->closing_cash !== null ? max(0, round((float)$lastShift->closing_cash - $depositAmt, 2)) : 0.0;
 
         // Ambil saldo riil Kas Besar saat ini untuk outlet ini:
@@ -899,6 +1028,8 @@ class ShiftController extends Controller
     {
         $data = $request->validate([
             'shift_name'          => 'nullable|string|max:100',
+            'client_shift_id'     => 'nullable|string|max:100',
+            'opened_at'           => 'nullable|date',
             'shift_schedule_id'   => 'nullable|integer',
             'initial_cash'        => 'nullable|numeric|min:0',
             'initial_cash_source' => 'nullable|string|in:DRAWER,KAS_BESAR',
@@ -928,6 +1059,23 @@ class ShiftController extends Controller
             ], 422);
         }
 
+        // Idempotency check for offline shift synchronization
+        $clientShiftId = $data['client_shift_id'] ?? $request->input('client_shift_id');
+        if (!empty($clientShiftId)) {
+            $existingClientShift = Shift::where('business_id', $businessId)
+                ->where('client_shift_id', $clientShiftId)
+                ->first();
+
+            if ($existingClientShift) {
+                $existingClientShift->load(['user', 'outlet', 'creator', 'updater', 'shiftSchedule']);
+                return response()->json([
+                    'message'            => 'Shift sudah terdaftar (idempotent sync).',
+                    'data'               => $existingClientShift,
+                    'is_idempotent_sync' => true,
+                ], 200);
+            }
+        }
+
         // Check if there is already an open shift for this outlet
         $existing = Shift::where('status', 'OPEN')
             ->where('business_id', $businessId)
@@ -935,6 +1083,17 @@ class ShiftController extends Controller
             ->first();
 
         if ($existing) {
+            // If offline shift sync arrives and user already has an active open shift without client_shift_id, link them
+            if (!empty($clientShiftId) && empty($existing->client_shift_id) && $existing->user_id === $user->id) {
+                $existing->update(['client_shift_id' => $clientShiftId]);
+                $existing->load(['user', 'outlet', 'creator', 'updater', 'shiftSchedule']);
+                return response()->json([
+                    'message'            => 'Shift aktif berhasil ditautkan dengan shift offline kasir.',
+                    'data'               => $existing,
+                    'is_idempotent_sync' => true,
+                ], 200);
+            }
+
             return response()->json([
                 'message' => "Masih ada shift yang aktif di outlet ini (#{$existing->id} - {$existing->shift_name}). Silakan closing shift tersebut terlebih dahulu.",
                 'active_shift' => $existing,
@@ -1037,20 +1196,59 @@ class ShiftController extends Controller
             }
         }
 
+        // Cek sisa kas fisik di laci dari shift sebelumnya untuk validasi serah-terima laci
+        $prevClosedShift = Shift::where('outlet_id', $outletId)
+            ->where('status', 'CLOSED')
+            ->orderByDesc('closed_at')
+            ->orderByDesc('id')
+            ->first();
+
+        $expectedDrawerCash = null;
+        $handoverDiff = 0.0;
+        if ($prevClosedShift && $prevClosedShift->closing_cash !== null) {
+            $prevClosing = (float)$prevClosedShift->closing_cash;
+            $depositStatus = $prevClosedShift->deposit_status;
+            $prevDepAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING')
+                ? (float)($prevClosedShift->deposit_amount ?? 0)
+                : 0.0;
+            if ($prevDepAmt == 0.0) {
+                $depTx = \App\Models\CashTransaction::where('shift_id', $prevClosedShift->id)
+                    ->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
+                    ->whereIn('status', ['APPROVED', 'PENDING'])
+                    ->sum('amount');
+                if ($depTx > 0) {
+                    $prevDepAmt = (float)$depTx;
+                }
+            }
+            $expectedDrawerCash = max(0.0, round($prevClosing - $prevDepAmt, 2));
+            if ($initialCashSource === 'DRAWER') {
+                $handoverDiff = round($initialCash - $expectedDrawerCash, 2);
+            }
+        }
+
         $shiftNotes = $data['notes'] ?? null;
         if ($initialCashSource === 'KAS_BESAR' && $initialCash > 0 && $approverUser) {
             $kbNote = "Modal awal Rp " . number_format($initialCash, 0, ',', '.') . " diambil dari Kas Besar (Disetujui: {$approverUser->name} - {$approverUser->role_label}).";
             $shiftNotes = $shiftNotes ? ($shiftNotes . " | " . $kbNote) : $kbNote;
+        } elseif ($initialCashSource === 'DRAWER' && $expectedDrawerCash !== null && abs($handoverDiff) >= 0.01) {
+            $diffFormatted = $handoverDiff > 0
+                ? ("+Rp " . number_format($handoverDiff, 0, ',', '.') . " (Lebih)")
+                : ("-Rp " . number_format(abs($handoverDiff), 0, ',', '.') . " (Kurang)");
+            $hoNote = "Selisih Serah Terima Kas Laci: {$diffFormatted} [Sisa Shift Lalu #{$prevClosedShift->id}: Rp " . number_format($expectedDrawerCash, 0, ',', '.') . ", Diterima Kasir: Rp " . number_format($initialCash, 0, ',', '.') . "].";
+            $shiftNotes = $shiftNotes ? ($shiftNotes . " | " . $hoNote) : $hoNote;
         }
+
+        $openedAt = !empty($data['opened_at']) ? \Carbon\Carbon::parse($data['opened_at']) : now();
 
         $shift = Shift::create([
             'business_id'       => $businessId,
             'outlet_id'         => $outletId,
             'shift_schedule_id' => $shiftScheduleId,
             'shift_name'        => $shiftName,
+            'client_shift_id'   => $clientShiftId,
             'user_id'           => $user->id,
             'created_by'        => $user->id,
-            'opened_at'         => now(),
+            'opened_at'         => $openedAt,
             'initial_cash'      => $initialCash,
             'system_cash'       => 0,
             'status'            => 'OPEN',
@@ -1114,6 +1312,44 @@ class ShiftController extends Controller
             } catch (\Throwable $e) {
                 \Log::error("Failed to post journal for TARIK_MODAL_KASIR shift #{$shift->id}: " . $e->getMessage());
             }
+        } elseif (!$isFirstShiftEver && $initialCashSource === 'DRAWER' && $expectedDrawerCash !== null && abs($handoverDiff) >= 0.01) {
+            // 3. Shift selanjutnya (Laci): Jika kas fisik laci yang diterima berbeda dengan sisa laci shift sebelumnya,
+            // buat CashTransaction & jurnal penyesuaian selisih serah terima (Handover Discrepancy) secara eksplisit.
+            try {
+                $isShortage = $handoverDiff < 0;
+                $diffAmt = abs($handoverDiff);
+                $txType = $isShortage ? 'OUT' : 'IN';
+                $trxNo = 'CT-ST-' . date('YmdHis') . '-' . rand(100, 999);
+                $txName = $isShortage
+                    ? "Selisih Kurang Serah Terima Kas Laci Shift #{$shift->id}"
+                    : "Selisih Lebih Serah Terima Kas Laci Shift #{$shift->id}";
+
+                $prevShiftId = $prevClosedShift ? $prevClosedShift->id : '-';
+                $ct = \App\Models\CashTransaction::create([
+                    'business_id'    => $businessId,
+                    'outlet_id'      => $outletId,
+                    'shift_id'       => $shift->id,
+                    'transaction_no' => $trxNo,
+                    'name'           => $txName,
+                    'category'       => 'SELISIH_SERAH_TERIMA',
+                    'type'           => $txType,
+                    'activity_type'  => 'OPERATING',
+                    'account'        => 'PETTY_CASH',
+                    'payment_method' => 'CASH',
+                    'amount'         => $diffAmt,
+                    'date'           => now()->toDateString(),
+                    'status'         => 'APPROVED',
+                    'notes'          => "Penyesuaian selisih fisik kas laci saat serah terima pergantian shift dari Shift #{$prevShiftId} ke Shift #{$shift->id}. Sisa laci shift lalu: Rp " . number_format($expectedDrawerCash, 0, ',', '.') . ", kas fisik diterima kasir baru: Rp " . number_format($initialCash, 0, ',', '.') . " (" . ($isShortage ? 'Kurang' : 'Lebih') . " Rp " . number_format($diffAmt, 0, ',', '.') . ").",
+                    'user_id'        => $user->id,
+                    'created_by'     => $user->id,
+                    'approved_by'    => $user->id,
+                    'approved_at'    => now(),
+                ]);
+
+                \App\Services\AccountingService::postCashTransaction($ct);
+            } catch (\Throwable $e) {
+                \Log::error("Failed to post journal for SELISIH_SERAH_TERIMA shift #{$shift->id}: " . $e->getMessage());
+            }
         }
 
         $shift->load(['user', 'outlet', 'creator', 'updater', 'shiftSchedule']);
@@ -1146,166 +1382,13 @@ class ShiftController extends Controller
 
     /**
      * Get operating expenses and cash deductions associated with a shift.
+     * Uses centralized AccountingService::calculateShiftExpenses with intelligent de-duplication.
      */
     protected function getShiftExpenses(Shift $shift): array
     {
-        $openedAt = $shift->opened_at;
-        $closedAt = $shift->closed_at;
-        $openedDate = $openedAt ? $openedAt->toDateString() : now()->toDateString();
-        $closedDate = $closedAt ? $closedAt->toDateString() : now()->toDateString();
-
-        // 1. Operating Expenses (OPEX)
-        $opexQuery = \App\Models\OperatingExpense::with(['user', 'outlet'])
-            ->where(function ($q) use ($shift) {
-                $q->where('outlet_id', $shift->outlet_id)
-                  ->orWhereNull('outlet_id');
-            });
-
-        if ($shift->business_id) {
-            $opexQuery->where('business_id', $shift->business_id);
-        }
-
-        $opexQuery->where(function ($q) use ($openedAt, $closedAt, $openedDate, $closedDate) {
-            if ($openedAt && $closedAt) {
-                $q->where(function ($sub) use ($openedAt, $closedAt) {
-                    $sub->where('created_at', '>=', $openedAt)
-                        ->where('created_at', '<=', $closedAt);
-                })->orWhere(function ($sub) use ($openedDate, $closedDate) {
-                    $sub->whereBetween('date', [$openedDate, $closedDate]);
-                });
-            } elseif ($openedAt) {
-                $q->where(function ($sub) use ($openedAt) {
-                    $sub->where('created_at', '>=', $openedAt);
-                })->orWhere(function ($sub) use ($openedDate) {
-                    $sub->where('date', '>=', $openedDate);
-                });
-            } else {
-                $q->whereDate('date', now()->toDateString());
-            }
-        });
-
-        $opexList = $opexQuery->orderBy('created_at', 'asc')->get();
-
-        $expenses = [];
-        $totalExpenses = 0.0;
-        $cashExpenses = 0.0;
-        $nonCashExpenses = 0.0;
-
-        foreach ($opexList as $exp) {
-            $amt = (float)$exp->amount;
-            $method = strtoupper(trim($exp->payment_method ?? 'CASH'));
-            $isCash = in_array($method, ['CASH', 'TUNAI', 'PETTY_CASH', 'KAS_KECIL']) ||
-                      str_contains($method, 'CASH') ||
-                      str_contains($method, 'TUNAI') ||
-                      str_contains($method, 'PETTY');
-
-            $totalExpenses += $amt;
-            if ($isCash) {
-                $cashExpenses += $amt;
-            } else {
-                $nonCashExpenses += $amt;
-            }
-
-            $desc = $exp->name ?: ($exp->category_label ?? 'Biaya Operasional');
-            $expenses[] = [
-                'id'                   => $exp->id,
-                'source'               => 'OPERATING_EXPENSE',
-                'expense_no'           => $exp->expense_no,
-                'date'                 => $exp->date ? (is_string($exp->date) ? substr($exp->date, 0, 10) : $exp->date->format('Y-m-d')) : null,
-                'time'                 => $exp->created_at ? $exp->created_at->format('H:i') : '-',
-                'category'             => $exp->category,
-                'category_label'       => $exp->category_label ?? $exp->category,
-                'name'                 => $desc,
-                'description'          => $desc,
-                'amount'               => $amt,
-                'payment_method'       => $exp->payment_method ?? 'CASH',
-                'payment_method_label' => $exp->payment_method_label ?? ($isCash ? 'Tunai / Kas di Laci' : 'Transfer Bank'),
-                'is_cash'              => $isCash,
-                'notes'                => $exp->notes,
-                'user_name'            => $exp->user_name ?? ($exp->user?->name ?? 'Kasir'),
-            ];
-        }
-
-        // 2. Cash Transactions (Type OUT for CASH_DRAWER / PETTY_CASH)
-        $cashTrxQuery = \App\Models\CashTransaction::with(['user', 'outlet'])
-            ->where('type', 'OUT')
-            ->whereIn('account', ['CASH_DRAWER', 'PETTY_CASH'])
-            ->where('category', '!=', 'SETORAN_KASIR')
-            ->where(function ($q) use ($shift) {
-                $q->where('outlet_id', $shift->outlet_id)
-                  ->orWhereNull('outlet_id');
-            });
-
-        if ($shift->business_id) {
-            $cashTrxQuery->where('business_id', $shift->business_id);
-        }
-
-        $cashTrxQuery->where(function ($q) use ($openedAt, $closedAt, $openedDate, $closedDate) {
-            if ($openedAt && $closedAt) {
-                $q->where(function ($sub) use ($openedAt, $closedAt) {
-                    $sub->where('created_at', '>=', $openedAt)
-                        ->where('created_at', '<=', $closedAt);
-                })->orWhere(function ($sub) use ($openedDate, $closedDate) {
-                    $sub->whereBetween('date', [$openedDate, $closedDate]);
-                });
-            } elseif ($openedAt) {
-                $q->where(function ($sub) use ($openedAt) {
-                    $sub->where('created_at', '>=', $openedAt);
-                })->orWhere(function ($sub) use ($openedDate) {
-                    $sub->where('date', '>=', $openedDate);
-                });
-            } else {
-                $q->whereDate('date', now()->toDateString());
-            }
-        });
-
-        $cashTrxList = $cashTrxQuery->orderBy('created_at', 'asc')->get();
-
-        foreach ($cashTrxList as $ctx) {
-            // Avoid duplicate if already captured from operating_expenses
-            $isDuplicate = false;
-            $ctxDate = $ctx->date ? (is_string($ctx->date) ? substr($ctx->date, 0, 10) : $ctx->date->format('Y-m-d')) : null;
-            foreach ($expenses as $existing) {
-                if ($existing['source'] === 'OPERATING_EXPENSE' &&
-                    abs($existing['amount'] - (float)$ctx->amount) < 0.01 &&
-                    $existing['date'] === $ctxDate) {
-                    $isDuplicate = true;
-                    break;
-                }
-            }
-            if ($isDuplicate) continue;
-
-            $amt = (float)$ctx->amount;
-            $totalExpenses += $amt;
-            $cashExpenses += $amt;
-
-            $desc = $ctx->name ?: 'Pengeluaran Kas Kecil';
-            $expenses[] = [
-                'id'                   => $ctx->id,
-                'source'               => 'CASH_TRANSACTION',
-                'expense_no'           => $ctx->transaction_no,
-                'date'                 => $ctxDate,
-                'time'                 => $ctx->created_at ? $ctx->created_at->format('H:i') : '-',
-                'category'             => $ctx->category,
-                'category_label'       => $ctx->category_label ?? $ctx->category,
-                'name'                 => $desc,
-                'description'          => $desc,
-                'amount'               => $amt,
-                'payment_method'       => 'CASH',
-                'payment_method_label' => 'Kas di Laci (Tunai)',
-                'is_cash'              => true,
-                'notes'                => $ctx->notes,
-                'user_name'            => $ctx->user_name ?? ($ctx->user?->name ?? 'Kasir'),
-            ];
-        }
-
-        return [
-            'expenses'          => $expenses,
-            'total_expenses'    => $totalExpenses,
-            'cash_expenses'     => $cashExpenses,
-            'non_cash_expenses' => $nonCashExpenses,
-        ];
+        return \App\Services\AccountingService::calculateShiftExpenses($shift);
     }
+
 
     /**
      * Get real-time summary of sales & theoretical ingredient consumption for a shift.
@@ -1345,6 +1428,7 @@ class ShiftController extends Controller
         $shopeeSales = 0.0;
         $transferSales = 0.0;
         $debitSales = 0.0;
+        $kasbonSales = 0.0;
         $otherSales = 0.0;
         $nonCashSales = 0.0;
         $paymentBreakdown = [];
@@ -1362,16 +1446,18 @@ class ShiftController extends Controller
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'GOFOOD') || str_contains($method, 'GOJEK')) {
                 $gofoodSales += $price;
-                $grabSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'SHOPEE')) {
                 $shopeeSales += $price;
+                $nonCashSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
+            } elseif (str_contains($method, 'GRAB')) {
                 $grabSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
-            } elseif (str_contains($method, 'GRAB') || str_contains($method, 'TIKTOK')) {
-                $grabSales += $price;
+            } elseif (str_contains($method, 'TIKTOK')) {
+                $tiktokSales = ($tiktokSales ?? 0.0) + $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (str_contains($method, 'TRANSFER')) {
@@ -1382,7 +1468,9 @@ class ShiftController extends Controller
                 $debitSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
-            } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
+            } elseif (in_array($method, ['KASBON', 'PIUTANG']) || str_contains($method, 'KASBON') || str_contains($method, 'PIUTANG')) {
+                $kasbonSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
                 if (!$hasShiftRecPayments) {
                     $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
                     $dpPaid = (float)($t->amount_paid ?? 0);
@@ -1482,6 +1570,25 @@ class ShiftController extends Controller
         $openBillsCount = $openBills->count();
         $openBillsTotal = (float)$openBills->sum('total_amount');
 
+        // Pending Urgent Notes in this outlet
+        $pendingUrgentNotes = UrgentNote::where('outlet_id', $shift->outlet_id)
+            ->where('status', 'PENDING')
+            ->with(['ingredient', 'menu'])
+            ->get();
+        $pendingUrgentCount = $pendingUrgentNotes->count();
+        $pendingUrgentOrdersCount = $pendingUrgentNotes->pluck('order_number')->filter()->unique()->count();
+        $pendingUrgentList = $pendingUrgentNotes->map(function ($un) {
+            return [
+                'id'           => $un->id,
+                'order_number' => $un->order_number,
+                'item_name'    => $un->item_name ?: ($un->ingredient?->name ?? $un->menu?->name ?? 'Bahan'),
+                'pending_qty'  => (float)$un->pending_qty,
+                'unit'         => $un->unit ?: ($un->ingredient?->unit_pakai ?? 'satuan'),
+                'notes'        => $un->notes,
+                'created_at'   => $un->created_at ? $un->created_at->format('Y-m-d H:i') : null,
+            ];
+        });
+
         $ordersGrouped = [];
         foreach ($paidTransactions as $t) {
             $ordNum = $t->order_number ?: ('TRX-' . $t->id);
@@ -1559,6 +1666,40 @@ class ShiftController extends Controller
         $shift->can_deposit = $canDeposit;
         $shift->cannot_deposit_reason = $cannotDepositReason;
 
+        $shiftRecs = \App\Models\Receivable::where('shift_id', $shift->id)->with('payments')->get();
+        $kbTotal = (float)$shiftRecs->sum('total_amount');
+        $kbPaid = (float)$shiftRecs->sum('paid_amount');
+        $kbRemaining = (float)$shiftRecs->sum('remaining_amount');
+        $kbSettlementMethods = [];
+        foreach ($shiftRecs as $rec) {
+            foreach ($rec->payments as $p) {
+                $pm = strtoupper(trim($p->payment_method ?? 'CASH'));
+                $kbSettlementMethods[$pm] = ($kbSettlementMethods[$pm] ?? 0.0) + (float)$p->amount;
+            }
+        }
+
+        $rpCollections = [
+            'total'    => (float)$shiftRecPayments->sum('amount'),
+            'cash'     => 0.0,
+            'qris'     => 0.0,
+            'transfer' => 0.0,
+            'debit'    => 0.0,
+            'other'    => 0.0,
+        ];
+        foreach ($shiftRecPayments as $rp) {
+            $amt = (float)$rp->amount;
+            $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            if ($m === 'CASH' || $m === 'TUNAI') $rpCollections['cash'] += $amt;
+            elseif (str_contains($m, 'QRIS')) $rpCollections['qris'] += $amt;
+            elseif (str_contains($m, 'TRANSFER')) $rpCollections['transfer'] += $amt;
+            elseif (str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'CREDIT')) $rpCollections['debit'] += $amt;
+            else $rpCollections['other'] += $amt;
+        }
+
+        if ($kasbonSales == 0 && $kbTotal > 0) {
+            $kasbonSales = $kbTotal;
+        }
+
         return response()->json([
             'shift'              => $shift,
             'has_next_shift'     => $hasNextShift,
@@ -1576,6 +1717,11 @@ class ShiftController extends Controller
             'transfer_sales'     => $transferSales,
             'debit_sales'        => $debitSales,
             'other_sales'        => $otherSales,
+            'kasbon_sales'       => $kasbonSales,
+            'kasbon_settled'     => $kbPaid,
+            'kasbon_remaining'   => $kbRemaining,
+            'kasbon_settlement_methods' => $kbSettlementMethods,
+            'receivable_collections'    => $rpCollections,
             'non_cash_sales'     => $nonCashSales,
             'payment_breakdown'  => $paymentBreakdown,
             'expenses'           => $expData['expenses'],
@@ -1591,6 +1737,9 @@ class ShiftController extends Controller
             'open_bills_count'   => $openBillsCount,
             'open_bills_total'   => $openBillsTotal,
             'open_bills'         => $openBills,
+            'pending_urgent_count'        => $pendingUrgentCount,
+            'pending_urgent_orders_count' => $pendingUrgentOrdersCount,
+            'pending_urgent_notes'        => $pendingUrgentList,
         ]);
     }
 
@@ -1617,10 +1766,7 @@ class ShiftController extends Controller
             ->with(['menu', 'customer'])
             ->get();
 
-        $shiftRecPayments = \App\Models\ReceivablePayment::where('shift_id', $shift->id)
-            ->with('receivable.customer')
-            ->get();
-
+        $shiftRecPayments = $this->getShiftReceivablePayments($shift);
         $hasShiftRecPayments = $shiftRecPayments->isNotEmpty();
 
         $cashSales = 0.0;
@@ -1630,9 +1776,10 @@ class ShiftController extends Controller
         $shopeeSales = 0.0;
         $transferSales = 0.0;
         $debitSales = 0.0;
+        $kasbonSales = 0.0;
         $otherSales = 0.0;
         $nonCashSales = 0.0;
-        $totalSales = (float)$shift->calculateTotalSales();
+        $totalSales = (float)$paidTransactions->sum('total_price');
 
         $paymentBreakdown = [];
         $ordersGrouped = [];
@@ -1670,7 +1817,9 @@ class ShiftController extends Controller
                 $debitSales += $price;
                 $nonCashSales += $price;
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
-            } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
+            } elseif (in_array($method, ['KASBON', 'PIUTANG']) || str_contains($method, 'KASBON') || str_contains($method, 'PIUTANG')) {
+                $kasbonSales += $price;
+                $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
                 if (!$hasShiftRecPayments) {
                     $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
                     $dpPaid = (float)($t->amount_paid ?? 0);
@@ -1795,11 +1944,20 @@ class ShiftController extends Controller
         if ($grabSales > 0) $nonCashDetails['GRAB / TIKTOK'] = $grabSales;
         if ($gofoodSales > 0) $nonCashDetails['GOFOOD'] = $gofoodSales;
         if ($shopeeSales > 0) $nonCashDetails['SHOPEEFOOD'] = $shopeeSales;
+        if ($kasbonSales > 0) $nonCashDetails['KASBON'] = $kasbonSales;
         if ($otherSales > 0) $nonCashDetails['LAINNYA'] = $otherSales;
 
         $closingCash = $shift->closing_cash !== null ? (float)$shift->closing_cash : null;
         $cashDiff = $shift->cash_difference !== null ? (float)$shift->cash_difference : ($closingCash !== null ? ($closingCash - $expectedCash) : 0);
-        $depositAmount = (float)($shift->deposit_amount ?? 0);
+
+        // Fetch any existing cash deposit transaction for this shift
+        $lastDeposit = \App\Models\CashTransaction::where('shift_id', $shift->id)
+            ->where('category', 'SETORAN_KASIR')
+            ->latest('id')
+            ->first();
+
+        $depositAmount = (float)($shift->deposit_amount ?: ($lastDeposit ? $lastDeposit->amount : 0));
+        $depositStatus = $shift->deposit_status ?: ($lastDeposit ? $lastDeposit->status : null);
         $depositDiff = $depositAmount > 0 && $closingCash !== null ? round($depositAmount - $closingCash, 2) : 0;
 
         return response()->json([
@@ -1816,15 +1974,17 @@ class ShiftController extends Controller
             'total_expenses'     => $expData['cash_expenses'],
             'closing_cash'       => $closingCash,
             'cash_difference'    => $cashDiff,
-            'deposit_status'     => $shift->deposit_status,
-            'is_deposited'       => $shift->deposit_status === 'APPROVED' || $depositAmount > 0,
-            'is_deposit_pending' => $shift->deposit_status === 'PENDING',
-            'is_deposit_rejected'=> $shift->deposit_status === 'REJECTED',
+            'deposit_status'     => $depositStatus,
+            'is_deposited'       => $depositStatus === 'APPROVED' || $depositAmount > 0,
+            'is_deposit_pending' => $depositStatus === 'PENDING',
+            'is_deposit_rejected'=> $depositStatus === 'REJECTED',
             'deposit_amount'     => $depositAmount,
-            'deposit_account'    => $shift->deposit_account_label ?: ($shift->deposit_account ?: 'Kas Besar / Brankas'),
+            'deposit_account'    => $shift->deposit_account_label ?: ($shift->deposit_account ?: ($lastDeposit?->account === 'BANK_MAIN' ? 'Rekening Bank' : 'Kas Besar / Brankas')),
             'deposit_diff'       => $depositDiff,
+            'last_deposit'       => $lastDeposit,
             'total_transactions' => count($ordersList),
             'total_sales'        => $totalSales,
+            'kasbon_sales'       => $kasbonSales,
             'non_cash_total'     => $nonCashSales,
             'non_cash_details'   => $nonCashDetails,
             'orders'             => $ordersList,
@@ -1934,10 +2094,11 @@ class ShiftController extends Controller
                 $systemSales = $totalPaymentsReceived;
             }
 
-            $expData = $this->getShiftExpenses($shift);
+            $drawerData = \App\Services\AccountingService::calculateShiftDrawerCash($shift);
+            $expData = $drawerData['exp_data'];
             $closingCash = (float)$data['closing_cash'];
-            $expectedCash = max(0, (float)$shift->initial_cash + $cashSales - $expData['cash_expenses']);
-            $cashDiff = $closingCash - $expectedCash;
+            $expectedCash = $drawerData['expected_cash'];
+            $cashDiff = round($closingCash - $expectedCash, 2);
 
             // 1. Calculate aggregated theoretical ingredient usage
             $ingredientUsages = $shift->calculateIngredientUsage();
@@ -1966,6 +2127,11 @@ class ShiftController extends Controller
             if ($openBillsCount > 0 && $allowCarryOver) {
                 $carryNote = "Open Bill Dialihkan ke Shift Berikutnya: {$openBillsCount} tagihan pelanggan (Rp " . number_format($openBillsTotal, 0, ',', '.') . ")";
                 $combinedNotes = $combinedNotes ? $combinedNotes . "\n" . $carryNote : $carryNote;
+            }
+            $pendingUrgentCount = UrgentNote::where('outlet_id', $shift->outlet_id)->where('status', 'PENDING')->count();
+            if ($pendingUrgentCount > 0) {
+                $carryUrgentNote = "Nota Urgent Dialihkan ke Shift Berikutnya: {$pendingUrgentCount} bahan/pesanan pending.";
+                $combinedNotes = $combinedNotes ? $combinedNotes . "\n" . $carryUrgentNote : $carryUrgentNote;
             }
             if (!empty($data['notes'])) {
                 $combinedNotes = $combinedNotes ? $combinedNotes . "\nClosing: " . $data['notes'] : $data['notes'];
@@ -2010,6 +2176,7 @@ class ShiftController extends Controller
                 'cash_difference'  => $cashDiff,
                 'carry_over_count' => $openBillsCount,
                 'carry_over_total' => $openBillsTotal,
+                'pending_urgent_count' => $pendingUrgentCount,
             ];
         });
 
@@ -2031,7 +2198,7 @@ class ShiftController extends Controller
         $ingId = $request->ingredient_id ? (int)$request->ingredient_id : null;
 
         $transactions = $shift->transactions()
-            ->with(['menu.recipes.items.ingredient', 'user', 'outlet', 'shift', 'creator', 'updater', 'cancelledByUser', 'voidRequestedByUser', 'voidApprovedByUser', 'voidRejectedByUser', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient', 'customer'])
+            ->with(['menu.recipes.items.ingredient', 'user', 'outlet', 'shift', 'creator', 'updater', 'cancelledByUser', 'voidRequestedByUser', 'voidApprovedByUser', 'voidRejectedByUser', 'modifiers.ingredient', 'discount', 'urgentNotes.ingredient', 'customer', 'receivable.payments.receiver'])
             ->orderBy('created_at', 'asc')
             ->orderBy('id', 'asc')
             ->get();
@@ -2111,6 +2278,7 @@ class ShiftController extends Controller
             'non_cash_expenses'          => $expData['non_cash_expenses'],
             'transactions'               => $rows,
             'raw_transactions'           => $transactions,
+            'receivable_payments'        => $shiftRecPayments,
         ]);
     }
 
@@ -2514,11 +2682,57 @@ class ShiftController extends Controller
 
                 \App\Services\AccountingService::postCashTransaction($ct);
                 $synced++;
+            } elseif ($prevRemaining > 0 && !str_contains($shift->notes ?? '', 'Kas Besar')) {
+                // 3. KASUS SELISIH SERAH TERIMA LACI ($prevRemaining > 0 dan sisa laci berbeda)
+                $hoDiff = round((float)$shift->initial_cash - $prevRemaining, 2);
+                if (abs($hoDiff) >= 0.01) {
+                    $existingHo = \App\Models\CashTransaction::where('shift_id', $shift->id)
+                        ->where('category', 'SELISIH_SERAH_TERIMA')
+                        ->first();
+                    if ($existingHo) {
+                        \App\Services\AccountingService::postCashTransaction($existingHo);
+                    } else {
+                        $isShortage = $hoDiff < 0;
+                        $diffAmt = abs($hoDiff);
+                        $txType = $isShortage ? 'OUT' : 'IN';
+                        $trxNo = 'CT-ST-' . date('YmdHis', strtotime($shift->opened_at ?: now())) . '-' . rand(100, 999);
+                        $txName = $isShortage
+                            ? "Selisih Kurang Serah Terima Kas Laci Shift #{$shift->id}"
+                            : "Selisih Lebih Serah Terima Kas Laci Shift #{$shift->id}";
+
+                        $approverId = $shift->created_by ?: ($shift->user_id ?: 1);
+                        $txDate = $shift->opened_at ? substr($shift->opened_at, 0, 10) : now()->toDateString();
+
+                        $ct = \App\Models\CashTransaction::create([
+                            'business_id'    => $shift->business_id ?: $businessId,
+                            'outlet_id'      => $shift->outlet_id,
+                            'shift_id'       => $shift->id,
+                            'transaction_no' => $trxNo,
+                            'name'           => $txName,
+                            'category'       => 'SELISIH_SERAH_TERIMA',
+                            'type'           => $txType,
+                            'activity_type'  => 'OPERATING',
+                            'account'        => 'PETTY_CASH',
+                            'payment_method' => 'CASH',
+                            'amount'         => $diffAmt,
+                            'date'           => $txDate,
+                            'status'         => 'APPROVED',
+                            'notes'          => "Penyesuaian selisih fisik kas laci saat serah terima pergantian shift dari Shift #{$prev->id} ke Shift #{$shift->id}. Sisa laci shift lalu: Rp " . number_format($prevRemaining, 0, ',', '.') . ", kas diterima kasir: Rp " . number_format($shift->initial_cash, 0, ',', '.') . " (" . ($isShortage ? 'Kurang' : 'Lebih') . " Rp " . number_format($diffAmt, 0, ',', '.') . ").",
+                            'user_id'        => $shift->user_id,
+                            'created_by'     => $approverId,
+                            'approved_by'    => $approverId,
+                            'approved_at'    => $shift->opened_at ?: now(),
+                        ]);
+
+                        \App\Services\AccountingService::postCashTransaction($ct);
+                        $synced++;
+                    }
+                }
             }
         }
 
         return response()->json([
-            'message' => "Berhasil menyinkronkan {$synced} jurnal penarikan modal kasir dari Kas Besar.",
+            'message' => "Berhasil menyinkronkan {$synced} jurnal modal & serah-terima kasir.",
             'synced_count' => $synced,
         ]);
     }

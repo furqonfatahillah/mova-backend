@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Opname;
 use App\Models\Ingredient;
 use App\Models\Outlet;
+use App\Models\Shift;
 use App\Services\AccountingService;
 use Illuminate\Http\Request;
 
@@ -32,7 +33,28 @@ class OpnameController extends Controller
             $query->where('outlet_id', $outletId);
         }
 
-        return response()->json($query->get()->keyBy('ingredient_id'));
+        $list = $query->get()->keyBy('ingredient_id');
+
+        // Jika user bukan owner/manager (pegawai blind count), sembunyikan snapshot teoritis & selisih
+        if ($user && !$this->checkIsOwnerOrManager($user)) {
+            $list->transform(function ($opn) {
+                $opn->stok_akhir_teoritis = 0;
+                $opn->stok_awal_periode = 0;
+                $opn->pembelian = 0;
+                $opn->pemakaian_teoritis = 0;
+                $opn->waste_qty = 0;
+                $opn->waste_value = 0;
+                $opn->nilai_teoritis = 0;
+                $opn->nilai_aktual = null;
+                $opn->variance_qty = null;
+                $opn->variance_pct = null;
+                $opn->variance_value = null;
+                $opn->status = null;
+                return $opn;
+            });
+        }
+
+        return response()->json($list);
     }
 
     public function upsert(Request $request)
@@ -66,6 +88,25 @@ class OpnameController extends Controller
             ->where('ingredient_id', $data['ingredient_id'])
             ->where('outlet_id', $outletId)
             ->first();
+
+        // 0. Stock opname tidak boleh dilakukan jika ada shift kasir yang masih terbuka
+        $openShift = $this->getActiveShift($outletId);
+        if ($openShift) {
+            $isOnlyEditingClosedNotes = $existing && $existing->is_closed && (!isset($data['actual_qty']) || (float)$data['actual_qty'] === (float)$existing->actual_qty);
+            if (!$isOnlyEditingClosedNotes) {
+                $shiftName = $openShift->shift_name ?: "Shift #{$openShift->id}";
+                $cashierName = $openShift->user?->name ? " (Kasir: {$openShift->user->name})" : '';
+                return response()->json([
+                    'message' => "Stock Opname tidak dapat dilakukan karena masih ada shift kasir yang aktif/terbuka di cabang ini: {$shiftName}{$cashierName}. Harap lakukan closing shift terlebih dahulu sebelum melaksanakan opname.",
+                    'active_shift' => [
+                        'id'         => $openShift->id,
+                        'shift_name' => $openShift->shift_name,
+                        'user_name'  => $openShift->user?->name,
+                        'opened_at'  => $openShift->opened_at,
+                    ]
+                ], 422);
+            }
+        }
 
         $opnameDate = $data['opname_date'] ?? ($existing?->opname_date ? (is_string($existing->opname_date) ? $existing->opname_date : $existing->opname_date->toDateString()) : now()->toDateString());
         $today = now()->toDateString();
@@ -254,6 +295,22 @@ class OpnameController extends Controller
         }
         $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
+        // 0. Stock opname tidak boleh dilakukan jika ada shift kasir yang masih terbuka
+        $openShift = $this->getActiveShift($outletId);
+        if ($openShift) {
+            $shiftName = $openShift->shift_name ?: "Shift #{$openShift->id}";
+            $cashierName = $openShift->user?->name ? " (Kasir: {$openShift->user->name})" : '';
+            return response()->json([
+                'message' => "Stock Opname tidak dapat dilakukan karena masih ada shift kasir yang aktif/terbuka di cabang ini: {$shiftName}{$cashierName}. Harap lakukan closing shift terlebih dahulu sebelum melaksanakan opname.",
+                'active_shift' => [
+                    'id'         => $openShift->id,
+                    'shift_name' => $openShift->shift_name,
+                    'user_name'  => $openShift->user?->name,
+                    'opened_at'  => $openShift->opened_at,
+                ]
+            ], 422);
+        }
+
         // 2. Tidak boleh tanggal mundur dari sesi opname yang telah di-release sebelumnya di cabang ini
         $latestReleased = Opname::where('outlet_id', $outletId)
             ->where('is_closed', true)
@@ -440,6 +497,23 @@ class OpnameController extends Controller
 
         $approverName = $request->approver ?: ($user->name ?? 'Owner Bisnis');
         $firstOpn = $opnames->first();
+        $targetOutletId = (int)$firstOpn->outlet_id;
+
+        // Stock opname tidak boleh di-release jika masih ada shift kasir yang terbuka
+        $openShift = $this->getActiveShift($targetOutletId);
+        if ($openShift) {
+            $shiftName = $openShift->shift_name ?: "Shift #{$openShift->id}";
+            $cashierName = $openShift->user?->name ? " (Kasir: {$openShift->user->name})" : '';
+            return response()->json([
+                'message' => "Sesi Opname tidak dapat di-release karena masih ada shift kasir yang aktif/terbuka di cabang ini: {$shiftName}{$cashierName}. Harap lakukan closing shift terlebih dahulu.",
+                'active_shift' => [
+                    'id'         => $openShift->id,
+                    'shift_name' => $openShift->shift_name,
+                    'user_name'  => $openShift->user?->name,
+                    'opened_at'  => $openShift->opened_at,
+                ]
+            ], 422);
+        }
 
         // Compute theoretical snapshot baseline only if existing snapshot is missing
         $reportCtrl = app(ReportController::class);
@@ -919,6 +993,8 @@ class OpnameController extends Controller
             }
         }
 
+        $activeShift = $this->getActiveShift((int)$outId);
+
         return response()->json([
             'session' => [
                 'opname_no'       => $first->opname_no,
@@ -933,6 +1009,13 @@ class OpnameController extends Controller
                 'is_closed'       => (bool) $first->is_closed,
                 'status'          => $first->is_closed ? 'RELEASED' : 'DRAFT',
                 'created_at'      => $first->created_at?->format('Y-m-d H:i:s'),
+                'active_shift'    => $activeShift ? [
+                    'id'         => $activeShift->id,
+                    'shift_name' => $activeShift->shift_name,
+                    'user_name'  => $activeShift->user?->name,
+                    'opened_at'  => $activeShift->opened_at,
+                ] : null,
+                'has_active_shift'=> (bool)$activeShift,
             ],
             'summary' => [
                 'total_items'             => count($detailedItems),
@@ -946,7 +1029,29 @@ class OpnameController extends Controller
                 'status_counts'           => $statusCounts,
             ],
             'items' => $detailedItems,
+            'active_shift' => $activeShift ? [
+                'id'         => $activeShift->id,
+                'shift_name' => $activeShift->shift_name,
+                'user_name'  => $activeShift->user?->name,
+                'opened_at'  => $activeShift->opened_at,
+            ] : null,
+            'has_active_shift' => (bool)$activeShift,
         ]);
+    }
+
+    /**
+     * Check if there is an active/open shift in the specified outlet.
+     */
+    private function getActiveShift(?int $outletId): ?Shift
+    {
+        if (!$outletId) {
+            return null;
+        }
+
+        return Shift::where('outlet_id', $outletId)
+            ->where('status', 'OPEN')
+            ->with('user:id,name')
+            ->first();
     }
 
     /**

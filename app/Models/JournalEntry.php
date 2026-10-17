@@ -70,6 +70,10 @@ class JournalEntry extends Model
             $num = (int)$m[1] + 1;
         }
 
+        while (static::where('business_id', $businessId)->where('entry_no', $prefix . str_pad((string)$num, 4, '0', STR_PAD_LEFT))->exists()) {
+            $num++;
+        }
+
         return $prefix . str_pad((string)$num, 4, '0', STR_PAD_LEFT);
     }
 }

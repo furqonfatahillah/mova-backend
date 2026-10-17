@@ -116,4 +116,117 @@ Artisan::command('shifts:sync-initial-cash-journals', function () {
     $this->info("Selesai! {$count} jurnal modal kasir berhasil disinkronkan.");
 })->purpose('Sinkronkan jurnal modal awal kasir (Saldo Awal vs Tarik dari Kas Besar) untuk shift-shift sebelumnya');
 
+Artisan::command('accounting:sync-all {business_id?}', function (?int $business_id = null) {
+    $this->info('Memulai sinkronisasi total Kartu Stok & Jurnal Akuntansi...');
+    $res = \App\Services\AccountingService::syncAllHistoricalData($business_id);
+    $this->info('Sinkronisasi selesai! Hasil:');
+    $this->table(['Entitas', 'Jumlah Diproses'], [
+        ['Saldo Awal', $res['initial_balances'] ?? 0],
+        ['Transaksi POS', $res['transactions'] ?? 0],
+        ['Pelunasan Kasbon', $res['receivable_payments'] ?? 0],
+        ['Shift Kasir', $res['shifts'] ?? 0],
+        ['Kas Masuk/Keluar', $res['cash_transactions'] ?? 0],
+        ['Biaya Operasional', $res['expenses'] ?? 0],
+        ['Transfer Stok', $res['transfers'] ?? 0],
+        ['Waste / Kerusakan', $res['wastes'] ?? 0],
+        ['Opname Fisik', $res['opnames'] ?? 0],
+        ['Pembelian Stok', $res['purchases'] ?? 0],
+        ['Pelunasan Hutang', $res['payable_payments'] ?? 0],
+        ['Total Jurnal Buku Besar', $res['total_journal_entries'] ?? 0],
+    ]);
+})->purpose('Sinkronisasi ulang seluruh Kartu Stok dan Jurnal Akuntansi secara kronologis');
+
+
+Artisan::command('stock:fix-adjustment-deficit-price {business_id?}', function (?int $business_id = null) {
+    // Fix: ADJUSTMENT_IN yang diinput saat stok defisit seharusnya menyimpan
+    // unit_price = avg pada saat defisit (avg terkunci), bukan avg terkini yang
+    // mungkin sudah berubah akibat pembelian setelah defisit.
+    //
+    // Command ini:
+    // 1. Mencari semua ADJUSTMENT_IN yang bertipe "Penyesuaian" (bukan auto-normalisasi dari PURCHASE)
+    // 2. Menemukan movement keluar (SALE_USAGE) yang mendahului ADJUSTMENT_IN tersebut
+    //    dan membawa stok ke defisit
+    // 3. Mengunci unit_price ADJUSTMENT_IN ke avg saat defisit
+    // 4. Memanggil recomputeMovingAverageFromHistory untuk menghitung ulang seluruh kartu stok
+
+    $this->info('Fixing ADJUSTMENT_IN movements with wrong deficit price...');
+
+    $ingredients = \App\Models\Ingredient::when($business_id, fn($q) => $q->where('business_id', $business_id))->get();
+    $outlets     = \App\Models\Outlet::when($business_id, fn($q) => $q->where('business_id', $business_id))->get();
+    $fixedCount  = 0;
+
+    foreach ($ingredients as $ing) {
+        $konversi = max((float)$ing->konversi, 1);
+        foreach ($outlets as $outlet) {
+            // Ambil semua movements secara kronologis untuk outlet ini
+            $movements = \App\Models\StockMovement::where('ingredient_id', $ing->id)
+                ->where('outlet_id', $outlet->id)
+                ->where('type', '!=', 'INITIAL')
+                ->orderBy('date', 'asc')
+                ->orderBy('created_at', 'asc')
+                ->orderBy('id', 'asc')
+                ->get();
+
+            if ($movements->isEmpty()) continue;
+
+            // Simulasi running stock untuk menemukan momen defisit
+            $runningStock = 0.0;
+            $lastOutPrice = 0.0; // unit_price dari movement keluar terakhir
+            $lastOutCostBefore = 0.0;
+
+            foreach ($movements as $m) {
+                $qty = (float)$m->qty;
+                $outTypes = ['SALE_USAGE', 'ADJUSTMENT_OUT', 'WASTE', 'TRANSFER_OUT', 'PREP_USAGE'];
+                $inTypes  = ['PURCHASE', 'TRANSFER_IN', 'ADJUSTMENT_IN', 'ADJUSTMENT_PLUS', 'PREP_OUTPUT'];
+
+                if (in_array($m->type, $outTypes)) {
+                    if ((float)$m->unit_price > 0) {
+                        $lastOutPrice = (float)$m->unit_price;
+                    }
+                    if ((float)$m->cost_before > 0) {
+                        $lastOutCostBefore = (float)$m->cost_before;
+                    }
+                    $runningStock -= $qty;
+                } elseif (in_array($m->type, ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS'])) {
+                    // Cek: apakah pada saat movement ini diproses, stok sedang defisit?
+                    if ($runningStock < -0.0001 && $lastOutPrice > 0) {
+                        // unit_price yang BENAR = avg saat defisit (dari movement keluar terakhir)
+                        $correctUnitPrice = $lastOutPrice;
+                        $currentUnitPrice = (float)$m->unit_price;
+
+                        // Hanya update jika unit_price berbeda signifikan (> 1% selisih)
+                        if (abs($currentUnitPrice - $correctUnitPrice) > ($correctUnitPrice * 0.01)) {
+                            $m->unit_price  = round($correctUnitPrice, 4);
+                            $m->total_price = round(($qty / $konversi) * $correctUnitPrice, 2);
+                            $m->saveQuietly();
+                            $fixedCount++;
+                            $this->line("  Fixed: {$ing->name} @ outlet {$outlet->name} | ADJUSTMENT_IN #{$m->id} | was {$currentUnitPrice} → corrected to {$correctUnitPrice}");
+                        }
+                    }
+                    $runningStock += $qty;
+                } else {
+                    $runningStock += $qty;
+                }
+            }
+        }
+    }
+
+    $this->info("Fixed {$fixedCount} ADJUSTMENT_IN movements.");
+    $this->info('Now recomputing all moving averages...');
+
+    foreach ($ingredients as $ing) {
+        $mainOutlet = $outlets->firstWhere('is_main', true) ?: $outlets->first();
+        $visited = [];
+        if ($mainOutlet) {
+            $ing->recomputeMovingAverageFromHistory((int)$mainOutlet->id, $visited);
+        }
+        foreach ($outlets as $out) {
+            if (!in_array((int)$out->id, $visited)) {
+                $ing->recomputeMovingAverageFromHistory((int)$out->id, $visited);
+            }
+        }
+    }
+
+    $this->info('All done! Moving averages recomputed with corrected deficit prices.');
+})->purpose('Fix ADJUSTMENT_IN movements recorded during stock deficit that used wrong (post-purchase) avg price instead of locked deficit avg, then recompute all moving averages');
 

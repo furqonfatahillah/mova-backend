@@ -20,3 +20,4 @@ foreach (App\Models\ReceivablePayment::all() as $rp) {
 foreach (App\Models\Shift::all() as $s) {
     echo "Shift #{$s->id} | {$s->shift_name} | status:{$s->status} | initial:{$s->initial_cash} | closing:{$s->closing_cash} | sys:{$s->system_cash}\n";
 }
+

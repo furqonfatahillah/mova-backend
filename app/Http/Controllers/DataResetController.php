@@ -12,6 +12,7 @@ class DataResetController extends Controller
      * List of all transaction & operational tables
      */
     protected $transactionTables = [
+        'order_sequences',
         'transaction_modifiers',
         'transactions',
         'point_redemptions',
@@ -31,6 +32,8 @@ class DataResetController extends Controller
         'operating_expenses',
         'cash_transactions',
         'coin_transactions',
+        'journal_lines',
+        'journal_entries',
     ];
 
     /**
@@ -48,6 +51,7 @@ class DataResetController extends Controller
         'modifier_groups',
         'outlet_menus',
         'menus',
+        'ingredient_initial_balances',
         'outlet_ingredients',
         'ingredients',
         'customers',
@@ -58,10 +62,27 @@ class DataResetController extends Controller
     ];
 
     /**
+     * Check if user is authorized platform superadmin
+     */
+    protected function authorizeSuperadmin(Request $request): void
+    {
+        $user = $request->user();
+        if (!$user || !$user->isPlatformAdmin()) {
+            abort(403, 'Akses Ditolak: Fitur Reset Data Sistem hanya dapat diakses oleh Superadmin Platform / Website Owner.');
+        }
+
+        if (app()->environment('production')) {
+            abort(403, 'Operasi Ditolak: Fitur Reset Data dinonaktifkan secara permanen pada environment production demi keamanan data.');
+        }
+    }
+
+    /**
      * Get preview stats before resetting
      */
     public function preview(Request $request)
     {
+        $this->authorizeSuperadmin($request);
+
         $stats = [
             'transactions_count' => Schema::hasTable('transactions') ? DB::table('transactions')->count() : 0,
             'shifts_count'       => Schema::hasTable('shifts') ? DB::table('shifts')->count() : 0,
@@ -76,6 +97,7 @@ class DataResetController extends Controller
             'opnames_count'      => Schema::hasTable('opnames') ? DB::table('opnames')->count() : 0,
             'urgent_notes_count' => Schema::hasTable('urgent_notes') ? DB::table('urgent_notes')->count() : 0,
             'batch_preps_count'  => Schema::hasTable('batch_preps') ? DB::table('batch_preps')->count() : 0,
+            'journal_entries_count' => Schema::hasTable('journal_entries') ? DB::table('journal_entries')->count() : 0,
             // Preserved
             'users_count'        => Schema::hasTable('users') ? DB::table('users')->count() : 0,
             'outlets_count'      => Schema::hasTable('outlets') ? DB::table('outlets')->count() : 0,
@@ -95,6 +117,8 @@ class DataResetController extends Controller
      */
     public function resetData(Request $request)
     {
+        $this->authorizeSuperadmin($request);
+
         $mode = $request->input('mode', 'all'); // 'all' or 'transactions_only'
 
         try {
@@ -120,13 +144,15 @@ class DataResetController extends Controller
                 }
             }
 
-            // If mode is 'transactions_only', reset current stock numbers on outlet_ingredients to 0
+            // If mode is 'transactions_only', reset running current stock numbers on outlet_ingredients to match Table 2 (ingredient_initial_balances)
             if ($mode === 'transactions_only') {
-                if (Schema::hasTable('outlet_ingredients')) {
-                    DB::table('outlet_ingredients')->update(['current_stock' => 0]);
-                }
-                if (Schema::hasTable('ingredients')) {
-                    DB::table('ingredients')->update(['current_stock' => 0]);
+                if (Schema::hasTable('outlet_ingredients') && Schema::hasTable('ingredient_initial_balances')) {
+                    DB::statement("
+                        UPDATE outlet_ingredients oi
+                        LEFT JOIN ingredient_initial_balances iib 
+                            ON iib.outlet_id = oi.outlet_id AND iib.ingredient_id = oi.ingredient_id
+                        SET oi.current_stock = COALESCE(iib.stok_awal, 0)
+                    ");
                 }
             }
 

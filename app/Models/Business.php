@@ -23,6 +23,7 @@ class Business extends Model
         'referral_code_used',
         'coin_balance',
         'coins_per_transaction',
+        'is_unlimited_coins',
         'low_coin_threshold',
         'expires_at',
         'created_by',
@@ -34,6 +35,7 @@ class Business extends Model
         'max_outlets'            => 'integer',
         'coin_balance'           => 'float',
         'coins_per_transaction'  => 'float',
+        'is_unlimited_coins'     => 'boolean',
         'low_coin_threshold'     => 'integer',
     ];
 
@@ -43,6 +45,7 @@ class Business extends Model
         'changed_at',
         'changed_by_name',
         'is_active',
+        'is_unlimited',
         'remaining_transactions',
         'is_coin_low',
         'is_coin_out',
@@ -54,9 +57,17 @@ class Business extends Model
         return $this->hasMany(CoinTransaction::class);
     }
 
+    public function getIsUnlimitedAttribute(): bool
+    {
+        return (bool)($this->is_unlimited_coins || (isset($this->coins_per_transaction) && (float)$this->coins_per_transaction <= 0));
+    }
+
     public function getRemainingTransactionsAttribute(): int
     {
-        $rate = (float)($this->coins_per_transaction ?: 1.00);
+        if ($this->is_unlimited) {
+            return 999999;
+        }
+        $rate = isset($this->coins_per_transaction) ? (float)$this->coins_per_transaction : 1.00;
         if ($rate <= 0) return 999999;
         $balance = (float)($this->coin_balance ?: 0.00);
         return (int) floor($balance / $rate);
@@ -64,12 +75,18 @@ class Business extends Model
 
     public function getIsCoinLowAttribute(): bool
     {
+        if ($this->is_unlimited) {
+            return false;
+        }
         $threshold = (int)($this->low_coin_threshold ?: 2000);
         return $this->remaining_transactions <= $threshold && $this->remaining_transactions > 0;
     }
 
     public function getIsCoinOutAttribute(): bool
     {
+        if ($this->is_unlimited) {
+            return false;
+        }
         return $this->remaining_transactions <= 0;
     }
 
@@ -125,6 +142,8 @@ class Business extends Model
 
     public function getIsActiveAttribute(): bool
     {
+        if ($this->status === 'pending') return false;
+        if ($this->status === 'rejected') return false;
         if ($this->status === 'suspended') return false;
         if ($this->status === 'expired') return false;
         if ($this->expires_at && $this->expires_at->isPast()) return false;

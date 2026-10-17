@@ -29,6 +29,11 @@ class ExpenseCategoryController extends Controller
         return response()->json($category, 201);
     }
 
+    public function show(ExpenseCategory $expenseCategory)
+    {
+        return response()->json($expenseCategory);
+    }
+
     public function update(Request $request, ExpenseCategory $expenseCategory)
     {
         $data = $request->validate([

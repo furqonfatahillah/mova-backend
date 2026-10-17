@@ -35,6 +35,11 @@ class PaymentMethodController extends Controller
         return response()->json($paymentMethod, 201);
     }
 
+    public function show(PaymentMethod $paymentMethod)
+    {
+        return response()->json($paymentMethod);
+    }
+
     public function update(Request $request, PaymentMethod $paymentMethod)
     {
         $data = $request->validate([

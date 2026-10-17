@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Account;
+use App\Models\BatchPrep;
 use App\Models\Business;
 use App\Models\CashTransaction;
 use App\Models\Ingredient;
@@ -21,6 +22,7 @@ use App\Models\Shift;
 use App\Models\StockMovement;
 use App\Models\Transaction;
 use App\Models\Transfer;
+use App\Models\UrgentNote;
 use App\Models\WasteLog;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -28,12 +30,21 @@ use Illuminate\Support\Facades\Log;
 class AccountingService
 {
     /**
+     * Cache existing journal entry numbers by reference key (reference_type:reference_id)
+     * to preserve stable journal numbers across syncAllHistoricalData executions.
+     */
+    protected static array $preservedEntryNos = [];
+
+    /**
      * Map payment method string to Account Code
      */
     public static function getAccountCodeForPaymentMethod(?string $method): string
     {
         $m = strtoupper(trim((string)$method));
-        if ($m === 'CASH' || $m === 'TUNAI' || $m === 'PETTY_CASH' || $m === 'KAS' || $m === 'KASIR') {
+        if ($m === 'KAS_BESAR' || $m === 'KAS_UTAMA' || $m === 'BRANKAS') {
+            return '1-11001'; // KAS BESAR
+        }
+        if ($m === 'CASH' || $m === 'TUNAI' || $m === 'PETTY_CASH' || $m === 'KAS' || $m === 'KASIR' || $m === 'KAS_KECIL') {
             return '1-11002'; // KAS KECIL KASIR
         }
         if (
@@ -52,8 +63,11 @@ class AccountingService
         ) {
             return '1-11004'; // KAS APLIKASI (QRIS & E-COMMERCE)
         }
-        if (str_contains($m, 'TRANSFER') || str_contains($m, 'BANK') || str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'KARTU') || str_contains($m, 'CREDIT') || str_contains($m, 'BCA') || str_contains($m, 'MANDIRI') || str_contains($m, 'BRI') || str_contains($m, 'BNI')) {
+        if (str_contains($m, 'TRANSFER') || str_contains($m, 'BANK') || str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'KARTU') || str_contains($m, 'BCA') || str_contains($m, 'MANDIRI') || str_contains($m, 'BRI') || str_contains($m, 'BNI')) {
             return '1-11003'; // BANK
+        }
+        if ($m === 'HUTANG' || $m === 'TEMPO' || $m === 'CREDIT' || $m === 'SUPPLIER') {
+            return '2-21001'; // HUTANG USAHA
         }
         if ($m === 'KASBON' || $m === 'PIUTANG' || str_contains($m, 'KASBON') || str_contains($m, 'HUTANG_PELANGGAN') || str_contains($m, 'KARYAWAN') || str_contains($m, 'STAFF') || str_contains($m, 'PEGAWAI')) {
             return '1-12001'; // PIUTANG USAHA
@@ -154,19 +168,27 @@ class AccountingService
 
         $isBalanced = abs($totalDebit - $totalCredit) < 0.01;
 
-        // Delete previous entry with the same reference if updating
-        if (!empty($data['reference_type']) && !empty($data['reference_id'])) {
+        // Delete previous entry with the same reference if updating, while preserving original entry_no
+        $refKey = (!empty($data['reference_type']) && !empty($data['reference_id']))
+            ? ($data['reference_type'] . ':' . $data['reference_id'])
+            : null;
+
+        $existingEntryNo = null;
+        if ($refKey) {
             $existing = JournalEntry::where('business_id', $bizId)
                 ->where('reference_type', $data['reference_type'])
                 ->where('reference_id', $data['reference_id'])
                 ->first();
             if ($existing) {
+                $existingEntryNo = $existing->entry_no;
                 $existing->delete();
+            } elseif (isset(self::$preservedEntryNos[$refKey])) {
+                $existingEntryNo = self::$preservedEntryNos[$refKey];
             }
         }
 
         $entryDate = $data['entry_date'] ?? now()->toDateString();
-        $entryNo = $data['entry_no'] ?? JournalEntry::generateEntryNo($bizId, $entryDate);
+        $entryNo = $data['entry_no'] ?? ($existingEntryNo ?: JournalEntry::generateEntryNo($bizId, $entryDate));
 
         $accountsMap = Account::where('business_id', $bizId)->get()->keyBy('code');
 
@@ -237,27 +259,50 @@ class AccountingService
             $ings = Ingredient::where('business_id', $bizId)->with('outletIngredients')->get();
             $totalBahanAwal = 0.0;
             $totalPlkAwal = 0.0;
-            $isMainOutlet = (bool)$outlet->is_main || ((int)$outlet->id === 1);
-            $stockInitDate = null;
+            $stockInitDate = \App\Models\IngredientInitialBalance::where('outlet_id', $outlet->id)
+                ->whereNotNull('tanggal_saldo_awal')
+                ->value('tanggal_saldo_awal');
 
             foreach ($ings as $ing) {
                 $isPlk = self::isPerlengkapan($ing);
 
-                $oi = $ing->outletIngredients->firstWhere('outlet_id', $outlet->id);
-                $stokAwal = $oi ? (float)$oi->stok_awal : ($isMainOutlet ? (float)$ing->stok_awal : 0.0);
+                $initRow = \App\Models\IngredientInitialBalance::where('outlet_id', $outlet->id)->where('ingredient_id', $ing->id)->first();
+                $stokAwal = $initRow ? (float)$initRow->stok_awal : 0.0;
                 $costUnit = $ing->costPerPakaiForOutlet($outlet->id);
-                $saldoAwalNom = ($oi && (float)$oi->saldo_awal_nominal > 0) ? (float)$oi->saldo_awal_nominal : round($stokAwal * $costUnit, 2);
+                $saldoAwalNom = $initRow ? (float)$initRow->saldo_awal_nominal : round($stokAwal * $costUnit, 2);
 
                 if ($saldoAwalNom > 0) {
+                    // Cek apakah saldo awal ini berasal dari auto-adopt nilai plus saat saldo awal 0
+                    $adoptedMov = StockMovement::where('ingredient_id', $ing->id)
+                        ->where('outlet_id', $outlet->id)
+                        ->where('type', 'INITIAL')
+                        ->where('note', 'like', '%[Saldo Awal Otomatis]%')
+                        ->first();
+
+                    if ($adoptedMov) {
+                        // Jurnal untuk nilai plus yang menjadi saldo awal ketika saldo awal 0 adalah Persediaan pada Persediaan
+                        self::postAdoptedInitialBalance($adoptedMov, $saldoAwalNom, $outlet->id);
+                        continue; // JANGAN masukkan ke Modal Saldo Awal Persediaan (3-31001)
+                    }
+
                     if ($isPlk) {
                         $totalPlkAwal += $saldoAwalNom;
                     } else {
                         $totalBahanAwal += $saldoAwalNom;
                     }
                     if (!$stockInitDate) {
-                        $stockInitDate = $oi?->tanggal_saldo_awal ?: $ing->tanggal_saldo_awal;
+                        $stockInitDate = $initRow?->tanggal_saldo_awal ?: null;
                     }
                 }
+            }
+
+            // Pastikan mutasi masuk pertama bertipe INITIAL dengan [Saldo Awal Otomatis] lainnya tercatat jurnal Persediaan pada Persediaan
+            $allAdoptedMovements = StockMovement::where('outlet_id', $outlet->id)
+                ->where('type', 'INITIAL')
+                ->where('note', 'like', '%[Saldo Awal Otomatis]%')
+                ->get();
+            foreach ($allAdoptedMovements as $am) {
+                self::postAdoptedInitialBalance($am, null, $outlet->id);
             }
 
             $totalPersediaanAwal = round($totalBahanAwal + $totalPlkAwal, 2);
@@ -287,18 +332,281 @@ class AccountingService
     }
 
     /**
+     * 1B. POST ADOPTED INITIAL BALANCE (Saldo Awal Otomatis dari Mutasi Masuk Pertama ketika Saldo Awal = 0)
+     * Jurnal: Persediaan pada Persediaan (Debit: 1-13001/1-13002, Kredit: 1-13001/1-13002)
+     */
+    public static function postAdoptedInitialBalance(StockMovement $sm, ?float $amount = null, ?int $outletId = null): ?JournalEntry
+    {
+        $bizId = $sm->business_id ?? 1;
+        $outletId = $outletId ?: ($sm->outlet_id ?: 1);
+        $ing = $sm->ingredient ?: Ingredient::find($sm->ingredient_id);
+        $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
+
+        if ($amount === null || $amount <= 0) {
+            $amount = (float)$sm->total_price > 0
+                ? (float)$sm->total_price
+                : round((float)$sm->qty * (float)($sm->unit_price > 0 ? ($sm->unit_price > 1000 && $konversi > 1 ? $sm->unit_price / $konversi : $sm->unit_price) : ($ing ? $ing->costPerPakaiForOutlet($outletId) : 0)), 2);
+        }
+
+        if ($amount <= 0) {
+            return null;
+        }
+
+        $date = $sm->date ?: now()->toDateString();
+        $isPlk = self::isPerlengkapan($ing);
+        $invAcc = $isPlk ? '1-13002' : '1-13001';
+        $ingName = $ing ? $ing->name : 'Bahan';
+
+        $lines = [
+            [
+                'account_code' => $invAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => $amount,
+                'credit'       => 0,
+                'memo'         => "Saldo Awal Persediaan {$ingName} (Saldo Awal Otomatis)",
+            ],
+            [
+                'account_code' => $invAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => 0,
+                'credit'       => $amount,
+                'memo'         => "Alokasi Persediaan Masuk {$ingName} (Persediaan pada Persediaan)",
+            ],
+        ];
+
+        return self::recordEntry([
+            'business_id'    => $bizId,
+            'outlet_id'      => $outletId,
+            'entry_date'     => $date,
+            'entry_type'     => 'INITIAL_BALANCE',
+            'reference_type' => 'STOCK_MOVEMENT',
+            'reference_id'   => $sm->id,
+            'description'    => "Saldo Awal Otomatis (Persediaan pada Persediaan) #{$sm->id} - {$ingName}",
+        ], $lines, $bizId);
+    }
+
+    /**
+     * 1C. POST BATCH PREP (Masak Olahan: Persediaan Olahan pada Persediaan Bahan Baku)
+     */
+    public static function postBatchPrep(BatchPrep $bp): ?JournalEntry
+    {
+        $bizId = $bp->business_id ?? 1;
+        $outletId = $bp->outlet_id;
+        $totalCost = (float)$bp->total_cost;
+        if ($totalCost <= 0) {
+            return null;
+        }
+
+        // Cek apakah output batch prep ini sudah dijadikan Saldo Awal Otomatis (INITIAL_BALANCE)
+        $outputMov = StockMovement::where('batch_prep_id', $bp->id)
+            ->where('ingredient_id', $bp->ingredient_id)
+            ->first();
+
+        if ($outputMov && $outputMov->type === 'INITIAL') {
+            // Sudah tercatat lewat postAdoptedInitialBalance sebagai Persediaan pada Persediaan
+            return self::postAdoptedInitialBalance($outputMov, $totalCost, $outletId);
+        }
+
+        $date = $bp->date ?: now()->toDateString();
+        $semiIng = $bp->ingredient ?: Ingredient::find($bp->ingredient_id);
+        $semiName = $semiIng ? $semiIng->name : 'Bahan Olahan';
+        $isPlk = self::isPerlengkapan($semiIng);
+        $outputAcc = $isPlk ? '1-13002' : '1-13001';
+
+        $lines = [
+            [
+                'account_code' => $outputAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => $totalCost,
+                'credit'       => 0,
+                'memo'         => "Hasil Masak {$bp->batch_no} - {$semiName} ({$bp->actual_output_qty} {$bp->output_unit})",
+            ],
+            [
+                'account_code' => '1-13001',
+                'outlet_id'    => $outletId,
+                'debit'        => 0,
+                'credit'       => $totalCost,
+                'memo'         => "Pemakaian Bahan Mentah Masak {$bp->batch_no} - {$semiName}",
+            ],
+        ];
+
+        return self::recordEntry([
+            'business_id'    => $bizId,
+            'outlet_id'      => $outletId,
+            'entry_date'     => $date,
+            'entry_type'     => 'BATCH_PREP',
+            'reference_type' => 'BATCH_PREP',
+            'reference_id'   => $bp->id,
+            'description'    => "Produksi Masak Olahan {$bp->batch_no} - {$semiName}",
+        ], $lines, $bizId);
+    }
+
+    /**
      * 2. POST POS TRANSACTION (Penjualan, Piutang Kasbon, Diskon, & HPP Resep)
      */
     public static function postTransaction(Transaction $t): void
     {
-        if (!in_array($t->status, ['PAID', 'HOLD', 'SPLIT_CLOSED'])) {
-            // Delete journal entry if cancelled or voided
-            JournalEntry::where('business_id', $t->business_id ?? 1)
-                ->where('reference_type', 'TRANSACTION')
-                ->where('reference_id', $t->id)
-                ->delete();
+        if ($t->status === 'CANCELLED' || $t->status === 'VOID') {
+            self::postCancelledTransaction($t);
             return;
         }
+
+        // Transaksi berstatus HOLD (Open Bill / Meja Makan / Belum Bayar) dicatat sebagai Piutang Open Bill
+        // karena bahan baku sudah keluar dari dapur saat pesanan dibuat.
+        if (!in_array($t->status, ['PAID', 'HOLD', 'SPLIT_CLOSED'])) {
+            self::deleteReferenceEntry('TRANSACTION', $t->id, $t->business_id ?? 1);
+            return;
+        }
+
+        self::buildAndRecordSalesJournal($t);
+    }
+
+    /**
+     * Handle Jurnal untuk Transaksi yang Dibatalkan / Void (CANCELLED)
+     * Tidak menghapus jurnal asli transaksi/nota urgent, melainkan memastikan
+     * jurnal asli tetap tercatat dan membentuk JURNAL PEMBALIK (REVERSAL) BARU
+     * untuk mematikan/meng-offset jurnal asli tersebut secara transparan di buku besar.
+     */
+    public static function postCancelledTransaction(Transaction $t): void
+    {
+        $bizId = $t->business_id ?? 1;
+        $outletId = $t->outlet_id;
+
+        // 1. Cek apakah Jurnal Asli Penjualan sudah ada
+        $origEntry = JournalEntry::with('lines')
+            ->where('business_id', $bizId)
+            ->where('reference_type', 'TRANSACTION')
+            ->where('reference_id', $t->id)
+            ->first();
+
+        // Cek apakah transaksi ini merupakan Open Bill yang belum pernah dibayar (HOLD atau CANCELLED tanpa pembayaran)
+        $isUnpaidOpenBill = ($t->status === 'HOLD')
+            || ($t->status === 'CANCELLED' && (float)$t->amount_paid <= 0)
+            || ($t->status === 'CANCELLED' && str_contains(strtolower($t->notes ?? ''), 'open bill'))
+            || ($t->status === 'CANCELLED' && empty($t->payment_method))
+            || ($t->status === 'CANCELLED' && Transaction::where('order_number', $t->order_number)->where('status', 'HOLD')->exists());
+
+        // Jika jurnal asli belum ada, bangun jurnal aslinya terlebih dahulu agar memiliki basis pembalik yang akurat
+        if (!$origEntry) {
+            $origEntry = self::buildAndRecordSalesJournal($t);
+        }
+
+        if (!$origEntry) {
+            return;
+        }
+
+        // Jika transaksi ini belum pernah dibayar (Open Bill), pastikan akun penerimaan di jurnal asli adalah 1-12001 (Piutang Open Bill)
+        // dan BUKAN 1-11002 (Kas Kecil Kasir), agar Kas Kecil sama sekali tidak tersentuh
+        if ($isUnpaidOpenBill) {
+            $fixed = false;
+            foreach ($origEntry->lines as $ol) {
+                $rawCode = explode('.', $ol->account_code)[0];
+                if (in_array($rawCode, ['1-11001', '1-11002', '1-11003', '1-11004'])) {
+                    $ol->update([
+                        'account_code' => '1-12001',
+                        'memo'         => "Piutang Open Bill {$t->order_number}",
+                    ]);
+                    $fixed = true;
+                }
+            }
+            if ($fixed || str_contains($origEntry->description, '(CASH)')) {
+                $origEntry->update([
+                    'description' => "Penjualan POS Open Bill #{$t->order_number} (Piutang Meja)",
+                ]);
+                $origEntry->load('lines');
+            }
+        }
+
+        $isWasted = (strtoupper((string)$t->void_type) === 'WASTED');
+
+        // 2. Bentuk baris jurnal pembalik / void
+        // Jika WASTED: Kredit Persediaan di jurnal asli dialihkan menjadi DEBET BIAYA WASTED (5-51003 / 5-51006)
+        // Jika WRONG_INPUT: Persediaan bertambah kembali ke gudang (stok aman)
+        $reversalLines = [];
+        foreach ($origEntry->lines as $l) {
+            $deb = (float)$l->debit;
+            $crd = (float)$l->credit;
+            if ($deb <= 0 && $crd <= 0) continue;
+
+            $rawCode = explode('.', $l->account_code)[0];
+
+            if ($isWasted) {
+                // Sisi 1: Kredit Persediaan Bahan di jurnal asli dialihkan menjadi DEBET BIAYA WASTED BAHAN
+                if ($crd > 0 && ($rawCode === '1-13001' || str_starts_with($rawCode, '1-13001'))) {
+                    $reversalLines[] = [
+                        'account_code' => '5-51003',
+                        'outlet_id'    => $l->outlet_id ?: $outletId,
+                        'debit'        => $crd,
+                        'credit'       => 0,
+                        'memo'         => "Biaya Kerugian Waste Bahan (Void Wasted Nota #{$t->order_number})",
+                    ];
+                    continue;
+                }
+                // Sisi 2: Kredit Persediaan Perlengkapan di jurnal asli dialihkan menjadi DEBET BIAYA WASTED KEMASAN
+                if ($crd > 0 && ($rawCode === '1-13002' || str_starts_with($rawCode, '1-13002'))) {
+                    $reversalLines[] = [
+                        'account_code' => '5-51006',
+                        'outlet_id'    => $l->outlet_id ?: $outletId,
+                        'debit'        => $crd,
+                        'credit'       => 0,
+                        'memo'         => "Biaya Kerugian Waste Kemasan (Void Wasted Nota #{$t->order_number})",
+                    ];
+                    continue;
+                }
+
+                // Sisi 3: Akun-akun lainnya dibalik:
+                // - Kredit Pendapatan (4-41001) -> Debet (mematikan pendapatan)
+                // - Debet Kas/Piutang (1-1100x / 1-12001) -> Kredit (mematikan piutang/kas)
+                // - Debet HPP (5-51001, 5-51002, 5-51007, 5-51008) -> Kredit (mematikan HPP penjualan)
+                $memoPrefix = "Pembalikan Void Wasted: ";
+                if ($deb > 0 && in_array($rawCode, ['5-51001', '5-51002', '5-51007', '5-51008'])) {
+                    $memoPrefix = "Pengalihan HPP ke Biaya Waste: ";
+                }
+                $reversalLines[] = [
+                    'account_code' => $rawCode,
+                    'outlet_id'    => $l->outlet_id ?: $outletId,
+                    'debit'        => $crd,
+                    'credit'       => $deb,
+                    'memo'         => $memoPrefix . ($l->memo ?: "Nota #{$t->order_number}"),
+                ];
+            } else {
+                // Jika SALAH INPUT: debet dan kredit dibalik murni sehingga stok persediaan bertambah kembali
+                $reversalLines[] = [
+                    'account_code' => $rawCode,
+                    'outlet_id'    => $l->outlet_id ?: $outletId,
+                    'debit'        => $crd,
+                    'credit'       => $deb,
+                    'memo'         => "Pembalikan Void (Salah Input): " . ($l->memo ?: "Nota #{$t->order_number}"),
+                ];
+            }
+        }
+
+        if (empty($reversalLines)) {
+            return;
+        }
+
+        $cancelDate = $t->cancelled_at ? substr($t->cancelled_at, 0, 10) : ($t->date ?? now()->toDateString());
+        $voidTypeLabel = $isWasted ? 'WASTED' : ($t->void_type ?: 'VOID');
+        $reason = $t->cancellation_reason ?: ($isWasted ? 'Makanan Terbuang / Rusak' : 'Pembatalan Transaksi');
+
+        self::recordEntry([
+            'business_id'    => $bizId,
+            'outlet_id'      => $outletId,
+            'entry_date'     => $cancelDate,
+            'entry_type'     => $isWasted ? 'WASTE' : 'VOID',
+            'reference_type' => 'VOID_TRANSACTION',
+            'reference_id'   => $t->id,
+            'description'    => $isWasted
+                ? "Jurnal Void Wasted (Biaya Waste & Pembatalan Penjualan) Nota #{$t->order_number} - {$reason}"
+                : "Jurnal Pembalik / Void Nota #{$t->order_number} [{$voidTypeLabel}] - {$reason}",
+        ], $reversalLines, $bizId);
+    }
+
+    /**
+     * Membangun dan mencatat Jurnal Penjualan Asli (Sales Journal)
+     */
+    public static function buildAndRecordSalesJournal(Transaction $t): ?JournalEntry
+    {
 
         $bizId = $t->business_id ?? 1;
         $outletId = $t->outlet_id;
@@ -330,14 +638,24 @@ class AccountingService
         }
 
         // Debit side (Payment / Receivable)
-        // If status is HOLD (Open Bill) or payment method is KASBON/PIUTANG, it goes to Piutang Usaha (1-12001)
-        if ($t->status === 'HOLD' || $pm === 'KASBON' || $pm === 'PIUTANG') {
+        // Jika status HOLD (Open Bill), atau transaksi CANCELLED yang belum pernah dibayar (amount_paid <= 0 atau catatan Open Bill),
+        // atau metode bayar KASBON/PIUTANG, maka masuk ke Piutang Usaha (1-12001).
+        // Kas Kecil / Kas Kasir (1-11002) SAMA SEKALI TIDAK TERSENTUH karena belum pernah ada uang yang dibayar!
+        $isUnpaidOpenBill = ($t->status === 'HOLD')
+            || ($t->status === 'CANCELLED' && (float)$t->amount_paid <= 0)
+            || ($t->status === 'CANCELLED' && str_contains(strtolower($t->notes ?? ''), 'open bill'))
+            || ($t->status === 'CANCELLED' && empty($t->payment_method))
+            || ($t->status === 'CANCELLED' && Transaction::where('order_number', $t->order_number)->where('status', 'HOLD')->exists());
+
+        if ($isUnpaidOpenBill || $pm === 'KASBON' || $pm === 'PIUTANG') {
             $lines[] = [
                 'account_code' => '1-12001', // PIUTANG USAHA
                 'outlet_id'    => $outletId,
                 'debit'        => $totalNet,
                 'credit'       => 0,
-                'memo'         => ($t->status === 'HOLD') ? "Piutang Open Bill {$t->order_number}" : "Piutang Kasbon {$t->order_number}",
+                'memo'         => ($isUnpaidOpenBill && $pm !== 'KASBON' && $pm !== 'PIUTANG') 
+                    ? "Piutang Open Bill {$t->order_number}" 
+                    : "Piutang Kasbon {$t->order_number}",
             ];
         } else {
             $accCode = self::getAccountCodeForPaymentMethod($pm);
@@ -350,29 +668,126 @@ class AccountingService
             ];
         }
 
-        // B. COGS & Inventory Usage Side (HPP Resep)
+        // B. COGS & Inventory Usage Side (HPP & Pengurangan Persediaan)
+        // Prioritize actual StockMovement records created for this transaction to guarantee 100% sync with Kartu Stok!
+        // Ignore resolution movements with 'Pelunasan Nota Urgent' to avoid double-counting
+        $txMovements = StockMovement::with('ingredient')
+            ->where('transaction_id', $t->id)
+            ->where('type', 'SALE_USAGE')
+            ->where('note', 'not like', '%Pelunasan Nota Urgent%')
+            ->get();
+
+        $urgentNotes = $t->relationLoaded('urgentNotes')
+            ? $t->urgentNotes
+            : $t->urgentNotes()->get();
+
         $cogsBahan = 0.0;
         $cogsPlk = 0.0;
+        $cogsTeoritisBahan = 0.0;
+        $cogsTeoritisPlk = 0.0;
 
-        $menu = $t->menu;
-        if ($menu) {
-            if ($menu->item_type === 'DIRECT' || (!$menu->activeRecipe($t->date) && (float)$menu->cost_price > 0)) {
-                $cogsBahan += (float)$menu->cost_price * (int)$t->qty;
-            } else {
-                $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?: $menu->recipes->first();
-                if ($recipe) {
-                    foreach ($recipe->items as $it) {
-                        $ing = $it->ingredient;
-                        if (!$ing) continue;
-                        $isPlk = self::isPerlengkapan($ing);
-                        $unitCost = $ing->costPerPakaiForOutlet($outletId);
-                        $itemCost = (float)$it->qty * (int)$t->qty * $unitCost;
+        if ($txMovements->isNotEmpty()) {
+            foreach ($txMovements as $sm) {
+                $smIng = $sm->ingredient;
+                $isPlk = self::isPerlengkapan($smIng);
+                $totalQty = (float)$sm->qty;
 
-                        if ($isPlk) {
-                            $cogsPlk += $itemCost;
-                        } else {
-                            $cogsBahan += $itemCost;
+                $unitCost = 0.0;
+                if ((float)$sm->total_price > 0 && $totalQty > 0) {
+                    $unitCost = (float)$sm->total_price / $totalQty;
+                } elseif ((float)$sm->cost_after > 0) {
+                    $unitCost = (float)$sm->cost_after;
+                } elseif ((float)$sm->cost_before > 0) {
+                    $unitCost = (float)$sm->cost_before;
+                } elseif ($smIng) {
+                    $unitCost = (float)$smIng->costPerPakaiForOutlet($outletId);
+                }
+
+                // Check if this movement has a deficit / urgent note
+                $un = $urgentNotes->firstWhere('ingredient_id', $sm->ingredient_id);
+                $deficitQty = 0.0;
+                if ($un && (float)$un->pending_qty > 0) {
+                    $deficitQty = min($totalQty, (float)$un->pending_qty);
+                } elseif (preg_match('/Defisit\s+([0-9.]+)/i', (string)$sm->note, $matches)) {
+                    $deficitQty = min($totalQty, (float)$matches[1]);
+                }
+
+                $actualQty = max(0.0, $totalQty - $deficitQty);
+                $actualCost = round($actualQty * $unitCost, 2);
+                $deficitCost = round($deficitQty * $unitCost, 2);
+
+                if ($isPlk) {
+                    $cogsPlk += $actualCost;
+                    $cogsTeoritisPlk += $deficitCost;
+                } else {
+                    $cogsBahan += $actualCost;
+                    $cogsTeoritisBahan += $deficitCost;
+                }
+            }
+        } else {
+
+            $menu = $t->menu;
+            if ($menu) {
+                if ($menu->item_type === 'DIRECT' || (!$menu->activeRecipe($t->date) && (float)$menu->cost_price > 0)) {
+                    $un = $urgentNotes->firstWhere('menu_id', $menu->id);
+                    $reqQty = (int)$t->qty;
+                    $qtyToUse = $un ? min($reqQty, (float)$un->deducted_qty) : $reqQty;
+                    $shortfallQty = max(0, $reqQty - $qtyToUse);
+                    $costPrice = (float)$menu->cost_price;
+
+                    $cogsBahan += $costPrice * $qtyToUse;
+                    $cogsTeoritisBahan += $costPrice * $shortfallQty;
+                } else {
+                    $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?: $menu->recipes->first();
+                    if ($recipe) {
+                        foreach ($recipe->items as $it) {
+                            $ing = $it->ingredient;
+                            if (!$ing) continue;
+                            $isPlk = self::isPerlengkapan($ing);
+                            $unitCost = $ing->costPerPakaiForOutlet($outletId);
+
+                            $un = $urgentNotes->firstWhere('ingredient_id', $ing->id);
+                            $reqQty = (float)$it->qty * (int)$t->qty;
+                            $qtyToUse = $un ? min($reqQty, (float)$un->deducted_qty) : $reqQty;
+                            $shortfallQty = max(0.0, $reqQty - $qtyToUse);
+
+                            $itemCost = $qtyToUse * $unitCost;
+                            $shortfallCost = $shortfallQty * $unitCost;
+
+                            if ($isPlk) {
+                                $cogsPlk += $itemCost;
+                                $cogsTeoritisPlk += $shortfallCost;
+                            } else {
+                                $cogsBahan += $itemCost;
+                                $cogsTeoritisBahan += $shortfallCost;
+                            }
                         }
+                    }
+                }
+            }
+
+            // Modifiers COGS
+            $modifiers = $t->relationLoaded('modifiers') ? $t->modifiers : $t->modifiers()->with('ingredient')->get();
+            if ($modifiers && $modifiers->count() > 0) {
+                foreach ($modifiers as $mod) {
+                    $modIng = $mod->ingredient;
+                    if (!$modIng) continue;
+                    $isPlk = self::isPerlengkapan($modIng);
+                    $unitCost = $modIng->costPerPakaiForOutlet($outletId);
+                    $un = $urgentNotes->firstWhere('ingredient_id', $modIng->id);
+                    $reqQty = (float)($mod->qty_consumed ?: 1);
+                    $qtyToUse = $un ? min($reqQty, (float)$un->deducted_qty) : $reqQty;
+                    $shortfallQty = max(0.0, $reqQty - $qtyToUse);
+
+                    $itemCost = $qtyToUse * $unitCost;
+                    $shortfallCost = $shortfallQty * $unitCost;
+
+                    if ($isPlk) {
+                        $cogsPlk += $itemCost;
+                        $cogsTeoritisPlk += $shortfallCost;
+                    } else {
+                        $cogsBahan += $itemCost;
+                        $cogsTeoritisBahan += $shortfallCost;
                     }
                 }
             }
@@ -380,6 +795,9 @@ class AccountingService
 
         $cogsBahan = round($cogsBahan, 2);
         $cogsPlk = round($cogsPlk, 2);
+        $cogsTeoritisBahan = round($cogsTeoritisBahan, 2);
+        $cogsTeoritisPlk = round($cogsTeoritisPlk, 2);
+        $cogsTeoritis = round($cogsTeoritisBahan + $cogsTeoritisPlk, 2);
 
         if ($cogsBahan > 0) {
             $lines[] = ['account_code' => '5-51001', 'outlet_id' => $outletId, 'debit' => $cogsBahan, 'credit' => 0, 'memo' => 'Beban Bahan Baku (HPP)'];
@@ -389,16 +807,128 @@ class AccountingService
             $lines[] = ['account_code' => '5-51002', 'outlet_id' => $outletId, 'debit' => $cogsPlk, 'credit' => 0, 'memo' => 'Beban Kemasan & Packaging (HPP)'];
             $lines[] = ['account_code' => '1-13002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsPlk, 'memo' => 'Pengurangan Persediaan Perlengkapan'];
         }
+        if ($cogsTeoritisBahan > 0) {
+            $lines[] = ['account_code' => '5-51007', 'outlet_id' => $outletId, 'debit' => $cogsTeoritisBahan, 'credit' => 0, 'memo' => 'Beban Selisih HPP Teoritis Bahan (Stok Minus)'];
+            $lines[] = ['account_code' => '1-13001', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsTeoritisBahan, 'memo' => 'Pengurangan Persediaan Bahan (Selisih Teoritis)'];
+        }
+        if ($cogsTeoritisPlk > 0) {
+            $lines[] = ['account_code' => '5-51008', 'outlet_id' => $outletId, 'debit' => $cogsTeoritisPlk, 'credit' => 0, 'memo' => 'Beban Selisih HPP Teoritis Perlengkapan (Stok Minus)'];
+            $lines[] = ['account_code' => '1-13002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsTeoritisPlk, 'memo' => 'Pengurangan Persediaan Perlengkapan (Selisih Teoritis)'];
+        }
 
-        self::recordEntry([
+        return self::recordEntry([
             'business_id'    => $bizId,
             'outlet_id'      => $outletId,
             'entry_date'     => $t->date,
             'entry_type'     => 'SALES',
             'reference_type' => 'TRANSACTION',
-            'description'    => ($t->status === 'HOLD')
+            'reference_id'   => $t->id,
+            'description'    => ($isUnpaidOpenBill)
                 ? "Penjualan POS Open Bill #{$t->order_number} (Piutang Meja)"
                 : "Penjualan POS #{$t->order_number} ({$pm})",
+        ], $lines, $bizId);
+    }
+
+    /**
+     * 2B. POST URGENT NOTE RESOLUTION (Pelunasan Bahan Tergantung)
+     * When pending ingredients from urgent notes are verified & deducted later.
+     */
+    public static function postUrgentNoteResolution(UrgentNote $un): void
+    {
+        if ($un->status !== 'RESOLVED') {
+            return;
+        }
+
+        // Jika transaksi asalnya berstatus CANCELLED, VOID, atau REFUNDED,
+        // tidak boleh memposting jurnal pelunasan karena tidak ada beban selisih teoritis yang diakui di jurnal penjualan
+        if ($un->transaction_id) {
+            $parentTrx = Transaction::find($un->transaction_id);
+            if ($parentTrx && in_array(strtoupper((string)$parentTrx->status), ['CANCELLED', 'VOID', 'REFUNDED'])) {
+                return;
+            }
+        }
+
+        $bizId = $un->business_id ?: 1;
+        $outletId = $un->outlet_id ?: 1;
+        $pendingQty = (float)$un->pending_qty;
+        if ($pendingQty <= 0) {
+            return;
+        }
+        $cost = 0.0;
+        $isPlk = false;
+
+        if ($un->ingredient_id) {
+            $ing = $un->ingredient ?: Ingredient::find($un->ingredient_id);
+            if ($ing) {
+                $isPlk = self::isPerlengkapan($ing);
+
+                // 1. Kunci (Lock) nilai HPP berdasarkan HPP saat transaksi penjualan awal terjadi agar nilai kredit pembalik persis sama dengan nilai debit awal
+                $originalUnitCost = 0.0;
+                if ($un->transaction_id) {
+                    $sm = StockMovement::where('transaction_id', $un->transaction_id)
+                        ->where('ingredient_id', $un->ingredient_id)
+                        ->first();
+                    if ($sm) {
+                        if ((float)$sm->cost_before > 0) {
+                            $originalUnitCost = (float)$sm->cost_before;
+                        } elseif ((float)$sm->cost_after > 0) {
+                            $originalUnitCost = (float)$sm->cost_after;
+                        } elseif ((float)$sm->unit_price > 0) {
+                            $originalUnitCost = (float)$sm->unit_price / max((float)($ing->konversi ?: 1), 1);
+                        }
+                    }
+                }
+
+                $unitCost = ($originalUnitCost > 0) ? $originalUnitCost : $ing->costPerPakaiForOutlet((int)$outletId);
+                $cost = round($pendingQty * $unitCost, 2);
+            }
+        } elseif ($un->menu_id && $un->item_type === 'DIRECT') {
+            $menu = $un->menu ?: Menu::find($un->menu_id);
+            if ($menu) {
+                $cost = round($pendingQty * (float)$menu->cost_price, 2);
+            }
+        }
+
+        if ($cost <= 0) {
+            return;
+        }
+
+        $expenseAcc = $isPlk ? '5-51002' : '5-51001';
+        $theoreticalAcc = $isPlk ? '5-51008' : '5-51007';
+        $expenseMemo = $isPlk ? 'Beban Kemasan & Packaging (Pelunasan HPP Aktual)' : 'Beban Bahan Baku (Pelunasan HPP Aktual)';
+        $theoreticalMemo = $isPlk
+            ? 'Pengalihan Beban Selisih HPP Teoritis Perlengkapan ke HPP Aktual'
+            : 'Pengalihan Beban Selisih HPP Teoritis Bahan ke HPP Aktual';
+
+        $resolveDate = $un->resolved_at
+            ? (is_string($un->resolved_at) ? substr($un->resolved_at, 0, 10) : $un->resolved_at->format('Y-m-d'))
+            : now()->toDateString();
+
+        $lines = [
+            [
+                'account_code' => $expenseAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => $cost,
+                'credit'       => 0,
+                'memo'         => $expenseMemo,
+            ],
+            [
+                'account_code' => $theoreticalAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => 0,
+                'credit'       => $cost,
+                'memo'         => $theoreticalMemo,
+            ],
+        ];
+
+        self::recordEntry([
+            'business_id'    => $bizId,
+            'outlet_id'      => $outletId,
+            'entry_date'     => $resolveDate,
+            'entry_type'     => 'COGS',
+            'reference_type' => 'URGENT_NOTE',
+            'reference_id'   => $un->id,
+            'description'    => "Pelunasan Nota Urgent #{$un->order_number} – {$un->item_name} ({$pendingQty} {$un->unit})",
         ], $lines, $bizId);
     }
 
@@ -443,6 +973,440 @@ class AccountingService
     }
 
     /**
+     * Get operating expenses and cash deductions associated with a shift.
+     * Intelligent de-duplication ensures legitimate transactions with identical amounts are never dropped.
+     */
+    public static function calculateShiftExpenses(Shift $shift): array
+    {
+        $openedAt = $shift->opened_at;
+        $closedAt = $shift->closed_at;
+        $openedDate = $openedAt ? (is_string($openedAt) ? substr($openedAt, 0, 10) : $openedAt->toDateString()) : now()->toDateString();
+        $closedDate = $closedAt ? (is_string($closedAt) ? substr($closedAt, 0, 10) : $closedAt->toDateString()) : now()->toDateString();
+
+        $expenses = [];
+        $totalExpenses = 0.0;
+        $cashExpenses = 0.0;
+        $nonCashExpenses = 0.0;
+        $cashOpex = 0.0;
+        $cashPurchases = 0.0;
+        $cashPayables = 0.0;
+        $cashOtherTrx = 0.0;
+
+        // 1. Operating Expenses (OPEX)
+        $opexQuery = OperatingExpense::with(['user', 'outlet'])
+            ->where(function ($q) use ($shift) {
+                $q->where('outlet_id', $shift->outlet_id)
+                  ->orWhereNull('outlet_id');
+            });
+
+        if ($shift->business_id) {
+            $opexQuery->where('business_id', $shift->business_id);
+        }
+
+        $opexQuery->where(function ($q) use ($shift, $openedAt, $closedAt, $openedDate, $closedDate) {
+            $q->where('shift_id', $shift->id)
+              ->orWhere(function ($sub) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+                  $sub->whereNull('shift_id');
+                  if ($openedAt && $closedAt) {
+                      $sub->where(function ($inner) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+                          $inner->whereBetween('created_at', [$openedAt, $closedAt])
+                                ->orWhereBetween('date', [$openedDate, $closedDate]);
+                      });
+                  } elseif ($openedAt) {
+                      $sub->where(function ($inner) use ($openedAt, $openedDate) {
+                          $inner->where('created_at', '>=', $openedAt)
+                                ->orWhere('date', '>=', $openedDate);
+                      });
+                  } else {
+                      $sub->whereDate('date', now()->toDateString());
+                  }
+              });
+        });
+
+        $opexList = $opexQuery->orderBy('created_at', 'asc')->get();
+
+        foreach ($opexList as $exp) {
+            $amt = (float)$exp->amount;
+            $method = strtoupper(trim($exp->payment_method ?? 'CASH'));
+            $isCash = in_array($method, ['CASH', 'TUNAI', 'PETTY_CASH', 'KAS_KECIL']) ||
+                      str_contains($method, 'CASH') ||
+                      str_contains($method, 'TUNAI') ||
+                      str_contains($method, 'PETTY') ||
+                      str_contains($method, 'KASIR') ||
+                      str_contains($method, 'LACI');
+
+            $totalExpenses += $amt;
+            if ($isCash) {
+                $cashExpenses += $amt;
+                $cashOpex += $amt;
+            } else {
+                $nonCashExpenses += $amt;
+            }
+
+            $desc = $exp->name ?: ($exp->category_label ?? 'Biaya Operasional');
+            $expenses[] = [
+                'id'                   => $exp->id,
+                'source'               => 'OPERATING_EXPENSE',
+                'expense_no'           => $exp->expense_no,
+                'date'                 => $exp->date ? (is_string($exp->date) ? substr($exp->date, 0, 10) : $exp->date->format('Y-m-d')) : null,
+                'time'                 => $exp->created_at ? $exp->created_at->format('H:i') : '-',
+                'category'             => $exp->category,
+                'category_label'       => $exp->category_label ?? $exp->category,
+                'name'                 => $desc,
+                'description'          => $desc,
+                'amount'               => $amt,
+                'payment_method'       => $exp->payment_method ?? 'CASH',
+                'payment_method_label' => $exp->payment_method_label ?? ($isCash ? 'Tunai / Kas di Laci' : 'Transfer Bank'),
+                'is_cash'              => $isCash,
+                'notes'                => $exp->notes,
+                'user_name'            => $exp->user_name ?? ($exp->user?->name ?? 'Kasir'),
+            ];
+        }
+
+        // 2. Cash Transactions (Type OUT for CASH_DRAWER / PETTY_CASH)
+        $cashTrxQuery = CashTransaction::with(['user', 'outlet'])
+            ->where('type', 'OUT')
+            ->whereNotIn('category', ['SETORAN_KASIR', 'TARIK_MODAL_KASIR', 'SALDO_AWAL', 'INITIAL_BALANCE', 'INITIAL_BALANCE_CASH', 'SETOR_KAS_APLIKASI', 'SELISIH_SERAH_TERIMA'])
+            ->where(function ($q) use ($shift) {
+                $q->where('outlet_id', $shift->outlet_id)
+                  ->orWhereNull('outlet_id');
+            });
+
+        if ($shift->business_id) {
+            $cashTrxQuery->where('business_id', $shift->business_id);
+        }
+
+        $cashTrxQuery->where(function ($q) use ($shift, $openedAt, $closedAt, $openedDate, $closedDate) {
+            $q->where('shift_id', $shift->id)
+              ->orWhere(function ($sub) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+                  $sub->whereNull('shift_id');
+                  if ($openedAt && $closedAt) {
+                      $sub->where(function ($inner) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+                          $inner->whereBetween('created_at', [$openedAt, $closedAt])
+                                ->orWhereBetween('date', [$openedDate, $closedDate]);
+                      });
+                  } elseif ($openedAt) {
+                      $sub->where(function ($inner) use ($openedAt, $openedDate) {
+                          $inner->where('created_at', '>=', $openedAt)
+                                ->orWhere('date', '>=', $openedDate);
+                      });
+                  } else {
+                      $sub->whereDate('date', now()->toDateString());
+                  }
+              });
+        });
+
+        $cashTrxList = $cashTrxQuery->orderBy('created_at', 'asc')->get();
+
+        foreach ($cashTrxList as $ctx) {
+            $ctxDate = $ctx->date ? (is_string($ctx->date) ? substr($ctx->date, 0, 10) : $ctx->date->format('Y-m-d')) : null;
+            $amt = (float)$ctx->amount;
+            $desc = $ctx->name ?: 'Pengeluaran Kas Kecil';
+
+            // Intelligent de-duplication: ONLY mark duplicate if explicit cross-reference in notes,
+            // OR identical normalized name + exact amount + date
+            $isDuplicate = false;
+            foreach ($expenses as $existing) {
+                if ($existing['source'] === 'OPERATING_EXPENSE') {
+                    if (!empty($existing['expense_no']) && str_contains((string)$ctx->notes, $existing['expense_no'])) {
+                        $isDuplicate = true;
+                        break;
+                    }
+                    if (abs($existing['amount'] - $amt) < 0.01 &&
+                        $existing['date'] === $ctxDate &&
+                        strcasecmp(trim((string)$existing['name']), trim($desc)) === 0) {
+                        $isDuplicate = true;
+                        break;
+                    }
+                }
+            }
+            if ($isDuplicate) continue;
+
+            $acc = strtoupper(trim((string)$ctx->account));
+            $pm = strtoupper(trim((string)$ctx->payment_method));
+            $isCash = in_array($acc, ['CASH_DRAWER', 'PETTY_CASH', 'KAS_KECIL', 'KASIR', 'LACI']) ||
+                      in_array($pm, ['CASH', 'TUNAI', 'PETTY_CASH', 'KAS_KECIL']) ||
+                      str_contains($acc, 'CASH') || str_contains($acc, 'PETTY') ||
+                      str_contains($pm, 'CASH') || str_contains($pm, 'TUNAI') ||
+                      str_contains($pm, 'PETTY');
+
+            $totalExpenses += $amt;
+            if ($isCash) {
+                $cashExpenses += $amt;
+                $cashOtherTrx += $amt;
+            } else {
+                $nonCashExpenses += $amt;
+            }
+
+            $expenses[] = [
+                'id'                   => $ctx->id,
+                'source'               => 'CASH_TRANSACTION',
+                'expense_no'           => $ctx->transaction_no,
+                'date'                 => $ctxDate,
+                'time'                 => $ctx->created_at ? $ctx->created_at->format('H:i') : '-',
+                'category'             => $ctx->category,
+                'category_label'       => $ctx->category_label ?? $ctx->category,
+                'name'                 => $desc,
+                'description'          => $desc,
+                'amount'               => $amt,
+                'payment_method'       => $ctx->payment_method ?? 'CASH',
+                'payment_method_label' => $isCash ? 'Kas di Laci (Tunai)' : 'Bank / Non-Tunai',
+                'is_cash'              => $isCash,
+                'notes'                => $ctx->notes,
+                'user_name'            => $ctx->user_name ?? ($ctx->user?->name ?? 'Kasir'),
+            ];
+        }
+
+        // 3. Stock Movements (Direct Cash Ingredient Restock / Pembelian Bahan Tunai dari Laci Kasir)
+        $smQuery = StockMovement::with(['ingredient', 'user'])
+            ->whereIn('type', ['RESTOCK', 'PURCHASE'])
+            ->where(function ($q) use ($shift) {
+                $q->where('outlet_id', $shift->outlet_id)
+                  ->orWhereNull('outlet_id');
+            })
+            ->where(function ($q) {
+                $q->whereIn('payment_type', ['CASH', 'TUNAI', 'PETTY_CASH', 'KAS_KECIL'])
+                  ->orWhere('payment_type', 'like', '%CASH%')
+                  ->orWhere('payment_type', 'like', '%TUNAI%')
+                  ->orWhere('payment_type', 'like', '%PETTY%');
+            });
+
+        if ($shift->business_id) {
+            $smQuery->where('business_id', $shift->business_id);
+        }
+
+        $smQuery->where(function ($q) use ($shift, $openedAt, $closedAt, $openedDate, $closedDate) {
+            $q->where('shift_id', $shift->id)
+              ->orWhere(function ($sub) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+                  $sub->whereNull('shift_id');
+                  if ($openedAt && $closedAt) {
+                      $sub->whereBetween('created_at', [$openedAt, $closedAt]);
+                  } elseif ($openedAt) {
+                      $sub->where('created_at', '>=', $openedAt);
+                  } else {
+                      $sub->whereDate('date', now()->toDateString());
+                  }
+              });
+        });
+
+        $smList = $smQuery->orderBy('created_at', 'asc')->get();
+
+        foreach ($smList as $sm) {
+            $smAmt = (float)($sm->total_price ?: ($sm->qty * $sm->unit_price));
+            if ($smAmt <= 0) continue;
+
+            $smDate = $sm->date ? (is_string($sm->date) ? substr($sm->date, 0, 10) : $sm->date->format('Y-m-d')) : null;
+            $ingName = $sm->ingredient?->name ?? 'Bahan Baku';
+            $desc = "Beli Bahan Tunai: {$ingName} (" . (float)$sm->qty . " " . ($sm->unit ?: ($sm->ingredient?->unit_beli ?: 'satuan')) . ")";
+
+            // Only de-duplicate if explicit cross-reference in note to an existing OPEX
+            $isDuplicate = false;
+            foreach ($expenses as $existing) {
+                if ($existing['source'] === 'OPERATING_EXPENSE') {
+                    if (!empty($existing['expense_no']) && str_contains((string)$sm->note, $existing['expense_no'])) {
+                        $isDuplicate = true;
+                        break;
+                    }
+                }
+            }
+            if ($isDuplicate) continue;
+
+            $totalExpenses += $smAmt;
+            $cashExpenses += $smAmt;
+            $cashPurchases += $smAmt;
+
+            $expenses[] = [
+                'id'                   => $sm->id,
+                'source'               => 'STOCK_MOVEMENT',
+                'expense_no'           => "STK-{$sm->id}",
+                'date'                 => $smDate,
+                'time'                 => $sm->created_at ? $sm->created_at->format('H:i') : '-',
+                'category'             => 'SUPPLIER_PURCHASE',
+                'category_label'       => 'Belanja Bahan Baku (Tunai)',
+                'name'                 => $desc,
+                'description'          => $desc,
+                'amount'               => $smAmt,
+                'payment_method'       => $sm->payment_type ?? 'CASH',
+                'payment_method_label' => 'Kas di Laci (Tunai)',
+                'is_cash'              => true,
+                'notes'                => $sm->note,
+                'user_name'            => $sm->user?->name ?? 'Kasir',
+            ];
+        }
+
+        // 4. Payable Payments (Pembayaran Hutang Supplier Tunai dari Laci Kasir)
+        $ppQuery = PayablePayment::with(['payable', 'payer'])
+            ->where(function ($q) use ($shift) {
+                $q->where('outlet_id', $shift->outlet_id)
+                  ->orWhereNull('outlet_id');
+            })
+            ->where(function ($q) {
+                $q->whereIn('payment_method', ['CASH', 'TUNAI', 'PETTY_CASH', 'KAS_KECIL'])
+                  ->orWhere('payment_method', 'like', '%CASH%')
+                  ->orWhere('payment_method', 'like', '%TUNAI%')
+                  ->orWhere('payment_method', 'like', '%PETTY%');
+            });
+
+        if ($shift->business_id) {
+            $ppQuery->where('business_id', $shift->business_id);
+        }
+
+        $ppQuery->where(function ($q) use ($openedAt, $closedAt, $openedDate, $closedDate) {
+            if ($openedAt && $closedAt) {
+                $q->whereBetween('created_at', [$openedAt, $closedAt]);
+            } elseif ($openedAt) {
+                $q->where('created_at', '>=', $openedAt);
+            } else {
+                $q->whereDate('payment_date', now()->toDateString());
+            }
+        });
+
+        $ppList = $ppQuery->orderBy('created_at', 'asc')->get();
+
+        foreach ($ppList as $pp) {
+            $ppAmt = (float)$pp->amount;
+            if ($ppAmt <= 0) continue;
+
+            $ppDate = $pp->payment_date ? (is_string($pp->payment_date) ? substr($pp->payment_date, 0, 10) : $pp->payment_date->format('Y-m-d')) : null;
+            $suppName = $pp->payable?->supplier_name ?? 'Supplier';
+            $desc = "Bayar Hutang Supplier: {$suppName} (#{$pp->payment_no})";
+
+            // Only de-duplicate if explicit cross-reference in note to an existing OPEX
+            $isDuplicate = false;
+            foreach ($expenses as $existing) {
+                if ($existing['source'] === 'OPERATING_EXPENSE') {
+                    if (!empty($existing['expense_no']) && str_contains((string)$pp->notes, $existing['expense_no'])) {
+                        $isDuplicate = true;
+                        break;
+                    }
+                }
+            }
+            if ($isDuplicate) continue;
+
+            $totalExpenses += $ppAmt;
+            $cashExpenses += $ppAmt;
+            $cashPayables += $ppAmt;
+
+            $expenses[] = [
+                'id'                   => $pp->id,
+                'source'               => 'PAYABLE_PAYMENT',
+                'expense_no'           => $pp->payment_no,
+                'date'                 => $ppDate,
+                'time'                 => $pp->created_at ? $pp->created_at->format('H:i') : '-',
+                'category'             => 'SUPPLIER_PAYMENT',
+                'category_label'       => 'Pelunasan Hutang (Tunai)',
+                'name'                 => $desc,
+                'description'          => $desc,
+                'amount'               => $ppAmt,
+                'payment_method'       => $pp->payment_method ?? 'CASH',
+                'payment_method_label' => 'Kas di Laci (Tunai)',
+                'is_cash'              => true,
+                'notes'                => $pp->notes,
+                'user_name'            => $pp->payer?->name ?? 'Kasir',
+            ];
+        }
+
+        return [
+            'expenses'          => $expenses,
+            'total_expenses'    => round($totalExpenses, 2),
+            'cash_expenses'     => round($cashExpenses, 2),
+            'non_cash_expenses' => round($nonCashExpenses, 2),
+            'cash_opex'         => round($cashOpex, 2),
+            'cash_purchases'    => round($cashPurchases, 2),
+            'cash_payables'     => round($cashPayables, 2),
+            'cash_other_trx'    => round($cashOtherTrx, 2),
+        ];
+    }
+
+    /**
+     * Single Source of Truth for calculating expected drawer cash & discrepancy for a shift.
+     * Guaranteed 100% consistent across ShiftController and AccountingService.
+     */
+    public static function calculateShiftDrawerCash(Shift $shift): array
+    {
+        $initialCash = (float)$shift->initial_cash;
+        $openedAt = $shift->opened_at;
+        $closedAt = $shift->closed_at;
+
+        // 1. Paid Sales Transactions
+        $paidTransactions = $shift->transactions()
+            ->where(function ($q) {
+                $q->where(function ($sub) {
+                    $sub->where('status', 'PAID')
+                        ->where(function ($inner) {
+                            $inner->whereNull('split_type')->orWhere('split_type', '!=', 'EQUAL');
+                        });
+                })->orWhere('status', 'SPLIT_CLOSED');
+            })
+            ->get();
+
+        // 2. Collections from Kasbon / Receivable Payments collected during shift
+        $recQuery = ReceivablePayment::where(function ($query) use ($shift, $openedAt, $closedAt) {
+            $query->where('shift_id', $shift->id)
+                  ->orWhere(function ($q) use ($shift, $openedAt, $closedAt) {
+                      $q->whereNull('shift_id')
+                        ->where('outlet_id', $shift->outlet_id);
+                      if ($openedAt && $closedAt) {
+                          $q->whereBetween('created_at', [$openedAt, $closedAt]);
+                      } elseif ($openedAt) {
+                          $q->where('created_at', '>=', $openedAt);
+                      } else {
+                          $q->whereDate('payment_date', now()->toDateString());
+                      }
+                  });
+        });
+        $shiftRecPayments = $recQuery->get();
+        $hasShiftRecPayments = $shiftRecPayments->count() > 0;
+
+        $cashSales = 0.0;
+        foreach ($paidTransactions as $t) {
+            $method = strtoupper(trim($t->payment_method ?? 'CASH'));
+            $price = (float)$t->total_price;
+            if ($method === 'CASH' || $method === 'TUNAI') {
+                $cashSales += $price;
+            } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
+                if (!$hasShiftRecPayments) {
+                    $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
+                    $dpPaid = (float)($t->amount_paid ?? 0);
+                    if ($dpMethod === 'CASH' || $dpMethod === 'TUNAI') {
+                        $cashSales += $dpPaid;
+                    }
+                }
+            }
+        }
+
+        // Add collections from kasbon payments received in cash
+        $cashRec = 0.0;
+        foreach ($shiftRecPayments as $rp) {
+            $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $rpPrice = (float)$rp->amount;
+            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
+                $cashSales += $rpPrice;
+                $cashRec += $rpPrice;
+            }
+        }
+
+        // 3. Shift Expenses (OPEX, Stock Purchases, Supplier Debt, Cash Transactions)
+        $expData = self::calculateShiftExpenses($shift);
+        $cashExpenses = (float)$expData['cash_expenses'];
+
+        $expectedCash = max(0, round($initialCash + $cashSales - $cashExpenses, 2));
+        $closingCash = $shift->closing_cash !== null ? (float)$shift->closing_cash : null;
+        $diff = $closingCash !== null ? round($closingCash - $expectedCash, 2) : 0.0;
+
+        return [
+            'initial_cash'       => $initialCash,
+            'cash_sales'         => round($cashSales, 2),
+            'cash_receivables'   => round($cashRec, 2),
+            'cash_expenses'      => round($cashExpenses, 2),
+            'expected_cash'      => $expectedCash,
+            'closing_cash'       => $closingCash,
+            'cash_difference'    => $diff,
+            'exp_data'           => $expData,
+        ];
+    }
+
+    /**
      * 4. POST SHIFT CLOSING (Selisih Lebih -> Pendapatan Lain-Lain POS, Selisih Kurang -> Biaya Lain-Lain POS)
      */
     public static function postShiftClosing(Shift $shift): void
@@ -454,9 +1418,14 @@ class AccountingService
             return;
         }
 
-        $diff = $shift->cash_difference !== null
-            ? round((float)$shift->cash_difference, 2)
-            : round((float)$shift->closing_cash - (float)$shift->system_cash, 2);
+        // Single Source of Truth for expected drawer cash and discrepancy
+        $drawerData = self::calculateShiftDrawerCash($shift);
+        $diff = $drawerData['cash_difference'];
+
+        // Sinkronkan cash_difference di model shift agar tampilan laporan dan jurnal 100% konsisten
+        if ($shift->cash_difference === null || abs((float)$shift->cash_difference - $diff) > 0.01) {
+            $shift->updateQuietly(['cash_difference' => $diff]);
+        }
 
         // Jika selisih Rp 0,00, hapus jurnal lama jika ada dan return
         if (abs($diff) < 0.01) {
@@ -559,7 +1528,17 @@ class AccountingService
             $lines[] = ['account_code' => '1-11002', 'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Penerimaan Modal Awal Kasir Shift #{$ct->shift_id}"];
             $lines[] = ['account_code' => $srcCode,    'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Pengambilan Kas Besar untuk Modal Kasir Shift #{$ct->shift_id}"];
         } elseif ($cat === 'SALDO_AWAL' || $cat === 'INITIAL_BALANCE' || $cat === 'INITIAL_BALANCE_CASH') {
-            // Saldo Awal Modal Kasir Pertama Kali: Kasir (1-11002) Debit, Modal Pemilik Disetor (3-31001) Kredit (bukan Kas Besar)
+            // Saldo Awal Modal Kasir Pertama Kali: Jika sudah dibukukan via INITIAL_BALANCE_CASH, jangan buat jurnal ganda
+            $hasInitBalanceJournal = JournalEntry::where('business_id', $bizId)
+                ->where('outlet_id', $outletId)
+                ->where('reference_type', 'INITIAL_BALANCE_CASH')
+                ->exists();
+
+            if ($hasInitBalanceJournal) {
+                self::deleteReferenceEntry('CASH_TRANSACTION', $ct->id, $bizId);
+                return;
+            }
+
             $destCode = ($acc === 'BANK_MAIN' || str_contains($acc, 'BANK')) ? '1-11003' : ($acc === 'KAS_BESAR' ? '1-11001' : '1-11002');
             $lines[] = ['account_code' => $destCode, 'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Saldo Awal Modal Kasir Shift #{$ct->shift_id}"];
             $lines[] = ['account_code' => '3-31001',  'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Modal Awal Pemilik Disetor (Shift #{$ct->shift_id})"];
@@ -579,15 +1558,53 @@ class AccountingService
             $lines[] = ['account_code' => '6-61005', 'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => 'Biaya Pemeliharaan & Aset'];
             $lines[] = ['account_code' => $srcCode, 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => 'Pembayaran Kas/Bank'];
         } elseif ($cat === 'SETOR_KAS_APLIKASI' || $cat === 'SETORAN_QRIS' || $cat === 'SETORAN_KAS_APLIKASI' || $cat === 'DEPOSIT_KAS_APLIKASI') {
-            // Setoran Kas Aplikasi (QRIS) ke Rekening Bank: Bank (1-11003) Debit, Kas Aplikasi (1-11004) Kredit
+            // Setoran Kas Aplikasi ke Rekening Bank: Bank (1-11003) Debit, Kas Aplikasi (1-11004) Kredit, Pendapatan Lain-Lain (4-41002) Kredit (jika ada selisih lebih)
+            // Biaya Admin Kas Aplikasi (6-61010) Debit (jika ada potongan fee/MDR)
             $destCode = ($acc === 'KAS_BESAR' ? '1-11001' : '1-11003');
-            $lines[] = ['account_code' => $destCode,   'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Penerimaan Setoran Kas Aplikasi ke Bank {$ct->account}"];
-            $lines[] = ['account_code' => '1-11004',   'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Penyetoran Kas Aplikasi (QRIS) ke Bank {$ct->account}"];
+            
+            $excess = 0;
+            if (preg_match('/\[SPLIT_PENDAPATAN_LAIN:([0-9.]+)\]/', (string)$ct->notes, $matches)) {
+                $excess = round((float)$matches[1], 2);
+            }
+
+            $adminFee = 0;
+            if (preg_match('/\[(?:BIAYA_ADMIN|ADMIN_FEE):([0-9.]+)\]/', (string)$ct->notes, $feeMatches)) {
+                $adminFee = round((float)$feeMatches[1], 2);
+            }
+
+            if ($adminFee > 0) {
+                $netBank = max(0, round($amount - $adminFee, 2));
+                $lines[] = ['account_code' => $destCode, 'outlet_id' => $outletId, 'debit' => $netBank, 'credit' => 0, 'memo' => "Penerimaan Bersih Kas Aplikasi ke Bank {$ct->account}"];
+                $lines[] = ['account_code' => '6-61010',  'outlet_id' => $outletId, 'debit' => $adminFee, 'credit' => 0, 'memo' => "Biaya Admin Kas Aplikasi / MDR ke Bank {$ct->account}"];
+                $lines[] = ['account_code' => '1-11004',  'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Penyetoran Saldo Kas Aplikasi ke Bank {$ct->account}"];
+            } elseif ($excess > 0 && $excess < $amount) {
+                $kasAplikasiPortion = round($amount - $excess, 2);
+                $lines[] = ['account_code' => $destCode, 'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Penerimaan Setoran Kas Aplikasi ke Bank {$ct->account}"];
+                if ($kasAplikasiPortion > 0) {
+                    $lines[] = ['account_code' => '1-11004', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $kasAplikasiPortion, 'memo' => "Penyetoran Saldo Kas Aplikasi ke Bank {$ct->account}"];
+                }
+                $lines[] = ['account_code' => '4-41002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $excess, 'memo' => "Selisih Lebih Pencairan Kas Aplikasi ke Bank (Pendapatan Lain-Lain)"];
+            } else {
+                $lines[] = ['account_code' => $destCode,   'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Penerimaan Setoran Kas Aplikasi ke Bank {$ct->account}"];
+                $lines[] = ['account_code' => '1-11004',   'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Penyetoran Kas Aplikasi (QRIS) ke Bank {$ct->account}"];
+            }
         } elseif (str_contains($cat, 'KARYAWAN') || str_contains($cat, 'KASBON_STAFF')) {
             // Kasbon Karyawan (dialihkan ke 1-12001 Piutang Usaha)
             $srcCode = ($acc === 'BANK_MAIN' || str_contains($acc, 'BANK')) ? '1-11003' : ($acc === 'KAS_BESAR' ? '1-11001' : '1-11002');
             $lines[] = ['account_code' => '1-12001', 'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => 'Piutang Kasbon Karyawan'];
             $lines[] = ['account_code' => $srcCode, 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => 'Pengeluaran Kas Kasbon Karyawan'];
+        } elseif ($cat === 'SELISIH_SERAH_TERIMA' || $cat === 'SELISIH_KAS') {
+            // Selisih Serah Terima Laci (Handover Discrepancy antar-shift):
+            // Jika OUT (Kurang): Debit Beban Biaya Lain-Lain (6-61008), Kredit Kas Kecil Kasir (1-11002)
+            // Jika IN (Lebih): Debit Kas Kecil Kasir (1-11002), Kredit Pendapatan Lain-Lain (4-41002)
+            $cashCode = '1-11002';
+            if ($ct->type === 'OUT') {
+                $lines[] = ['account_code' => '6-61008', 'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Beban Selisih Kurang Serah Terima Kasir Shift #{$ct->shift_id}"];
+                $lines[] = ['account_code' => $cashCode,  'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Pengurangan Kas Laci Serah Terima Shift #{$ct->shift_id}"];
+            } else {
+                $lines[] = ['account_code' => $cashCode,  'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Penambahan Kas Laci Serah Terima Shift #{$ct->shift_id}"];
+                $lines[] = ['account_code' => '4-41002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Pendapatan Selisih Lebih Serah Terima Kasir Shift #{$ct->shift_id}"];
+            }
         }
 
         if (!empty($lines)) {
@@ -630,6 +1647,8 @@ class AccountingService
             $expCode = '6-61006'; // BIAYA MARKETING
         } elseif (str_contains($cat, 'LOGISTIK') || str_contains($cat, 'TRANSPORT') || str_contains($cat, 'ONGKIR') || str_contains($cat, 'BENSIN') || str_contains($cat, 'PENGIRIMAN')) {
             $expCode = '6-61007'; // BIAYA LOGISTIK & TRANSPORTASI
+        } elseif (str_contains($cat, 'ADMIN') || str_contains($cat, 'APLIKASI') || str_contains($cat, 'MDR') || str_contains($cat, 'GATEWAY') || str_contains($cat, 'FEE')) {
+            $expCode = '6-61010'; // BIAYA ADMIN KAS APLIKASI
         } elseif ((str_contains($cat, 'SELISIH') && str_contains($cat, 'KAS')) || str_contains($cat, 'LAIN')) {
             $expCode = '6-61008'; // BIAYA LAIN-LAIN
         } else {
@@ -661,7 +1680,7 @@ class AccountingService
      */
     public static function postTransfer(Transfer $trf): void
     {
-        if (!in_array($trf->status, ['SENT', 'RECEIVED', 'COMPLETED', 'APPROVED'])) {
+        if (!in_array($trf->status, ['SENT', 'RECEIVED', 'COMPLETED', 'APPROVED', 'PARTIALLY_RETURNED', 'RETURNED'])) {
             JournalEntry::where('reference_type', 'TRANSFER')
                 ->where('reference_id', $trf->id)
                 ->delete();
@@ -681,7 +1700,26 @@ class AccountingService
             if (!$ing) continue;
             $isPlk = self::isPerlengkapan($ing);
             $costUnit = (float)($it->unit_cost ?: ($srcOutletId ? $ing->costPerPakaiForOutlet($srcOutletId) : $ing->cost_per_pakai));
-            $itemVal = (float)$it->qty * $costUnit;
+            
+            // Tentukan kuantitas transfer aktual yang diterima/berpindah ke cabang tujuan
+            $origInput = (float)($it->input_qty ?: $it->qty);
+            $ratio = ($origInput > 0) ? ((float)$it->qty / $origInput) : 1.0;
+
+            $qtyToTransfer = (float)$it->qty;
+            if ($it->received_qty !== null) {
+                $qtyToTransfer = round((float)$it->received_qty * $ratio, 4);
+            } elseif ($trf->status === 'RETURNED' && $trf->return_disposition === 'RETURN_TO_SOURCE') {
+                $qtyToTransfer = 0.0;
+            }
+
+            // Jika item memiliki total_price dan kuantitas diterima penuh, gunakan total_price item untuk mencegah selisih pembulatan desimal
+            if ($origInput > 0 && $it->received_qty !== null && abs((float)$it->received_qty - $origInput) < 0.0001 && (float)$it->total_price > 0) {
+                $itemVal = (float)$it->total_price;
+            } elseif ($it->received_qty === null && (float)$it->total_price > 0) {
+                $itemVal = (float)$it->total_price;
+            } else {
+                $itemVal = $qtyToTransfer * $costUnit;
+            }
 
             if ($isPlk) {
                 $totalValPlk += $itemVal;
@@ -691,7 +1729,12 @@ class AccountingService
         }
 
         $totalVal = round($totalValBahan + $totalValPlk, 2);
-        if ($totalVal <= 0) return;
+        if ($totalVal <= 0) {
+            JournalEntry::where('reference_type', 'TRANSFER')
+                ->where('reference_id', $trf->id)
+                ->delete();
+            return;
+        }
 
         // A. Jurnal Cabang Pengirim (Source Outlet - Kredit Pengurangan Stok)
         $linesSrc = [];
@@ -744,53 +1787,133 @@ class AccountingService
 
         $lines = [];
 
-        if ($ing) {
-            // Direct ingredient waste
+        $orderNum = null;
+        if (preg_match('/(?:Nota|Open Bill|Tagihan)?\s*#(TRX-[A-Za-z0-9\-]+|[A-Za-z0-9\-]+)/i', (string)$wl->notes, $matches)) {
+            $orderNum = $matches[1];
+        }
+
+        // Jika WasteLog ini berasal dari pembatalan transaksi yang sudah PAID (Void Wasted pada transaksi yang sudah lunas),
+        // jurnal biaya waste sudah dicatat langsung secara terintegrasi pada Jurnal Void Transaksi (VOID_TRANSACTION).
+        // Tetapi untuk transaksi Open Bill (HOLD) yang di-void sebelum bayar, jurnal VOID_TRANSACTION tidak dibuat,
+        // sehingga WasteLog inilah yang mencatat jurnal kerugian waste-nya secara resmi!
+        if ($orderNum) {
+            $hasVoidTrxJournal = JournalEntry::where('business_id', $bizId)
+                ->where('reference_type', 'VOID_TRANSACTION')
+                ->where('description', 'like', "%{$orderNum}%")
+                ->whereHas('lines', fn($l) => $l->where('account_code', 'like', '5-51003%'))
+                ->exists();
+            if ($hasVoidTrxJournal) {
+                JournalEntry::where('business_id', $bizId)
+                    ->where('reference_type', 'WASTE_LOG')
+                    ->where('reference_id', $wl->id)
+                    ->delete();
+                return;
+            }
+        }
+
+        $movements = null;
+        if ($wl->stock_movement_id) {
+            $movements = StockMovement::where('id', $wl->stock_movement_id)->with('ingredient')->get();
+        } elseif ($orderNum) {
+            $movements = StockMovement::where('type', 'WASTE')
+                ->where(function($q) use ($orderNum) {
+                    $q->where('note', 'like', "%{$orderNum}%");
+                })
+                ->when($wl->menu, function($q) use ($wl) {
+                    $q->where('note', 'like', "%{$wl->menu->name}%");
+                })
+                ->with('ingredient')
+                ->get();
+            if ($movements->isEmpty()) {
+                $movements = StockMovement::where('type', 'WASTE')
+                    ->where('note', 'like', "%{$orderNum}%")
+                    ->with('ingredient')
+                    ->get();
+            }
+        } elseif ($wl->waste_no) {
+            $movements = StockMovement::where('type', 'WASTE')
+                ->where('note', 'like', "%{$wl->waste_no}%")
+                ->with('ingredient')
+                ->get();
+        }
+
+        if ($movements && $movements->count() > 0) {
+            $wasteBahan = 0.0;
+            $wastePlk = 0.0;
+            foreach ($movements as $m) {
+                $mIng = $m->ingredient;
+                $isPlk = self::isPerlengkapan($mIng);
+                $mCost = (float)$m->total_price;
+                if ($mCost <= 0) {
+                    $unitCost = (float)$m->unit_price > 0 ? (float)$m->unit_price : ($mIng ? (float)$mIng->costPerPakaiForOutlet((int)$outletId) : 0);
+                    $mCost = round((float)$m->qty * $unitCost, 2);
+                }
+                if ($isPlk) {
+                    $wastePlk += $mCost;
+                } else {
+                    $wasteBahan += $mCost;
+                }
+            }
+            $wasteBahan = round($wasteBahan, 2);
+            $wastePlk = round($wastePlk, 2);
+
+            $itemName = $menu ? $menu->name : ($ing ? $ing->name : 'Menu/Bahan');
+
+            if ($wasteBahan > 0) {
+                $lines[] = ['account_code' => '5-51003', 'outlet_id' => $outletId, 'debit' => $wasteBahan, 'credit' => 0, 'memo' => "Beban Kerugian Waste Bahan ({$itemName}): {$memoReason}"];
+                $lines[] = ['account_code' => '1-13001', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $wasteBahan, 'memo' => "Pengurangan Persediaan Bahan Baku ({$itemName})"];
+            }
+            if ($wastePlk > 0) {
+                $lines[] = ['account_code' => '5-51006', 'outlet_id' => $outletId, 'debit' => $wastePlk, 'credit' => 0, 'memo' => "Beban Kerugian Waste Perlengkapan/Kemasan ({$itemName}): {$memoReason}"];
+                $lines[] = ['account_code' => '1-13002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $wastePlk, 'memo' => "Pengurangan Persediaan Perlengkapan ({$itemName})"];
+            }
+        } elseif ($ing) {
+            // Direct ingredient waste (fallback when no stock movement found)
             $isPlk = self::isPerlengkapan($ing);
             $invAcc = $isPlk ? '1-13002' : '1-13001';
             $wasteExpAcc = $isPlk ? '5-51006' : '5-51003';
             $memoType = $isPlk ? 'Perlengkapan' : 'Bahan Baku';
+
+            $unitCost = method_exists($ing, 'costPerPakaiForOutlet') 
+                ? (float)$ing->costPerPakaiForOutlet((int)$outletId) 
+                : (float)($ing->harga / max(1, (float)$ing->konversi));
+            
+            $computedCost = round((float)($wl->qty_pakai ?: $wl->qty ?: 1) * $unitCost, 2);
+            $lossCost = $computedCost > 0 ? $computedCost : $lossCost;
 
             $lines = [
                 ['account_code' => $wasteExpAcc, 'outlet_id' => $outletId, 'debit' => $lossCost, 'credit' => 0, 'memo' => "Beban Kerugian Waste {$memoType} ({$ing->name}): {$memoReason}"],
                 ['account_code' => $invAcc,      'outlet_id' => $outletId, 'debit' => 0, 'credit' => $lossCost, 'memo' => "Pengurangan Persediaan {$memoType} ({$ing->name})"],
             ];
         } elseif ($menu) {
-            // Menu / Recipe waste: check if recipe has both Bahan Baku and Perlengkapan
+            // Menu / Recipe waste: calculate exact cost from active recipe moving average prices
             $wasteBahan = 0.0;
             $wastePlk = 0.0;
-            $recipe = $menu->recipes?->first();
+            $qtyMenu = (float)($wl->qty_pakai ?: $wl->qty ?: 1);
+            $recipe = $menu->recipes?->sortByDesc('version')->first() ?: $menu->recipes?->first();
 
             if ($recipe && $recipe->items && $recipe->items->count() > 0) {
-                $recipeBahanCost = 0.0;
-                $recipePlkCost = 0.0;
-
                 foreach ($recipe->items as $it) {
                     $itemIng = $it->ingredient;
                     if (!$itemIng) continue;
                     $isPlk = self::isPerlengkapan($itemIng);
                     $unitCost = method_exists($itemIng, 'costPerPakaiForOutlet') 
-                        ? $itemIng->costPerPakaiForOutlet($outletId) 
-                        : (float)($itemIng->harga / max(1, $itemIng->konversi));
-                    $itemCost = (float)$it->qty * $unitCost;
+                        ? (float)$itemIng->costPerPakaiForOutlet((int)$outletId) 
+                        : (float)($itemIng->harga / max(1, (float)$itemIng->konversi));
+                    $itemCost = round((float)$it->qty * $unitCost * $qtyMenu, 2);
 
                     if ($isPlk) {
-                        $recipePlkCost += $itemCost;
+                        $wastePlk += $itemCost;
                     } else {
-                        $recipeBahanCost += $itemCost;
+                        $wasteBahan += $itemCost;
                     }
                 }
 
-                $totalRecipeCost = $recipeBahanCost + $recipePlkCost;
-                if ($totalRecipeCost > 0) {
-                    $ratioBahan = $recipeBahanCost / $totalRecipeCost;
-                    $ratioPlk = $recipePlkCost / $totalRecipeCost;
-                    $wasteBahan = round($lossCost * $ratioBahan, 2);
-                    $wastePlk = round($lossCost - $wasteBahan, 2);
-                } else {
-                    $wasteBahan = $lossCost;
-                }
-            } else {
+                $wasteBahan = round($wasteBahan, 2);
+                $wastePlk = round($wastePlk, 2);
+            }
+
+            if ($wasteBahan <= 0 && $wastePlk <= 0) {
                 $wasteBahan = $lossCost;
             }
 
@@ -838,11 +1961,9 @@ class AccountingService
 
         $date = $op->opname_date ?: now()->toDateString();
         $ing = $op->ingredient;
-        $code = $ing ? strtoupper((string)$ing->code) : '';
-        $cat = $ing ? strtolower((string)$ing->category) : '';
-        $isPlk = str_starts_with($code, 'PLK-') || str_starts_with($code, 'PKG-') || str_contains($cat, 'cup') || str_contains($cat, 'sedotan') || str_contains($cat, 'kemasan') || str_contains($cat, 'packaging');
+        $isPlk = $ing ? self::isPerlengkapan($ing) : false;
         $invAcc = $isPlk ? '1-13002' : '1-13001';
-        $deficitAcc = $isPlk ? '5-51005' : '5-51004';
+        $deficitAcc = $isPlk ? '5-51006' : '5-51003'; // 5-51006 Waste Perlengkapan, 5-51003 Waste Bahan / Defisit
 
         $lines = [];
         if ($diffVal < 0) {
@@ -872,26 +1993,34 @@ class AccountingService
      */
     public static function postStockMovementPurchase(StockMovement $sm): void
     {
-        if (!in_array($sm->type, ['PURCHASE', 'RESTOCK', 'IN']) || (float)$sm->total_price <= 0) {
+        if (!in_array($sm->type, ['PURCHASE', 'RESTOCK', 'IN'])) {
             return;
         }
 
         $bizId = $sm->business_id ?? 1;
         $outletId = $sm->outlet_id;
-        $amount = (float)$sm->total_price;
+        $ing = $sm->ingredient ?: Ingredient::find($sm->ingredient_id);
+        $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
+
+        $amount = (float)$sm->total_price > 0
+            ? (float)$sm->total_price
+            : round((float)$sm->qty * (float)($sm->unit_price > 0 ? ($sm->unit_price > 1000 && $konversi > 1 ? $sm->unit_price / $konversi : $sm->unit_price) : ($ing ? $ing->costPerPakaiForOutlet($outletId) : 0)), 2);
+
+        if ($amount <= 0) {
+            return;
+        }
+
         $date = $sm->date ?: now()->toDateString();
-        $ing = $sm->ingredient;
-        $code = $ing ? strtoupper((string)$ing->code) : '';
-        $cat = $ing ? strtolower((string)$ing->category) : '';
-        $isPlk = str_starts_with($code, 'PLK-') || str_starts_with($code, 'PKG-') || str_contains($cat, 'cup') || str_contains($cat, 'sedotan') || str_contains($cat, 'kemasan') || str_contains($cat, 'packaging');
+        $isPlk = self::isPerlengkapan($ing);
         $invAcc = $isPlk ? '1-13002' : '1-13001';
 
         $payType = strtoupper(trim((string)$sm->payment_type));
-        $credAcc = ($payType === 'CREDIT' || $payType === 'HUTANG' || $sm->payable_id) ? '2-21001' : '1-11001';
+        $isHutang = ($payType === 'CREDIT' || $payType === 'HUTANG' || $payType === 'TEMPO' || $sm->payable_id);
+        $credAcc = $isHutang ? '2-21001' : self::getAccountCodeForPaymentMethod($payType);
 
         $lines = [
             ['account_code' => $invAcc,  'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Pembelian {$ing?->name}"],
-            ['account_code' => $credAcc, 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Pembayaran/Hutang Pembelian {$sm->note}"],
+            ['account_code' => $credAcc, 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Pembayaran/Hutang Pembelian ({$payType}) {$sm->note}"],
         ];
 
         self::recordEntry([
@@ -902,6 +2031,97 @@ class AccountingService
             'reference_type' => 'STOCK_MOVEMENT',
             'reference_id'   => $sm->id,
             'description'    => "Pembelian Stok #{$sm->id} - {$ing?->name}",
+        ], $lines, $bizId);
+    }
+
+    /**
+     * 10B. POST STOCK ADJUSTMENT / NORMALISASI STOK MINUS (Pembalikan HPP Teoritis atau Surplus/Defisit Opname Manual)
+     */
+    public static function postStockMovementAdjustment(StockMovement $sm): void
+    {
+        if (!in_array($sm->type, ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS', 'ADJUSTMENT_OUT'])) {
+            return;
+        }
+
+        // Jika mutasi berasal dari Opname fisik yang sudah dijurnal lewat postOpname, lewati agar tidak dobel jurnal
+        $note = strtolower($sm->note ?? '');
+        if (str_contains($note, 'opname fisik') || str_contains($note, 'penyesuaian opname')) {
+            return;
+        }
+
+        $bizId = $sm->business_id ?? 1;
+        $outletId = $sm->outlet_id;
+        $ing = $sm->ingredient ?: Ingredient::find($sm->ingredient_id);
+        $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
+
+        $amount = (float)$sm->total_price;
+        if ($amount <= 0 && $ing) {
+            $amount = round((float)$sm->qty * (float)($sm->unit_price > 0 ? ($sm->unit_price > 1000 && $konversi > 1 ? $sm->unit_price / $konversi : $sm->unit_price) : $ing->costPerPakaiForOutlet($outletId)), 2);
+        }
+        if ($amount <= 0) {
+            return;
+        }
+
+        $date = $sm->date ?: now()->toDateString();
+        $isPlk = self::isPerlengkapan($ing);
+        $invAcc = $isPlk ? '1-13002' : '1-13001';
+        $ingName = $ing ? $ing->name : 'Bahan';
+
+        $isNormalisasi = str_contains($note, 'normalisasi') || str_contains($note, 'reset stok minus') || str_contains($note, 'barang baru');
+
+        $lines = [];
+
+        if (in_array($sm->type, ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS'])) {
+            // Surplus Stok / Normalisasi Stok: Selalu menambah Aset Persediaan Bahan Baku / Perlengkapan (D)
+            $lines[] = [
+                'account_code' => $invAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => $amount,
+                'credit'       => 0,
+                'memo'         => $isNormalisasi ? "Pemulihan Persediaan Normalisasi Stok {$ingName}" : "Penyesuaian Masuk / Surplus {$ingName}",
+            ];
+            $lines[] = [
+                'account_code' => '4-41002',
+                'outlet_id'    => $outletId,
+                'debit'        => 0,
+                'credit'       => $amount,
+                'memo'         => $isNormalisasi ? "Pendapatan Selisih Normalisasi Stok {$ingName}" : "Pendapatan Selisih Surplus Stok {$ingName}",
+            ];
+            $desc = $isNormalisasi
+                ? "Normalisasi Stok Minus #{$sm->id} - {$ingName}"
+                : "Penyesuaian Masuk Stok #{$sm->id} - {$ingName}";
+        } elseif ($sm->type === 'ADJUSTMENT_OUT') {
+            // Defisit / Pengurangan Stok Manual: Beban Kerusakan/Defisit Stok (5-51003 / 5-51006) (D), Persediaan (K)
+            $deficitAcc = $isPlk ? '5-51006' : '5-51003';
+            $lines[] = [
+                'account_code' => $deficitAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => $amount,
+                'credit'       => 0,
+                'memo'         => "Beban Penyesuaian Keluar / Defisit Stok {$ingName}",
+            ];
+            $lines[] = [
+                'account_code' => $invAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => 0,
+                'credit'       => $amount,
+                'memo'         => "Pengurangan Persediaan {$ingName}",
+            ];
+            $desc = "Penyesuaian Keluar Stok #{$sm->id} - {$ingName}";
+        }
+
+        if (empty($lines)) {
+            return;
+        }
+
+        self::recordEntry([
+            'business_id'    => $bizId,
+            'outlet_id'      => $outletId,
+            'entry_date'     => $date,
+            'entry_type'     => 'ADJUSTMENT',
+            'reference_type' => 'STOCK_MOVEMENT',
+            'reference_id'   => $sm->id,
+            'description'    => $desc,
         ], $lines, $bizId);
     }
 
@@ -951,13 +2171,32 @@ class AccountingService
             'wastes'             => 0,
             'opnames'            => 0,
             'purchases'          => 0,
+            'adjustments'        => 0,
             'payable_payments'   => 0,
             'total_journal_entries' => 0,
         ];
 
         foreach ($businesses as $biz) {
+            // -1. Recompute Moving Average & sync cost_before / cost_after / unit_price across all stock movements
+            $outlets = \App\Models\Outlet::where('business_id', $biz->id)->get();
+            $ingredients = \App\Models\Ingredient::where('business_id', $biz->id)->get();
+            foreach ($ingredients as $ing) {
+                $visited = [];
+                foreach ($outlets as $ot) {
+                    $ing->recomputeMovingAverageFromHistory($ot->id, $visited);
+                }
+            }
+
             // 0. Update & reseed new master accounts in database
             Account::seedForBusiness($biz->id);
+
+            // Petakan nomor jurnal yang sudah ada sebelumnya berdasarkan reference_type + reference_id
+            // agar saat sinkronisasi ulang, nomor jurnal lama tetap dipertahankan dan tidak berubah!
+            self::$preservedEntryNos = JournalEntry::where('business_id', $biz->id)
+                ->whereNotNull('reference_type')
+                ->whereNotNull('reference_id')
+                ->pluck('entry_no', DB::raw("CONCAT(reference_type, ':', reference_id)"))
+                ->all();
 
             // Clean up existing journal lines and entries for this business to guarantee 100% clean migration
             JournalEntry::where('business_id', $biz->id)->delete();
@@ -1022,13 +2261,25 @@ class AccountingService
                 $stats['opnames']++;
             }
 
-            // 10. Purchases from StockMovement
+            // 10. Purchases & Adjustments from StockMovement
             $sms = StockMovement::where('business_id', $biz->id)
-                ->whereIn('type', ['PURCHASE', 'RESTOCK', 'IN'])
+                ->whereIn('type', ['PURCHASE', 'RESTOCK', 'IN', 'ADJUSTMENT_IN', 'ADJUSTMENT_PLUS', 'ADJUSTMENT_OUT'])
                 ->get();
             foreach ($sms as $sm) {
-                self::postStockMovementPurchase($sm);
-                $stats['purchases']++;
+                if (in_array($sm->type, ['PURCHASE', 'RESTOCK', 'IN'])) {
+                    self::postStockMovementPurchase($sm);
+                    $stats['purchases']++;
+                } else {
+                    self::postStockMovementAdjustment($sm);
+                    $stats['adjustments'] = ($stats['adjustments'] ?? 0) + 1;
+                }
+            }
+
+            // 10C. Batch Preps
+            $bps = BatchPrep::where('business_id', $biz->id)->get();
+            foreach ($bps as $bp) {
+                self::postBatchPrep($bp);
+                $stats['batch_preps'] = ($stats['batch_preps'] ?? 0) + 1;
             }
 
             // 11. Payable Payments
@@ -1037,6 +2288,14 @@ class AccountingService
                 self::postPayablePayment($pp);
                 $stats['payable_payments']++;
             }
+
+            // 12. Urgent Notes Resolutions (Pelunasan Bahan Tergantung yang Disetujui)
+            $uns = UrgentNote::where('business_id', $biz->id)->where('status', 'RESOLVED')->get();
+            foreach ($uns as $un) {
+                self::postUrgentNoteResolution($un);
+                $stats['urgent_notes_resolved'] = ($stats['urgent_notes_resolved'] ?? 0) + 1;
+            }
+            self::$preservedEntryNos = [];
         }
 
         $stats['total_journal_entries'] = JournalEntry::count();

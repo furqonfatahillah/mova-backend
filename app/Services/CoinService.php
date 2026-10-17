@@ -16,34 +16,38 @@ class CoinService
         $business = Business::find($businessId);
         if (!$business) {
             return [
-                'allowed'   => false,
-                'balance'   => 0.0,
-                'cost'      => 1.0,
-                'remaining' => 0,
-                'message'   => 'Perusahaan tidak ditemukan.',
+                'allowed'        => false,
+                'balance'        => 0.0,
+                'cost'           => 1.0,
+                'remaining'      => 0,
+                'is_unlimited'   => false,
+                'message'        => 'Perusahaan tidak ditemukan.',
             ];
         }
 
-        $cost = (float)($business->coins_per_transaction ?: 1.00);
+        $isUnlimited = (bool)($business->is_unlimited_coins || (isset($business->coins_per_transaction) && (float)$business->coins_per_transaction <= 0));
+        $cost = $isUnlimited ? 0.0 : (isset($business->coins_per_transaction) ? (float)$business->coins_per_transaction : 1.00);
         $balance = (float)($business->coin_balance ?: 0.00);
-        $remaining = $cost > 0 ? (int) floor($balance / $cost) : 999999;
+        $remaining = $isUnlimited ? 999999 : ($cost > 0 ? (int) floor($balance / $cost) : 999999);
 
-        if ($balance < $cost) {
+        if (!$isUnlimited && $balance < $cost) {
             return [
-                'allowed'   => false,
-                'balance'   => $balance,
-                'cost'      => $cost,
-                'remaining' => 0,
-                'message'   => "Transaksi tidak dapat diproses: Saldo koin perusahaan Anda habis (Sisa: {$balance} koin, Dibutuhkan: {$cost} koin per nota). Silakan hubungi Pemilik Website untuk top-up koin.",
+                'allowed'        => false,
+                'balance'        => $balance,
+                'cost'           => $cost,
+                'remaining'      => 0,
+                'is_unlimited'   => false,
+                'message'        => "Transaksi tidak dapat diproses: Saldo koin perusahaan Anda habis (Sisa: {$balance} koin, Dibutuhkan: {$cost} koin per nota). Silakan hubungi Pemilik Website untuk top-up koin.",
             ];
         }
 
         return [
-            'allowed'   => true,
-            'balance'   => $balance,
-            'cost'      => $cost,
-            'remaining' => $remaining,
-            'message'   => null,
+            'allowed'        => true,
+            'balance'        => $balance,
+            'cost'           => $cost,
+            'remaining'      => $remaining,
+            'is_unlimited'   => $isUnlimited,
+            'message'        => null,
         ];
     }
 
@@ -69,7 +73,17 @@ class CoinService
         return DB::transaction(function () use ($businessId, $orderNumber, $outletId, $userId, $customNotes) {
             $business = Business::where('id', $businessId)->lockForUpdate()->firstOrFail();
 
-            $cost = (float)($business->coins_per_transaction ?: 1.00);
+            $isUnlimited = (bool)($business->is_unlimited_coins || (isset($business->coins_per_transaction) && (float)$business->coins_per_transaction <= 0));
+            if ($isUnlimited) {
+                // Mode Unlimited: Transaksi tidak memotong koin sama sekali
+                return null;
+            }
+
+            $cost = isset($business->coins_per_transaction) ? (float)$business->coins_per_transaction : 1.00;
+            if ($cost <= 0) {
+                return null;
+            }
+
             $before = (float)($business->coin_balance ?: 0.00);
 
             if ($before < $cost) {
@@ -141,9 +155,9 @@ class CoinService
     }
 
     /**
-     * Update the cost (coins per transaction) for a business.
+     * Update the cost (coins per transaction) or toggle unlimited status for a business.
      */
-    public static function updateRate(int $businessId, float $coinsPerTx, ?int $adminId = null): void
+    public static function updateRate(int $businessId, float $coinsPerTx, ?bool $isUnlimited = null, ?int $adminId = null): void
     {
         if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coins_per_transaction')) {
             throw new \Exception("Tabel koin belum dibuat di database server produksi. Silakan jalankan 'php artisan migrate --force' di terminal VPS server produksi Anda.");
@@ -155,6 +169,11 @@ class CoinService
 
         $business = Business::findOrFail($businessId);
         $business->coins_per_transaction = $coinsPerTx;
+        if ($isUnlimited !== null) {
+            $business->is_unlimited_coins = $isUnlimited;
+        } elseif ($coinsPerTx == 0.0) {
+            $business->is_unlimited_coins = true;
+        }
         $business->updated_by = $adminId;
         $business->save();
     }

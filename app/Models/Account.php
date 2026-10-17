@@ -251,6 +251,22 @@ class Account extends Model
                 'description'    => 'Nilainya akan bertambah jika admin mencatat di kartu stok sebagai waste untuk perlengkapan / kemasan',
             ],
             [
+                'code'           => '5-51007',
+                'name'           => 'BIAYA SELISIH HPP TEORITIS BAHAN',
+                'type'           => 'EXPENSE',
+                'category'       => 'COGS',
+                'normal_balance' => 'DEBIT',
+                'description'    => 'Biaya selisih HPP teoritis untuk pemakaian bahan baku saat stok minus/defisit di kartu stok',
+            ],
+            [
+                'code'           => '5-51008',
+                'name'           => 'BIAYA SELISIH HPP TEORITIS PERLENGKAPAN',
+                'type'           => 'EXPENSE',
+                'category'       => 'COGS',
+                'normal_balance' => 'DEBIT',
+                'description'    => 'Biaya selisih HPP teoritis untuk pemakaian perlengkapan/kemasan saat stok minus/defisit di kartu stok',
+            ],
+            [
                 'code'           => '5-51004',
                 'name'           => 'BIAYA SELISIH PERSEDIAAN BAHAN BAKU',
                 'type'           => 'EXPENSE',
@@ -340,6 +356,14 @@ class Account extends Model
                 'normal_balance' => 'DEBIT',
                 'description'    => 'Biaya lain-lainnya',
             ],
+            [
+                'code'           => '6-61010',
+                'name'           => 'BIAYA ADMIN KAS APLIKASI',
+                'type'           => 'EXPENSE',
+                'category'       => 'OPEX',
+                'normal_balance' => 'DEBIT',
+                'description'    => 'Biaya administrasi / komisi / potongan MDR aplikasi kasir, payment gateway, QRIS, dan e-commerce / online delivery (Grab, Gojek, Shopee)',
+            ],
         ];
     }
 
@@ -382,6 +406,16 @@ class Account extends Model
                 ]
             );
 
+            if ($head->name !== $acc['name'] || $head->type !== $acc['type'] || $head->category !== $acc['category'] || $head->normal_balance !== $acc['normal_balance']) {
+                $head->update([
+                    'name'           => $acc['name'],
+                    'type'           => $acc['type'],
+                    'category'       => $acc['category'],
+                    'normal_balance' => $acc['normal_balance'],
+                    'description'    => isset($acc['description']) ? mb_substr($acc['description'], 0, 250) : null,
+                ]);
+            }
+
             // 2. Child Sub-Accounts per Outlet (Anak Akun Cabang)
             foreach ($outlets as $index => $outlet) {
                 $suffix = sprintf('%02d', $index + 1);
@@ -406,10 +440,15 @@ class Account extends Model
                     ]
                 );
 
-                if ($sub->parent_code !== $acc['code'] || $sub->outlet_id !== $outlet->id) {
+                if ($sub->name !== $subName || $sub->parent_code !== $acc['code'] || $sub->outlet_id !== $outlet->id || $sub->type !== $acc['type'] || $sub->category !== $acc['category']) {
                     $sub->update([
-                        'parent_code' => $acc['code'],
-                        'outlet_id'   => $outlet->id,
+                        'name'           => $subName,
+                        'parent_code'    => $acc['code'],
+                        'outlet_id'      => $outlet->id,
+                        'type'           => $acc['type'],
+                        'category'       => $acc['category'],
+                        'normal_balance' => $acc['normal_balance'],
+                        'description'    => "Sub-Akun cabang {$outlet->name} untuk {$acc['name']}",
                     ]);
                 }
             }

@@ -66,8 +66,8 @@ class AuthController extends Controller
                     'referral_code_used' => $cleanReferralCode,
                     'package_type'       => 'pro',
                     'max_outlets'        => 5,
-                    'status'             => 'active',
-                    'expires_at'         => now()->addMonths(1), // Trial 30 hari
+                    'status'             => 'pending', // Wajib diverifikasi oleh Superadmin Platform
+                    'expires_at'         => now()->addMonths(1), // Masa trial 30 hari disiapkan
                 ]);
 
                 // 2. Buat Cabang Pertama untuk Bisnis ini
@@ -86,7 +86,7 @@ class AuthController extends Controller
                     'active'      => true,
                 ]);
 
-                // 3. Buat User Owner Bisnis
+                // 3. Buat User Owner Bisnis (Status Pending Menunggu Verifikasi Superadmin)
                 $user = User::create([
                     'business_id'    => $business->id,
                     'outlet_id'      => $outlet->id,
@@ -94,29 +94,25 @@ class AuthController extends Controller
                     'email'          => $data['email'],
                     'password'       => Hash::make($data['password']),
                     'role'           => 'owner_bisnis',
-                    'status'         => 'active',
+                    'status'         => 'pending',
                     'referred_by_id' => $referrer?->id,
-                    'approved_at'    => now(),
+                    'approved_at'    => null,
                 ]);
 
                 $business->update(['created_by' => $user->id]);
                 $outlet->update(['created_by' => $user->id]);
 
-                $token = $user->createToken('pos-token')->plainTextToken;
-
                 return [
                     'user'     => $user->load(['outlet', 'business', 'referredBy']),
                     'business' => $business->load(['referredBy']),
                     'outlet'   => $outlet,
-                    'token'    => $token,
                 ];
             });
 
             return response()->json([
-                'message'  => "Pendaftaran bisnis '{$result['business']->name}' berhasil! Anda telah masuk sebagai Owner Bisnis.",
-                'status'   => 'active',
+                'message'  => "Pendaftaran bisnis '{$result['business']->name}' berhasil! Akun bisnis Anda sedang menunggu verifikasi & persetujuan dari Superadmin Platform sebelum dapat digunakan.",
+                'status'   => 'pending',
                 'user'     => $result['user'],
-                'token'    => $result['token'],
                 'business' => $result['business'],
             ], 201);
         }
@@ -174,14 +170,22 @@ class AuthController extends Controller
         }
 
         if ($user->status === 'pending') {
+            $isBizOwner = $user->role === 'owner_bisnis' || ($user->business && $user->business->status === 'pending');
+            $msg = $isBizOwner
+                ? 'Pendaftaran akun bisnis Anda sedang menunggu verifikasi & persetujuan dari Superadmin Platform. Silakan tunggu hingga disetujui atau hubungi admin platform.'
+                : 'Akun Anda sedang menunggu persetujuan (approval) dari Owner Bisnis / Admin. Silakan hubungi admin untuk aktivasi akun.';
             throw ValidationException::withMessages([
-                'email' => ['Akun Anda sedang menunggu persetujuan (approval) dari Owner Bisnis / Admin. Silakan hubungi admin untuk aktivasi akun.'],
+                'email' => [$msg],
             ]);
         }
 
         if ($user->status === 'rejected') {
+            $isBizOwner = $user->role === 'owner_bisnis';
+            $msg = $isBizOwner
+                ? 'Pendaftaran akun bisnis Anda telah ditolak oleh Superadmin Platform. Silakan hubungi pengelola platform.'
+                : 'Pendaftaran akun Anda ditolak oleh Owner Bisnis. Silakan hubungi admin.';
             throw ValidationException::withMessages([
-                'email' => ['Pendaftaran akun Anda ditolak oleh Owner Bisnis. Silakan hubungi admin.'],
+                'email' => [$msg],
             ]);
         }
 
@@ -193,6 +197,16 @@ class AuthController extends Controller
 
         // Cek status bisnis (SaaS subscription)
         if ($user->business && !$user->isSuperadminPlatform()) {
+            if ($user->business->status === 'pending') {
+                throw ValidationException::withMessages([
+                    'email' => ['Akun bisnis Anda sedang menunggu verifikasi & persetujuan dari Superadmin Platform. Silakan hubungi pengelola platform.'],
+                ]);
+            }
+            if ($user->business->status === 'rejected') {
+                throw ValidationException::withMessages([
+                    'email' => ['Pendaftaran bisnis Anda telah ditolak oleh Superadmin Platform. Silakan hubungi pengelola platform.'],
+                ]);
+            }
             if ($user->business->status === 'suspended') {
                 throw ValidationException::withMessages([
                     'email' => ['Akses bisnis Anda telah dinonaktifkan sementara oleh pengelola platform. Silakan hubungi pengelola.'],

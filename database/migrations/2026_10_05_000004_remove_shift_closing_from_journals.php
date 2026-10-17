@@ -12,24 +12,9 @@ return new class extends Migration
      */
     public function up(): void
     {
-        // Delete all SHIFT_CLOSING entries from journal_entries so selisih kasir does not deduct Kas Kecil Kasir in Neraca
-        if (Schema::hasTable('journal_entries')) {
-            $shiftClosingIds = DB::table('journal_entries')
-                ->where('reference_type', 'SHIFT_CLOSING')
-                ->pluck('id');
-
-            if ($shiftClosingIds->isNotEmpty()) {
-                if (Schema::hasTable('journal_lines')) {
-                    DB::table('journal_lines')
-                        ->whereIn('journal_entry_id', $shiftClosingIds)
-                        ->delete();
-                }
-
-                DB::table('journal_entries')
-                    ->whereIn('id', $shiftClosingIds)
-                    ->delete();
-            }
-        }
+        // Obsolete: SHIFT_CLOSING entries are now properly reconciled with Kas Kecil Kasir (1-11002),
+        // Pendapatan Lain-Lain (4-41002), and Biaya Lain-Lain (6-61008) in double-entry accounting.
+        // No entries should be forcibly deleted here.
     }
 
     /**

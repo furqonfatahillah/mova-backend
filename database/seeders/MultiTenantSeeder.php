@@ -191,13 +191,23 @@ class MultiTenantSeeder extends Seeder
 
         // Set stok awal per outlet untuk Kopi Senja
         foreach ([$bijiKopi, $susuUHT, $gulaAren] as $ing) {
+            $stokAwal = (float)($ing->stok_awal ?? 0);
             OutletIngredient::updateOrCreate(
                 ['outlet_id' => $cabRanggong->id, 'ingredient_id' => $ing->id],
-                ['stok_awal' => $ing->stok_awal, 'stok_min' => $ing->stok_min]
+                ['current_stock' => $stokAwal, 'stok_min' => $ing->stok_min]
             );
+            \App\Models\IngredientInitialBalance::updateOrCreate(
+                ['outlet_id' => $cabRanggong->id, 'ingredient_id' => $ing->id],
+                ['business_id' => $senja->id, 'stok_awal' => $stokAwal, 'tanggal_saldo_awal' => now()->toDateString()]
+            );
+
             OutletIngredient::updateOrCreate(
                 ['outlet_id' => $cabBoulevard->id, 'ingredient_id' => $ing->id],
-                ['stok_awal' => 0, 'stok_min' => $ing->stok_min]
+                ['current_stock' => 0, 'stok_min' => $ing->stok_min]
+            );
+            \App\Models\IngredientInitialBalance::updateOrCreate(
+                ['outlet_id' => $cabBoulevard->id, 'ingredient_id' => $ing->id],
+                ['business_id' => $senja->id, 'stok_awal' => 0, 'tanggal_saldo_awal' => now()->toDateString()]
             );
         }
 

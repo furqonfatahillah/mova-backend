@@ -14,6 +14,8 @@ use App\Models\Payable;
 use App\Models\PayablePayment;
 use App\Models\Supplier;
 use App\Models\JournalEntry;
+use App\Models\UrgentNote;
+use App\Models\OutletIngredient;
 use App\Services\AccountingService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -85,7 +87,36 @@ class TransferController extends Controller
             $query->where('business_id', $request->user()->business_id);
         }
 
-        return response()->json($query->limit(200)->get());
+        $transfers = $query->limit(200)->get();
+
+        foreach ($transfers as $trf) {
+            $destOid = $trf->destination_outlet_id;
+            $hasNeg = false;
+            $negItems = [];
+            if ($destOid) {
+                foreach ($trf->items as $item) {
+                    $curStock = null;
+                    if ($item->ingredient_id && $item->ingredient) {
+                        $curStock = (float)$item->ingredient->stockForOutlet($destOid);
+                    } elseif ($item->menu_id && $item->menu) {
+                        $curStock = (float)$item->menu->stockForOutlet($destOid);
+                    }
+                    $item->dest_current_stock = $curStock;
+                    if ($curStock !== null && $curStock < -0.0001) {
+                        $hasNeg = true;
+                        $negItems[] = [
+                            'name'  => $item->item_name,
+                            'stock' => $curStock,
+                            'unit'  => $item->input_unit ?: $item->unit ?: 'pcs',
+                        ];
+                    }
+                }
+            }
+            $trf->has_negative_stock = $hasNeg;
+            $trf->negative_items = $negItems;
+        }
+
+        return response()->json($transfers);
     }
 
     public function store(Request $request)
@@ -103,6 +134,7 @@ class TransferController extends Controller
             'notes'                 => 'nullable|string|max:500',
             'driver_name'           => 'nullable|string|max:100',
             'vehicle_no'            => 'nullable|string|max:50',
+            'negative_handling'     => 'nullable|string|in:RESET_TO_ZERO,BARANG_BARU,LUPA_TERINPUT,OFFSET_NEGATIVE',
             'items'                 => 'required|array|min:1',
             'items.*.item_type'     => 'nullable|string|in:INGREDIENT,PRODUCT,PERLENGKAPAN',
             'items.*.ingredient_id' => 'nullable|exists:ingredients,id',
@@ -494,33 +526,119 @@ class TransferController extends Controller
                         $destStock = $ingredient->stockForOutlet($destOutlet->id);
                         $negHandling = strtoupper(trim($validated['negative_handling'] ?? 'RESET_TO_ZERO'));
 
-                        // Kategori: Transfer Masuk (Barang Baru) -> Reset minus ke 0 via penyesuaian di kartu stok
-                        if ($destStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                        $movementDate = $date;
+                        $movementCreatedAt = null;
+
+                        if ($destStock < -0.0001 && in_array($negHandling, ['LUPA_TERINPUT', 'OFFSET_NEGATIVE'])) {
+                            // 1. OPSI: Lupa Menginputkan (Barang Sebenarnya Sudah Ada Sebelumnya)
+                            $earliestNeg = $this->findEarliestNegativeMovement($ingredient->id, $destOutlet->id);
+                            if ($earliestNeg) {
+                                $movementDate = $earliestNeg->date;
+                                $negCreatedAt = $earliestNeg->created_at ? Carbon::parse($earliestNeg->created_at) : Carbon::parse($earliestNeg->date . ' 00:00:00');
+                                $movementCreatedAt = $negCreatedAt->copy()->subSecond();
+                            }
+
+                            // Selesaikan UrgentNote yang pending untuk bahan ini di cabang tujuan
+                            $urgentNotesToResolve = UrgentNote::where('ingredient_id', $ingredient->id)
+                                ->where('outlet_id', $destOutlet->id)
+                                ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                ->get();
+
+                            UrgentNote::where('ingredient_id', $ingredient->id)
+                                ->where('outlet_id', $destOutlet->id)
+                                ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                ->update([
+                                    'status'           => 'RESOLVED',
+                                    'resolved_at'      => now(),
+                                    'resolved_by'      => $userId,
+                                    'resolution_notes' => 'Terselesaikan otomatis melalui transfer stock yang disisipkan sebelum transaksi minus.',
+                                ]);
+
+                            foreach ($urgentNotesToResolve as $unItem) {
+                                try {
+                                    $unItem->refresh();
+                                    AccountingService::postUrgentNoteResolution($unItem);
+                                } catch (\Throwable $e) {}
+                            }
+                        } elseif ($destStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                            // 2. OPSI: Barang Baru Datang (Restok Saat Ini)
                             $minusQty = abs((float)$destStock);
-                            StockMovement::create([
+                            $deficitCostPerPakai = (float)$ingredient->costPerPakaiForOutlet($destOutlet->id);
+                            $lastMovement = StockMovement::where('ingredient_id', $ingredient->id)
+                                ->where('outlet_id', $destOutlet->id)
+                                ->orderBy('date', 'desc')
+                                ->orderBy('created_at', 'desc')
+                                ->orderBy('id', 'desc')
+                                ->first();
+                            if ($lastMovement) {
+                                if ((float)$lastMovement->cost_after > 0) {
+                                    $deficitCostPerPakai = (float)$lastMovement->cost_after;
+                                } elseif ((float)$lastMovement->cost_before > 0) {
+                                    $deficitCostPerPakai = (float)$lastMovement->cost_before;
+                                }
+                            }
+                            $destKonversi = max((float)$ingredient->konversi, 1);
+                            if ($deficitCostPerPakai <= 0) {
+                                $deficitCostPerPakai = (float)$ingredient->hargaForOutlet($destOutlet->id) / $destKonversi;
+                            }
+                            $lockedPricePerPakai = $deficitCostPerPakai;
+                            $lockedPricePerBeli = round($lockedPricePerPakai * $destKonversi, 4);
+
+                            $adjMvt = StockMovement::create([
                                 'business_id'   => $transfer->business_id,
                                 'date'          => $date,
                                 'ingredient_id' => $ingredient->id,
                                 'outlet_id'     => $destOutlet->id,
                                 'type'          => 'ADJUSTMENT_IN',
                                 'qty'           => $minusQty,
-                                'unit_price'    => $sourcePricePerBeli,
-                                'total_price'   => 0,
-                                'cost_before'   => $ingredient->costPerPakaiForOutlet($destOutlet->id),
-                                'cost_after'    => $ingredient->costPerPakaiForOutlet($destOutlet->id),
+                                'unit_price'    => $lockedPricePerBeli,
+                                'total_price'   => round(($minusQty / $destKonversi) * $lockedPricePerBeli, 2),
+                                'cost_before'   => round($lockedPricePerPakai, 4),
+                                'cost_after'    => round($lockedPricePerPakai, 4),
                                 'note'          => "Reset Stok Minus (Transfer Masuk Barang Baru) – Normalisasi ke 0 ({$transferNo})",
                                 'transfer_id'   => $transfer->id,
                                 'user_id'       => $userId,
                                 'created_by'    => $userId,
+                                'created_at'    => now()->subSecond(),
                             ]);
+                            AccountingService::postStockMovementAdjustment($adjMvt);
+
+                            // Selesaikan UrgentNote yang pending untuk bahan ini di cabang tujuan
+                            $urgentNotesToResolve = UrgentNote::where('ingredient_id', $ingredient->id)
+                                ->where('outlet_id', $destOutlet->id)
+                                ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                ->get();
+
+                            UrgentNote::where('ingredient_id', $ingredient->id)
+                                ->where('outlet_id', $destOutlet->id)
+                                ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                ->update([
+                                    'status'                 => 'RESOLVED',
+                                    'resolved_at'            => now(),
+                                    'resolved_by'            => $userId,
+                                    'resolution_notes'       => 'Terselesaikan otomatis melalui penyesuaian normalisasi reset stok minus ke 0.',
+                                    'resolution_movement_id' => $adjMvt->id,
+                                ]);
+
+                            foreach ($urgentNotesToResolve as $unItem) {
+                                try {
+                                    $unItem->refresh();
+                                    AccountingService::postUrgentNoteResolution($unItem);
+                                } catch (\Throwable $e) {}
+                            }
                         }
 
                         // Cabang penerima menyerap stok masuk dengan harga transfer dari cabang asal
                         $destAvg = $ingredient->recalculateMovingAverage($baseQty, $sourcePricePerPakai, $destOutlet->id);
 
-                        StockMovement::create([
+                        $transferInNote = "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transferNo})";
+                        if ($movementCreatedAt) {
+                            $transferInNote .= " [Disisipkan sebelum transaksi minus / Lupa Input]";
+                        }
+
+                        $incomingMvt = StockMovement::create([
                             'business_id'   => $transfer->business_id,
-                            'date'          => $date,
+                            'date'          => $movementDate,
                             'ingredient_id' => $ingredient->id,
                             'type'          => 'TRANSFER_IN',
                             'qty'           => $baseQty,
@@ -528,12 +646,22 @@ class TransferController extends Controller
                             'total_price'   => $itemTotalPrice,
                             'cost_before'   => $destAvg['cost_before'],
                             'cost_after'    => $destAvg['cost_after'],
-                            'note'          => "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transferNo})",
+                            'note'          => $transferInNote,
                             'transfer_id'   => $transfer->id,
                             'outlet_id'     => $destOutlet->id,
                             'user_id'       => $userId,
                             'created_by'    => $userId,
+                            'created_at'    => $movementCreatedAt ?: now(),
                         ]);
+
+                        if ($movementCreatedAt) {
+                            $incomingMvt->created_at = $movementCreatedAt;
+                            $incomingMvt->save();
+                        }
+
+                        if ($destStock < -0.0001) {
+                            $ingredient->recomputeMovingAverageFromHistory($destOutlet->id);
+                        }
                     }
                 }
             }
@@ -636,6 +764,33 @@ class TransferController extends Controller
             'receiver',
             'stockMovements'
         ]);
+
+        $destOutletId = $transfer->destination_outlet_id;
+        $hasNegativeStock = false;
+        $negativeItems = [];
+
+        if ($destOutletId) {
+            foreach ($transfer->items as $item) {
+                $curStock = null;
+                if ($item->ingredient_id && $item->ingredient) {
+                    $curStock = (float)$item->ingredient->stockForOutlet($destOutletId);
+                } elseif ($item->menu_id && $item->menu) {
+                    $curStock = (float)$item->menu->stockForOutlet($destOutletId);
+                }
+                $item->dest_current_stock = $curStock;
+                if ($curStock !== null && $curStock < -0.0001) {
+                    $hasNegativeStock = true;
+                    $negativeItems[] = [
+                        'name'  => $item->item_name,
+                        'stock' => $curStock,
+                        'unit'  => $item->input_unit ?: $item->unit ?: 'pcs',
+                    ];
+                }
+            }
+        }
+        $transfer->has_negative_stock = $hasNegativeStock;
+        $transfer->negative_items = $negativeItems;
+
         return response()->json($transfer);
     }
 
@@ -655,6 +810,7 @@ class TransferController extends Controller
             'received_notes'     => 'nullable|string|max:500',
             'return_disposition' => 'nullable|string|in:RECORD_AS_WASTE,RETURN_TO_SOURCE',
             'return_reason'      => 'nullable|string|max:255',
+            'negative_handling'  => 'nullable|string|in:RESET_TO_ZERO,BARANG_BARU,LUPA_TERINPUT,OFFSET_NEGATIVE',
             'items'              => 'nullable|array',
             'items.*.id'         => 'required_with:items|exists:transfer_items,id',
             'items.*.received_qty' => 'required_with:items|numeric|min:0',
@@ -683,11 +839,12 @@ class TransferController extends Controller
         $totalReceived = 0;
         $totalReturned = 0;
         $totalOriginal = 0;
+        $isAutoApprovedWaste = false;
 
         DB::transaction(function () use (
-            $transfer, $destOutlet, $sourceName, $destName, $userId, $businessId,
+            $transfer, $destOutlet, $sourceName, $destName, $user, $userId, $businessId,
             $receiveDate, $validated, $disposition, $defaultReturnReason,
-            &$totalReceived, &$totalReturned, &$totalOriginal
+            &$totalReceived, &$totalReturned, &$totalOriginal, &$isAutoApprovedWaste
         ) {
             $itemsMap = !empty($validated['items']) ? collect($validated['items'])->keyBy('id') : null;
 
@@ -762,42 +919,143 @@ class TransferController extends Controller
                                 $noteSuffix .= " [Diterima: " . number_format($receivedInputQty, 0, ',', '.') . "/{$originalInputQty} {$inputUnit}]";
                             }
 
+                            $ingKonversi = max((float)$ingredient->konversi, 1);
+                            $inputUnit = $item->input_unit ?: $item->unit;
+                            $isUnitBeli = strtolower((string)$inputUnit) === strtolower((string)$ingredient->unit_beli);
+
                             // Ambil harga modal dari item transfer (jika pembelian online / transfer ada harga khusus) atau dari cabang asal
                             if ($item->unit_price !== null && (float)$item->unit_price > 0) {
-                                $sourcePricePerBeli = (float)$item->unit_price;
+                                if ($isUnitBeli) {
+                                    $sourcePricePerBeli = (float)$item->unit_price;
+                                    $sourcePricePerPakai = $sourcePricePerBeli / $ingKonversi;
+                                } else {
+                                    $sourcePricePerPakai = (float)$item->unit_price;
+                                    $sourcePricePerBeli = $sourcePricePerPakai * $ingKonversi;
+                                }
                             } elseif ($item->total_price !== null && (float)$item->total_price > 0 && $originalInputQty > 0) {
-                                $sourcePricePerBeli = (float)$item->total_price / $originalInputQty;
+                                $unitPriceInput = (float)$item->total_price / $originalInputQty;
+                                if ($isUnitBeli) {
+                                    $sourcePricePerBeli = $unitPriceInput;
+                                    $sourcePricePerPakai = $sourcePricePerBeli / $ingKonversi;
+                                } else {
+                                    $sourcePricePerPakai = $unitPriceInput;
+                                    $sourcePricePerBeli = $sourcePricePerPakai * $ingKonversi;
+                                }
                             } elseif ($transfer->source_outlet_id) {
                                 $sourcePricePerBeli = $ingredient->hargaForOutlet($transfer->source_outlet_id);
+                                $sourcePricePerPakai = $sourcePricePerBeli / $ingKonversi;
                             } else {
                                 $sourcePricePerBeli = (float)$ingredient->harga;
+                                $sourcePricePerPakai = $sourcePricePerBeli / $ingKonversi;
                             }
 
-                            $sourcePricePerPakai = $sourcePricePerBeli / max((float)$ingredient->konversi, 1);
-                            $itemTotalPrice = round(($receivedBaseQty / max((float)$ingredient->konversi, 1)) * $sourcePricePerBeli, 2);
+                            $itemTotalPrice = round($receivedBaseQty * $sourcePricePerPakai, 2);
 
                             $destStock = $ingredient->stockForOutlet($destOutlet->id);
                             $negHandling = strtoupper(trim($validated['negative_handling'] ?? 'RESET_TO_ZERO'));
 
-                            // Kategori: Transfer Masuk (Barang Baru) -> Reset minus ke 0 via penyesuaian di kartu stok
-                            if ($destStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                            $movementDate = $receiveDate;
+                            $movementCreatedAt = null;
+
+                            if ($destStock < -0.0001 && in_array($negHandling, ['LUPA_TERINPUT', 'OFFSET_NEGATIVE'])) {
+                                // 1. OPSI: Lupa Menginputkan (Barang Sebenarnya Sudah Ada Sebelumnya)
+                                // Cari transaksi minus pertama untuk disisipkan tepat sebelum transaksi tersebut
+                                $earliestNeg = $this->findEarliestNegativeMovement($ingredient->id, $destOutlet->id);
+                                if ($earliestNeg) {
+                                    $movementDate = $earliestNeg->date;
+                                    $negCreatedAt = $earliestNeg->created_at ? Carbon::parse($earliestNeg->created_at) : Carbon::parse($earliestNeg->date . ' 00:00:00');
+                                    $movementCreatedAt = $negCreatedAt->copy()->subSecond();
+                                }
+
+                                // Selesaikan UrgentNote yang pending untuk bahan ini di cabang tujuan
+                                $urgentNotesToResolve = UrgentNote::where('ingredient_id', $ingredient->id)
+                                    ->where('outlet_id', $destOutlet->id)
+                                    ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                    ->get();
+
+                                UrgentNote::where('ingredient_id', $ingredient->id)
+                                    ->where('outlet_id', $destOutlet->id)
+                                    ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                    ->update([
+                                        'status'           => 'RESOLVED',
+                                        'resolved_at'      => now(),
+                                        'resolved_by'      => $userId,
+                                        'resolution_notes' => 'Terselesaikan otomatis melalui penerimaan transfer stock yang disisipkan sebelum transaksi minus.',
+                                    ]);
+
+                                foreach ($urgentNotesToResolve as $unItem) {
+                                    try {
+                                        $unItem->refresh();
+                                        AccountingService::postUrgentNoteResolution($unItem);
+                                    } catch (\Throwable $e) {}
+                                }
+                            } elseif ($destStock < -0.0001 && in_array($negHandling, ['RESET_TO_ZERO', 'BARANG_BARU'])) {
+                                // 2. OPSI: Barang Baru Datang (Restok Saat Ini)
+                                // Reset minus ke 0 via penyesuaian di kartu stok
                                 $minusQty = abs((float)$destStock);
-                                StockMovement::create([
+                                $deficitCostPerPakai = (float)$ingredient->costPerPakaiForOutlet($destOutlet->id);
+                                $lastMovement = StockMovement::where('ingredient_id', $ingredient->id)
+                                    ->where('outlet_id', $destOutlet->id)
+                                    ->orderBy('date', 'desc')
+                                    ->orderBy('created_at', 'desc')
+                                    ->orderBy('id', 'desc')
+                                    ->first();
+                                if ($lastMovement) {
+                                    if ((float)$lastMovement->cost_after > 0) {
+                                        $deficitCostPerPakai = (float)$lastMovement->cost_after;
+                                    } elseif ((float)$lastMovement->cost_before > 0) {
+                                        $deficitCostPerPakai = (float)$lastMovement->cost_before;
+                                    }
+                                }
+                                $destKonversi = max((float)$ingredient->konversi, 1);
+                                if ($deficitCostPerPakai <= 0) {
+                                    $deficitCostPerPakai = (float)$ingredient->hargaForOutlet($destOutlet->id) / $destKonversi;
+                                }
+                                $lockedPricePerPakai = $deficitCostPerPakai;
+                                $lockedPricePerBeli = round($lockedPricePerPakai * $destKonversi, 4);
+
+                                $adjMvt = StockMovement::create([
                                     'business_id'   => $transfer->business_id,
                                     'date'          => $receiveDate,
                                     'ingredient_id' => $ingredient->id,
                                     'outlet_id'     => $destOutlet->id,
                                     'type'          => 'ADJUSTMENT_IN',
                                     'qty'           => $minusQty,
-                                    'unit_price'    => $sourcePricePerBeli,
-                                    'total_price'   => 0,
-                                    'cost_before'   => $ingredient->costPerPakaiForOutlet($destOutlet->id),
-                                    'cost_after'    => $ingredient->costPerPakaiForOutlet($destOutlet->id),
+                                    'unit_price'    => $lockedPricePerBeli,
+                                    'total_price'   => round(($minusQty / $destKonversi) * $lockedPricePerBeli, 2),
+                                    'cost_before'   => round($lockedPricePerPakai, 4),
+                                    'cost_after'    => round($lockedPricePerPakai, 4),
                                     'note'          => "Reset Stok Minus (Transfer Masuk Barang Baru) – Normalisasi ke 0 ({$transfer->transfer_no})",
                                     'transfer_id'   => $transfer->id,
                                     'user_id'       => $userId,
                                     'created_by'    => $userId,
+                                    'created_at'    => now()->subSecond(),
                                 ]);
+                                AccountingService::postStockMovementAdjustment($adjMvt);
+
+                                // Selesaikan UrgentNote yang pending untuk bahan ini di cabang tujuan
+                                $urgentNotesToResolve = UrgentNote::where('ingredient_id', $ingredient->id)
+                                    ->where('outlet_id', $destOutlet->id)
+                                    ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                    ->get();
+
+                                UrgentNote::where('ingredient_id', $ingredient->id)
+                                    ->where('outlet_id', $destOutlet->id)
+                                    ->whereIn('status', ['PENDING', 'APPROVAL_PENDING'])
+                                    ->update([
+                                        'status'                 => 'RESOLVED',
+                                        'resolved_at'            => now(),
+                                        'resolved_by'            => $userId,
+                                        'resolution_notes'       => 'Terselesaikan otomatis melalui penyesuaian normalisasi reset stok minus ke 0.',
+                                        'resolution_movement_id' => $adjMvt->id,
+                                    ]);
+
+                                foreach ($urgentNotesToResolve as $unItem) {
+                                    try {
+                                        $unItem->refresh();
+                                        AccountingService::postUrgentNoteResolution($unItem);
+                                    } catch (\Throwable $e) {}
+                                }
                             }
 
                             // Cabang tujuan menyerap stok transfer ke moving average mandiri miliknya
@@ -809,9 +1067,13 @@ class TransferController extends Controller
                                 ? "Penerimaan belanja online dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})"
                                 : "Transfer masuk dari {$sourceName}{$noteSuffix} ({$transfer->transfer_no})";
 
-                            StockMovement::create([
+                            if ($movementCreatedAt) {
+                                $movementNote .= " [Disisipkan sebelum transaksi minus / Lupa Input]";
+                            }
+
+                            $incomingMvt = StockMovement::create([
                                 'business_id'   => $transfer->business_id,
-                                'date'          => $receiveDate,
+                                'date'          => $movementDate,
                                 'ingredient_id' => $ingredient->id,
                                 'type'          => $movementType,
                                 'qty'           => $receivedBaseQty,
@@ -824,33 +1086,167 @@ class TransferController extends Controller
                                 'outlet_id'     => $destOutlet->id,
                                 'user_id'       => $userId,
                                 'created_by'    => $userId,
+                                'created_at'    => $movementCreatedAt ?: now(),
                             ]);
+
+                            if ($movementCreatedAt) {
+                                $incomingMvt->created_at = $movementCreatedAt;
+                                $incomingMvt->save();
+                            }
+
+                            if ($destStock < -0.0001) {
+                                $ingredient->recomputeMovingAverageFromHistory($destOutlet->id);
+                            }
                         }
                     }
                 }
 
-                // 2. PENANGANAN RETUR: STOK CABANG ASAL BELUM DITAMBAHKAN SAMPAI DISETUJUI (APPROVAL) OLEH CABANG ASAL
+                // 2. PENANGANAN RETUR / WASTE
             }
 
             // Tentukan status transfer akhir
             $finalStatus = 'COMPLETED';
             $returnStatus = 'NONE';
+            $isAutoApprovedWaste = false;
             if ($totalReturned > 0) {
                 $finalStatus = ($totalReceived <= 0 && $totalOriginal > 0) ? 'RETURNED' : 'PARTIALLY_RETURNED';
                 $returnStatus = 'PENDING'; // Menunggu persetujuan cabang asal
+
+                // Jika penerima adalah Owner Bisnis atau Platform Admin dan memilih RECORD_AS_WASTE, langsung disetujui (auto-approve)
+                if ($user && ($user->isOwnerBisnis() || $user->isPlatformAdmin()) && $disposition === 'RECORD_AS_WASTE') {
+                    $returnStatus = 'APPROVED';
+                    $isAutoApprovedWaste = true;
+                }
+            }
+
+            if ($isAutoApprovedWaste) {
+                $wasteOutletId = $transfer->source_outlet_id ?: $transfer->destination_outlet_id;
+                foreach ($transfer->items as $item) {
+                    $retQty = (float)($item->returned_qty ?? 0);
+                    if ($retQty <= 0) continue;
+
+                    $item->update([
+                        'return_approved_qty' => $retQty,
+                        'return_rejected_qty' => 0,
+                    ]);
+
+                    $originalInputQty = (float)($item->input_qty ?? $item->qty);
+                    $ratio = ($originalInputQty > 0) ? ($item->qty / $originalInputQty) : 1;
+                    $approvedBaseQty = round($retQty * $ratio, 4);
+
+                    $costPerUnit = 0;
+                    $costPerBeli = 0;
+                    $ingredientId = null;
+                    $menuId = null;
+
+                    if (in_array($item->item_type, ['INGREDIENT', 'PERLENGKAPAN']) && $item->ingredient_id) {
+                        $ing = Ingredient::find($item->ingredient_id);
+                        $ingredientId = $ing?->id;
+                        $konversi = max(1, (float)($ing?->konversi ?: 1));
+                        $costPerPakai = (float)($ing?->costPerPakaiForOutlet($wasteOutletId) ?: ($ing?->harga / $konversi));
+                        $costPerBeli = round($costPerPakai * $konversi, 2);
+                        $costPerUnit = $costPerPakai;
+                    } elseif ($item->item_type === 'PRODUCT' && $item->menu_id) {
+                        $menu = Menu::find($item->menu_id);
+                        $menuId = $menu?->id;
+                        $costPerUnit = (float)($menu?->hpp ?? $menu?->cogs ?? $menu?->cost_price ?? $menu?->price ?? 0);
+                        $costPerBeli = $costPerUnit;
+                    }
+
+                    $lossCost = round($approvedBaseQty * $costPerUnit, 2);
+                    $wasteNo = 'WST-RET-' . date('Ymd') . '-' . str_pad(rand(1, 9999), 4, '0', STR_PAD_LEFT);
+
+                    $wasteMov = null;
+                    if ($ingredientId && $wasteOutletId) {
+                        $baseTimestamp = $transfer->received_at ?: ($transfer->created_at ?: now());
+                        $retInCreatedAt = \Carbon\Carbon::parse($baseTimestamp)->addSeconds(1)->format('Y-m-d H:i:s');
+                        $wasteCreatedAt = \Carbon\Carbon::parse($baseTimestamp)->addSeconds(2)->format('Y-m-d H:i:s');
+
+                        StockMovement::create([
+                            'business_id'   => $businessId,
+                            'date'          => $receiveDate,
+                            'ingredient_id' => $ingredientId,
+                            'outlet_id'     => $wasteOutletId,
+                            'type'          => 'TRANSFER_IN',
+                            'qty'           => $approvedBaseQty,
+                            'unit_price'    => $costPerBeli,
+                            'total_price'   => $lossCost,
+                            'cost_before'   => round($costPerUnit, 4),
+                            'cost_after'    => round($costPerUnit, 4),
+                            'note'          => "Retur transfer masuk (Barang Rusak) dari {$transfer->destination_display_name} ({$transfer->transfer_no})",
+                            'transfer_id'   => $transfer->id,
+                            'user_id'       => $userId,
+                            'created_by'    => $userId,
+                            'created_at'    => $retInCreatedAt,
+                            'updated_at'    => $retInCreatedAt,
+                        ]);
+
+                        $wasteMov = StockMovement::create([
+                            'business_id'   => $businessId,
+                            'date'          => $receiveDate,
+                            'ingredient_id' => $ingredientId,
+                            'outlet_id'     => $wasteOutletId,
+                            'type'          => 'WASTE',
+                            'waste_reason'  => 'DELIVERY_DAMAGE',
+                            'qty'           => $approvedBaseQty,
+                            'unit_price'    => $costPerBeli,
+                            'total_price'   => $lossCost,
+                            'cost_before'   => round($costPerUnit, 4),
+                            'cost_after'    => round($costPerUnit, 4),
+                            'note'          => "Waste Kerusakan Pengiriman Retur Transfer #{$transfer->transfer_no} [{$wasteNo}]",
+                            'transfer_id'   => $transfer->id,
+                            'user_id'       => $userId,
+                            'created_by'    => $userId,
+                            'created_at'    => $wasteCreatedAt,
+                            'updated_at'    => $wasteCreatedAt,
+                        ]);
+
+                        if ($ing) {
+                            $ing->recomputeMovingAverageFromHistory((int)$wasteOutletId);
+                        }
+                    }
+
+                    if (Schema::hasTable('waste_logs')) {
+                        $createdWasteLog = WasteLog::create([
+                            'business_id'       => $businessId,
+                            'waste_no'          => $wasteNo,
+                            'date'              => $receiveDate,
+                            'ingredient_id'     => $ingredientId,
+                            'menu_id'           => $menuId,
+                            'outlet_id'         => $wasteOutletId,
+                            'qty'               => $retQty,
+                            'unit_type'         => $item->input_unit ?: $item->unit ?: 'PAKAI',
+                            'qty_pakai'         => $approvedBaseQty,
+                            'cost_per_unit'     => $costPerUnit,
+                            'loss_cost'         => $lossCost,
+                            'reason_category'   => 'DELIVERY_DAMAGE',
+                            'notes'             => "Retur Transfer {$transfer->transfer_no} dicatat sebagai Waste saat penerimaan: " . ($item->return_reason ?: $defaultReturnReason),
+                            'action_taken'      => 'Dicatat sebagai Kerugian Pengiriman (Waste) saat Penerimaan',
+                            'stock_movement_id' => $wasteMov?->id,
+                            'user_id'           => $userId,
+                            'created_by'        => $userId,
+                            'updated_by'        => $userId,
+                        ]);
+
+                        AccountingService::postWaste($createdWasteLog);
+                    }
+                }
             }
 
             $transfer->update([
-                'status'             => $finalStatus,
-                'received_at'        => now(),
-                'received_by'        => $userId,
-                'received_notes'     => $validated['received_notes'] ?? null,
-                'return_status'      => $returnStatus,
-                'returned_at'        => $totalReturned > 0 ? now() : null,
-                'returned_by'        => $totalReturned > 0 ? $userId : null,
-                'return_reason'      => $totalReturned > 0 ? $defaultReturnReason : null,
-                'return_disposition' => $totalReturned > 0 ? $disposition : null,
-                'updated_by'         => $userId,
+                'status'                => $finalStatus,
+                'received_at'           => now(),
+                'received_by'           => $userId,
+                'received_notes'        => $validated['received_notes'] ?? null,
+                'return_status'         => $returnStatus,
+                'returned_at'           => $totalReturned > 0 ? now() : null,
+                'returned_by'           => $totalReturned > 0 ? $userId : null,
+                'return_reason'         => $totalReturned > 0 ? $defaultReturnReason : null,
+                'return_disposition'    => $totalReturned > 0 ? $disposition : null,
+                'return_approved_at'    => $isAutoApprovedWaste ? now() : null,
+                'return_approved_by'    => $isAutoApprovedWaste ? $userId : null,
+                'return_approval_notes' => $isAutoApprovedWaste ? 'Disetujui otomatis saat penerimaan oleh Owner' : null,
+                'updated_by'            => $userId,
             ]);
         });
 
@@ -871,9 +1267,11 @@ class TransferController extends Controller
         // Auto-post double-entry journal ledger
         AccountingService::postTransfer($transfer);
 
-        $message = ($totalReturned > 0)
-            ? "Penerimaan dicatat. Pengajuan retur {$totalReturned} unit telah dikirim dan MENUNGGU PERSETUJUAN (APPROVAL) dari cabang pengirim ({$sourceName})."
-            : "Transfer {$transfer->transfer_no} berhasil diterima penuh! Stok cabang tujuan telah diperbarui.";
+        $message = $isAutoApprovedWaste
+            ? "Transfer {$transfer->transfer_no} diterima dengan pencatatan {$totalReturned} unit rusak sebagai Kerugian Waste (Tercatat di Kartu Stok & Jurnal Akuntansi)."
+            : (($totalReturned > 0)
+                ? "Penerimaan dicatat. Pengajuan retur {$totalReturned} unit telah dikirim dan MENUNGGU PERSETUJUAN (APPROVAL) dari cabang pengirim ({$sourceName})."
+                : "Transfer {$transfer->transfer_no} berhasil diterima penuh! Stok cabang tujuan telah diperbarui.");
 
         return response()->json([
             'message'  => $message,
@@ -1203,44 +1601,99 @@ class TransferController extends Controller
                         }
                     }
                 } elseif ($disposition === 'RECORD_AS_WASTE') {
-                    // Catat sebagai Waste Log di cabang asal / pengiriman
+                    // Catat sebagai Waste di Kartu Stok dan Waste Log di cabang asal / pengiriman
+                    $wasteOutletId = $transfer->source_outlet_id ?: $transfer->destination_outlet_id;
                     $costPerUnit = 0;
+                    $costPerBeli = 0;
                     $ingredientId = null;
                     $menuId = null;
 
                     if (in_array($item->item_type, ['INGREDIENT', 'PERLENGKAPAN']) && $item->ingredient_id) {
                         $ing = Ingredient::find($item->ingredient_id);
                         $ingredientId = $ing?->id;
-                        $costPerUnit = (float)($ing?->cost_per_unit ?? $ing?->harga ?? 0);
+                        $konversi = max(1, (float)($ing?->konversi ?: 1));
+                        $costPerPakai = (float)($ing?->costPerPakaiForOutlet($wasteOutletId) ?: ($ing?->harga / $konversi));
+                        $costPerBeli = round($costPerPakai * $konversi, 2);
+                        $costPerUnit = $costPerPakai;
                     } elseif ($item->item_type === 'PRODUCT' && $item->menu_id) {
                         $menu = Menu::find($item->menu_id);
                         $menuId = $menu?->id;
-                        $costPerUnit = (float)($menu?->hpp ?? $menu?->cogs ?? $menu?->price ?? 0);
+                        $costPerUnit = (float)($menu?->hpp ?? $menu?->cogs ?? $menu?->cost_price ?? $menu?->price ?? 0);
+                        $costPerBeli = $costPerUnit;
                     }
 
                     $lossCost = round($approvedBaseQty * $costPerUnit, 2);
                     $wasteNo = 'WST-RET-' . date('Ymd') . '-' . str_pad(rand(1, 9999), 4, '0', STR_PAD_LEFT);
 
-                    if (Schema::hasTable('waste_logs')) {
-                        WasteLog::create([
-                            'business_id'     => $businessId,
-                            'waste_no'        => $wasteNo,
-                            'date'            => $returnDate,
-                            'ingredient_id'   => $ingredientId,
-                            'menu_id'         => $menuId,
-                            'outlet_id'       => $transfer->source_outlet_id ?: $transfer->destination_outlet_id,
-                            'qty'             => $approvedQty,
-                            'unit_type'       => $item->input_unit ?: $item->unit ?: 'PAKAI',
-                            'qty_pakai'       => $approvedBaseQty,
-                            'cost_per_unit'   => $costPerUnit,
-                            'loss_cost'       => $lossCost,
-                            'reason_category' => 'DELIVERY_DAMAGE',
-                            'notes'           => "Retur Transfer {$transfer->transfer_no} disetujui sebagai Waste: " . ($item->return_reason ?: $transfer->return_reason) . ($approvalNotes ? " ({$approvalNotes})" : ""),
-                            'action_taken'    => 'Disetujui sebagai Kerugian Pengiriman (Waste)',
-                            'user_id'         => $userId,
-                            'created_by'      => $userId,
-                            'updated_by'      => $userId,
+                    // 1. Catat ke Kartu Stok (StockMovement)
+                    // Masukkan retur lalu buang sebagai WASTE agar saldo fisik tidak berkurang ganda (karena sudah TRANSFER_OUT saat kirim)
+                    // dan mutasi resmi WASTE tercatat di Kartu Stok untuk jejak audit
+                    $wasteMov = null;
+                    if ($ingredientId && $wasteOutletId) {
+                        StockMovement::create([
+                            'business_id'   => $businessId,
+                            'date'          => $returnDate,
+                            'ingredient_id' => $ingredientId,
+                            'outlet_id'     => $wasteOutletId,
+                            'type'          => 'TRANSFER_IN',
+                            'qty'           => $approvedBaseQty,
+                            'unit_price'    => $costPerBeli,
+                            'total_price'   => $lossCost,
+                            'cost_before'   => round($costPerUnit, 4),
+                            'cost_after'    => round($costPerUnit, 4),
+                            'note'          => "Retur transfer masuk (Barang Rusak) dari {$transfer->destination_display_name} ({$transfer->transfer_no})",
+                            'transfer_id'   => $transfer->id,
+                            'user_id'       => $userId,
+                            'created_by'    => $userId,
                         ]);
+
+                        $wasteMov = StockMovement::create([
+                            'business_id'   => $businessId,
+                            'date'          => $returnDate,
+                            'ingredient_id' => $ingredientId,
+                            'outlet_id'     => $wasteOutletId,
+                            'type'          => 'WASTE',
+                            'waste_reason'  => 'DELIVERY_DAMAGE',
+                            'qty'           => $approvedBaseQty,
+                            'unit_price'    => $costPerBeli,
+                            'total_price'   => $lossCost,
+                            'cost_before'   => round($costPerUnit, 4),
+                            'cost_after'    => round($costPerUnit, 4),
+                            'note'          => "Waste Kerusakan Pengiriman Retur Transfer #{$transfer->transfer_no} [{$wasteNo}]" . ($approvalNotes ? " ({$approvalNotes})" : ""),
+                            'transfer_id'   => $transfer->id,
+                            'user_id'       => $userId,
+                            'created_by'    => $userId,
+                        ]);
+
+                        if ($ing) {
+                            $ing->recomputeMovingAverageFromHistory((int)$wasteOutletId);
+                        }
+                    }
+
+                    // 2. Catat ke WasteLog & Auto-post Jurnal Akuntansi Waste
+                    if (Schema::hasTable('waste_logs')) {
+                        $createdWasteLog = WasteLog::create([
+                            'business_id'       => $businessId,
+                            'waste_no'          => $wasteNo,
+                            'date'              => $returnDate,
+                            'ingredient_id'     => $ingredientId,
+                            'menu_id'           => $menuId,
+                            'outlet_id'         => $wasteOutletId,
+                            'qty'               => $approvedQty,
+                            'unit_type'         => $item->input_unit ?: $item->unit ?: 'PAKAI',
+                            'qty_pakai'         => $approvedBaseQty,
+                            'cost_per_unit'     => $costPerUnit,
+                            'loss_cost'         => $lossCost,
+                            'reason_category'   => 'DELIVERY_DAMAGE',
+                            'notes'             => "Retur Transfer {$transfer->transfer_no} disetujui sebagai Waste: " . ($item->return_reason ?: $transfer->return_reason) . ($approvalNotes ? " ({$approvalNotes})" : ""),
+                            'action_taken'      => 'Disetujui sebagai Kerugian Pengiriman (Waste)',
+                            'stock_movement_id' => $wasteMov?->id,
+                            'user_id'           => $userId,
+                            'created_by'        => $userId,
+                            'updated_by'        => $userId,
+                        ]);
+
+                        AccountingService::postWaste($createdWasteLog);
                     }
                 }
             }
@@ -1464,4 +1917,353 @@ class TransferController extends Controller
             'message' => "Transfer {$transfer->transfer_no} berhasil dihapus. Stok telah dikembalikan dan seluruh HPP Moving Average telah dihitung ulang secara real-time.",
         ]);
     }
+
+    /**
+     * Sinkronkan retur transfer waste yang belum memiliki mutasi StockMovement secara otomatis (Self-Healing).
+     */
+    public static function syncMissingWasteMovements(?int $businessId = null): void
+    {
+        // 1. Sinkronkan dari WasteLog yang belum memiliki stock_movement_id
+        if (Schema::hasTable('waste_logs')) {
+            $unlinkedLogs = WasteLog::whereNull('stock_movement_id')
+                ->where(function($q) {
+                    $q->where('notes', 'like', '%Retur Transfer%')
+                      ->orWhere('waste_no', 'like', 'WST-RET%');
+                })
+                ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+                ->get();
+
+            foreach ($unlinkedLogs as $wl) {
+                $outletId = $wl->outlet_id;
+                if (!$outletId) continue;
+
+                $qtyPakai = (float)($wl->qty_pakai ?: $wl->qty);
+                $transferNo = '';
+                if (preg_match('/(TRF-[0-9\-]+)/', $wl->notes, $matches)) {
+                    $transferNo = $matches[1];
+                }
+                $trf = $transferNo ? Transfer::where('transfer_no', $transferNo)->first() : null;
+
+                $ing = $wl->ingredient_id ? Ingredient::find($wl->ingredient_id) : null;
+                $menu = $wl->menu_id ? Menu::find($wl->menu_id) : null;
+
+                $costPerPakai = 0;
+                $costPerBeli = 0;
+                if ($ing) {
+                    $konversi = max(1, (float)$ing->konversi);
+                    $costPerPakai = (float)($ing->costPerPakaiForOutlet($outletId) ?: ($ing->harga / $konversi));
+                    $costPerBeli = round($costPerPakai * $konversi, 2);
+                } elseif ($menu) {
+                    $costPerPakai = (float)($menu->costPriceForOutlet($outletId) ?: ($menu->hpp ?: $menu->price));
+                    $costPerBeli = $costPerPakai;
+                }
+
+                $lossCost = round($qtyPakai * $costPerPakai, 2);
+
+                // Perbaiki loss_cost di WasteLog jika terinflasi
+                if ($lossCost > 0 && abs((float)$wl->loss_cost - $lossCost) > 1) {
+                    $wl->cost_per_unit = $costPerPakai;
+                    $wl->loss_cost = $lossCost;
+                }
+
+                // Cari apakah sudah ada mutasi WASTE
+                $existingWasteSM = StockMovement::where('outlet_id', $outletId)
+                    ->where('type', 'WASTE')
+                    ->where(function($q) use ($wl, $trf) {
+                        if ($trf) $q->where('transfer_id', $trf->id);
+                        $q->orWhere('note', 'like', "%{$wl->waste_no}%");
+                    })
+                    ->first();
+
+                $baseTimestamp = $trf?->received_at ?: ($trf?->created_at ?: ($wl->created_at ?: now()));
+                $retInCreatedAt = \Carbon\Carbon::parse($baseTimestamp)->addSeconds(1)->format('Y-m-d H:i:s');
+                $wasteCreatedAt = \Carbon\Carbon::parse($baseTimestamp)->addSeconds(2)->format('Y-m-d H:i:s');
+
+                // Jika sudah ada mutasi tapi timestamp-nya terbuat waktu sekarang (sehingga jatuh setelah nota urgent), selaraskan kembali ke jam transfer
+                if ($existingWasteSM && $trf) {
+                    if (\Carbon\Carbon::parse($existingWasteSM->created_at)->gt(\Carbon\Carbon::parse($wasteCreatedAt))) {
+                        $existingWasteSM->created_at = $wasteCreatedAt;
+                        $existingWasteSM->updated_at = $wasteCreatedAt;
+                        $existingWasteSM->saveQuietly();
+                    }
+                    $existingRetIn = StockMovement::where('transfer_id', $trf->id)
+                        ->where('type', 'TRANSFER_IN')
+                        ->where('outlet_id', $outletId)
+                        ->where('ingredient_id', $ing?->id)
+                        ->first();
+                    if ($existingRetIn && \Carbon\Carbon::parse($existingRetIn->created_at)->gt(\Carbon\Carbon::parse($retInCreatedAt))) {
+                        $existingRetIn->created_at = $retInCreatedAt;
+                        $existingRetIn->updated_at = $retInCreatedAt;
+                        $existingRetIn->saveQuietly();
+                    }
+                }
+
+                if (!$existingWasteSM && ($ing || $menu)) {
+                    // Buat TRANSFER_IN penyeimbang agar saldo fisik tidak berkurang ganda (karena sudah TRANSFER_OUT saat kirim)
+                    StockMovement::create([
+                        'business_id'   => $wl->business_id,
+                        'date'          => $wl->date ?: now()->toDateString(),
+                        'ingredient_id' => $ing?->id,
+                        'outlet_id'     => $outletId,
+                        'type'          => 'TRANSFER_IN',
+                        'qty'           => $qtyPakai,
+                        'unit_price'    => $costPerBeli,
+                        'total_price'   => $lossCost,
+                        'cost_before'   => round($costPerPakai, 4),
+                        'cost_after'    => round($costPerPakai, 4),
+                        'note'          => "Retur transfer masuk (Barang Rusak) ({$transferNo})",
+                        'transfer_id'   => $trf?->id,
+                        'user_id'       => $wl->user_id,
+                        'created_by'    => $wl->created_by,
+                        'created_at'    => $retInCreatedAt,
+                        'updated_at'    => $retInCreatedAt,
+                    ]);
+
+                    // Buat mutasi resmi WASTE di Kartu Stok
+                    $existingWasteSM = StockMovement::create([
+                        'business_id'   => $wl->business_id,
+                        'date'          => $wl->date ?: now()->toDateString(),
+                        'ingredient_id' => $ing?->id,
+                        'outlet_id'     => $outletId,
+                        'type'          => 'WASTE',
+                        'waste_reason'  => 'DELIVERY_DAMAGE',
+                        'qty'           => $qtyPakai,
+                        'unit_price'    => $costPerBeli,
+                        'total_price'   => $lossCost,
+                        'cost_before'   => round($costPerPakai, 4),
+                        'cost_after'    => round($costPerPakai, 4),
+                        'note'          => "Waste Kerusakan Pengiriman Retur Transfer #{$transferNo} [{$wl->waste_no}]",
+                        'transfer_id'   => $trf?->id,
+                        'user_id'       => $wl->user_id,
+                        'created_by'    => $wl->created_by,
+                        'created_at'    => $wasteCreatedAt,
+                        'updated_at'    => $wasteCreatedAt,
+                    ]);
+
+                    if ($ing) {
+                        $ing->recomputeMovingAverageFromHistory((int)$outletId);
+                    }
+                }
+
+                if ($existingWasteSM) {
+                    $wl->stock_movement_id = $existingWasteSM->id;
+                    $wl->saveQuietly();
+                }
+
+                AccountingService::postWaste($wl);
+            }
+        }
+
+        // 2. Sinkronkan dari Transfer dengan status APPROVED & RECORD_AS_WASTE yang belum memiliki StockMovement WASTE
+        $approvedTransfers = Transfer::where('return_status', 'APPROVED')
+            ->where('return_disposition', 'RECORD_AS_WASTE')
+            ->when($businessId, fn($q) => $q->where('business_id', $businessId))
+            ->get();
+
+        foreach ($approvedTransfers as $trf) {
+            $wasteOutletId = $trf->source_outlet_id ?: $trf->destination_outlet_id;
+            if (!$wasteOutletId) continue;
+
+            foreach ($trf->items as $item) {
+                $retQty = (float)($item->return_approved_qty ?: $item->returned_qty);
+                if ($retQty <= 0) continue;
+
+                $originalInputQty = (float)($item->input_qty ?? $item->qty);
+                $ratio = ($originalInputQty > 0) ? ($item->qty / $originalInputQty) : 1;
+                $approvedBaseQty = round($retQty * $ratio, 4);
+
+                $ing = in_array($item->item_type, ['INGREDIENT', 'PERLENGKAPAN']) && $item->ingredient_id
+                    ? Ingredient::find($item->ingredient_id)
+                    : null;
+                $menu = $item->item_type === 'PRODUCT' && $item->menu_id
+                    ? Menu::find($item->menu_id)
+                    : null;
+
+                if (!$ing && !$menu) continue;
+
+                $baseTimestamp = $trf->received_at ?: ($trf->created_at ?: now());
+                $retInCreatedAt = \Carbon\Carbon::parse($baseTimestamp)->addSeconds(1)->format('Y-m-d H:i:s');
+                $wasteCreatedAt = \Carbon\Carbon::parse($baseTimestamp)->addSeconds(2)->format('Y-m-d H:i:s');
+
+                // Selaraskan timestamp jika mutasi retur/waste terlanjur dibuat dengan waktu sekarang (sehingga jatuh setelah nota urgent)
+                $existingRetIn = StockMovement::where('transfer_id', $trf->id)
+                    ->where('type', 'TRANSFER_IN')
+                    ->where('outlet_id', $wasteOutletId)
+                    ->where(function($q) use ($ing, $menu) {
+                        if ($ing) $q->where('ingredient_id', $ing->id);
+                    })
+                    ->first();
+                if ($existingRetIn && \Carbon\Carbon::parse($existingRetIn->created_at)->gt(\Carbon\Carbon::parse($retInCreatedAt))) {
+                    $existingRetIn->created_at = $retInCreatedAt;
+                    $existingRetIn->updated_at = $retInCreatedAt;
+                    $existingRetIn->saveQuietly();
+                }
+
+                $existingWasteSM = StockMovement::where('transfer_id', $trf->id)
+                    ->where('type', 'WASTE')
+                    ->where('outlet_id', $wasteOutletId)
+                    ->where(function($q) use ($ing, $menu) {
+                        if ($ing) $q->where('ingredient_id', $ing->id);
+                    })
+                    ->first();
+                if ($existingWasteSM && \Carbon\Carbon::parse($existingWasteSM->created_at)->gt(\Carbon\Carbon::parse($wasteCreatedAt))) {
+                    $existingWasteSM->created_at = $wasteCreatedAt;
+                    $existingWasteSM->updated_at = $wasteCreatedAt;
+                    $existingWasteSM->saveQuietly();
+                }
+
+                $hasWasteSM = !empty($existingWasteSM);
+
+                if (!$hasWasteSM) {
+                    $costPerPakai = 0;
+                    $costPerBeli = 0;
+                    if ($ing) {
+                        $konversi = max(1, (float)$ing->konversi);
+                        $costPerPakai = (float)($ing->costPerPakaiForOutlet($wasteOutletId) ?: ($ing->harga / $konversi));
+                        $costPerBeli = round($costPerPakai * $konversi, 2);
+                    } elseif ($menu) {
+                        $costPerPakai = (float)($menu->costPriceForOutlet($wasteOutletId) ?: ($menu->hpp ?: $menu->price));
+                        $costPerBeli = $costPerPakai;
+                    }
+
+                    $lossCost = round($approvedBaseQty * $costPerPakai, 2);
+                    $wasteNo = 'WST-RET-' . date('Ymd') . '-' . str_pad(rand(1, 9999), 4, '0', STR_PAD_LEFT);
+
+                    StockMovement::create([
+                        'business_id'   => $trf->business_id,
+                        'date'          => $trf->returned_at ? substr($trf->returned_at, 0, 10) : ($trf->date ?: now()->toDateString()),
+                        'ingredient_id' => $ing?->id,
+                        'outlet_id'     => $wasteOutletId,
+                        'type'          => 'TRANSFER_IN',
+                        'qty'           => $approvedBaseQty,
+                        'unit_price'    => $costPerBeli,
+                        'total_price'   => $lossCost,
+                        'cost_before'   => round($costPerPakai, 4),
+                        'cost_after'    => round($costPerPakai, 4),
+                        'note'          => "Retur transfer masuk (Barang Rusak) ({$trf->transfer_no})",
+                        'transfer_id'   => $trf->id,
+                        'user_id'       => $trf->received_by ?: $trf->created_by,
+                        'created_by'    => $trf->received_by ?: $trf->created_by,
+                        'created_at'    => $retInCreatedAt,
+                        'updated_at'    => $retInCreatedAt,
+                    ]);
+
+                    $sm = StockMovement::create([
+                        'business_id'   => $trf->business_id,
+                        'date'          => $trf->returned_at ? substr($trf->returned_at, 0, 10) : ($trf->date ?: now()->toDateString()),
+                        'ingredient_id' => $ing?->id,
+                        'outlet_id'     => $wasteOutletId,
+                        'type'          => 'WASTE',
+                        'waste_reason'  => 'DELIVERY_DAMAGE',
+                        'qty'           => $approvedBaseQty,
+                        'unit_price'    => $costPerBeli,
+                        'total_price'   => $lossCost,
+                        'cost_before'   => round($costPerPakai, 4),
+                        'cost_after'    => round($costPerPakai, 4),
+                        'note'          => "Waste Kerusakan Pengiriman Retur Transfer #{$trf->transfer_no} [{$wasteNo}]",
+                        'transfer_id'   => $trf->id,
+                        'user_id'       => $trf->received_by ?: $trf->created_by,
+                        'created_by'    => $trf->received_by ?: $trf->created_by,
+                        'created_at'    => $wasteCreatedAt,
+                        'updated_at'    => $wasteCreatedAt,
+                    ]);
+
+                    $wl = WasteLog::where('notes', 'like', "%{$trf->transfer_no}%")
+                        ->where(function($q) use ($ing, $menu) {
+                            if ($ing) $q->where('ingredient_id', $ing->id);
+                        })
+                        ->first();
+
+                    if ($wl) {
+                        $wl->cost_per_unit = $costPerPakai;
+                        $wl->loss_cost = $lossCost;
+                        $wl->stock_movement_id = $sm->id;
+                        $wl->saveQuietly();
+                    } else {
+                        $wl = WasteLog::create([
+                            'business_id'       => $trf->business_id,
+                            'waste_no'          => $wasteNo,
+                            'date'              => $trf->returned_at ? substr($trf->returned_at, 0, 10) : ($trf->date ?: now()->toDateString()),
+                            'item_type'         => $ing ? 'INGREDIENT' : 'PRODUCT',
+                            'ingredient_id'     => $ing?->id,
+                            'menu_id'           => $menu?->id,
+                            'outlet_id'         => $wasteOutletId,
+                            'qty'               => $retQty,
+                            'unit_type'         => $item->input_unit ?: $item->unit ?: 'pcs',
+                            'qty_pakai'         => $approvedBaseQty,
+                            'cost_per_unit'     => $costPerPakai,
+                            'loss_cost'         => $lossCost,
+                            'reason_category'   => 'DELIVERY_DAMAGE',
+                            'notes'             => "Retur Transfer {$trf->transfer_no} disetujui sebagai Waste: " . ($item->return_reason ?: $trf->return_reason),
+                            'action_taken'      => 'Disetujui sebagai Kerugian Pengiriman (Waste)',
+                            'stock_movement_id' => $sm->id,
+                            'user_id'           => $trf->received_by ?: $trf->created_by,
+                            'created_by'        => $trf->received_by ?: $trf->created_by,
+                            'updated_by'        => $trf->received_by ?: $trf->created_by,
+                        ]);
+                    }
+
+                    if ($ing) {
+                        $ing->recomputeMovingAverageFromHistory((int)$wasteOutletId);
+                    }
+
+                    AccountingService::postWaste($wl);
+                }
+            }
+        }
+    }
+
+    /**
+     * Cari mutasi tempat stok MULAI minus pada rentetan minus yang masih berlangsung saat ini
+     * (berdasarkan urutan kronologis asli: date, created_at, id).
+     * Dipakai untuk opsi "Lupa Input": barang masuk disisipkan tepat di atas mutasi ini
+     * agar kartu stok kembali normal sejak titik minus tersebut.
+     */
+    private function findEarliestNegativeMovement(int $ingredientId, int $outletId): ?StockMovement
+    {
+        $ing = Ingredient::find($ingredientId);
+        if (!$ing) return null;
+
+        $initRow = \App\Models\IngredientInitialBalance::where('outlet_id', $outletId)->where('ingredient_id', $ingredientId)->first();
+        $otRow = OutletIngredient::where('outlet_id', $outletId)->where('ingredient_id', $ingredientId)->first();
+        $ot = Outlet::find($outletId);
+        $isHolding = $ot ? (bool)($ot->is_holding || $ot->is_main) : ($outletId == 1);
+
+        $initialStock = $initRow ? (float)$initRow->stok_awal : 0.0;
+
+        $movements = StockMovement::where('ingredient_id', $ingredientId)
+            ->where('outlet_id', $outletId)
+            ->where('type', '!=', 'INITIAL')
+            ->orderBy('date', 'asc')
+            ->orderBy('created_at', 'asc')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        $running = $initialStock;
+        $inTypes = ['PURCHASE', 'ADJUSTMENT_IN', 'TRANSFER_IN', 'PREP_OUTPUT', 'ADJUSTMENT_PLUS'];
+
+        $streakStart = null;
+
+        foreach ($movements as $m) {
+            $qty = (float)$m->qty;
+            if (in_array($m->type, $inTypes)) {
+                $running += $qty;
+            } else {
+                $running -= $qty;
+            }
+
+            if ($running < -0.0001) {
+                // Titik awal minus: saldo sebelumnya >= 0 lalu menjadi minus di mutasi ini
+                if (!$streakStart) {
+                    $streakStart = $m;
+                }
+            } else {
+                // Saldo kembali normal (>= 0) -> minus sebelumnya sudah tertutup
+                $streakStart = null;
+            }
+        }
+
+        return $streakStart;
+    }
+
 }

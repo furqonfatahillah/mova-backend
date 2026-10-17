@@ -23,7 +23,12 @@ class Menu extends Model
         'stock',
         'min_stock',
         'price',
+        'price_online',
+        'price_grab',
+        'price_gofood',
+        'price_shopeefood',
         'cost_price',
+        'estimated_hpp',
         'unit',
         'unit_id',
         'active',
@@ -45,12 +50,17 @@ class Menu extends Model
     ];
 
     protected $casts = [
-        'price'       => 'float',
-        'cost_price'  => 'float',
-        'stock'       => 'float',
-        'min_stock'   => 'float',
-        'track_stock' => 'boolean',
-        'active'      => 'boolean',
+        'price'            => 'float',
+        'price_online'     => 'float',
+        'price_grab'       => 'float',
+        'price_gofood'     => 'float',
+        'price_shopeefood' => 'float',
+        'cost_price'       => 'float',
+        'estimated_hpp'    => 'float',
+        'stock'        => 'float',
+        'min_stock'    => 'float',
+        'track_stock'  => 'boolean',
+        'active'       => 'boolean',
     ];
 
     public function categoryModel()
@@ -277,10 +287,12 @@ class Menu extends Model
                     $sum += (float)$item->qty * $hargaPakai;
                 }
             }
-            return round($sum, 2);
+            if ($sum > 0) {
+                return round($sum, 2);
+            }
         }
 
-        // Fallback jika belum memiliki resep
+        // Fallback jika belum memiliki resep atau kalkulasi resep masih 0
         return $this->costPriceForOutlet($outletId);
     }
 }

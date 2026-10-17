@@ -13,6 +13,7 @@ class Transaction extends Model
     protected $fillable = [
         'business_id',
         'order_number',
+        'client_order_id',
         'parent_order_number',
         'split_index',
         'split_total',
@@ -42,6 +43,10 @@ class Transaction extends Model
         'is_urgent_note',
         'urgent_status',
         'notes',
+        'is_deposited',
+        'deposited_amount',
+        'deposited_at',
+        'deposit_cash_transaction_id',
         'cancellation_reason',
         'void_type',
         'cancelled_at',
@@ -197,6 +202,11 @@ class Transaction extends Model
 
     public function receivable()
     {
-        return $this->hasOne(Receivable::class, 'transaction_id');
+        return $this->hasOne(Receivable::class, 'order_number', 'order_number');
+    }
+
+    public function depositCashTransaction()
+    {
+        return $this->belongsTo(CashTransaction::class, 'deposit_cash_transaction_id');
     }
 }

@@ -211,9 +211,18 @@ class ExpenseController extends Controller
 
         $expenseNo = OperatingExpense::generateExpenseNo($businessId, $data['date']);
 
+        $shiftId = $request->input('shift_id');
+        if (!$shiftId && $outletId) {
+            $shiftId = \App\Models\Shift::where('status', 'OPEN')
+                ->where('outlet_id', $outletId)
+                ->orderByDesc('opened_at')
+                ->value('id');
+        }
+
         $expense = OperatingExpense::create([
             'business_id'    => $businessId,
             'outlet_id'      => $outletId,
+            'shift_id'       => $shiftId,
             'expense_no'     => $expenseNo,
             'date'           => $data['date'],
             'category'       => $data['category'],
@@ -249,6 +258,7 @@ class ExpenseController extends Controller
      */
     public function update(Request $request, $id)
     {
+        $user = $request->user();
         $expense = OperatingExpense::findOrFail($id);
 
         $validCategories = array_keys(OperatingExpense::categories());

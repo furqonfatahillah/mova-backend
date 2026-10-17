@@ -86,7 +86,7 @@ class BusinessController extends Controller
             'address'      => 'nullable|string|max:500',
             'package_type' => 'required|in:starter,pro,enterprise',
             'max_outlets'  => 'required|integer|min:1|max:100',
-            'status'       => 'required|in:active,trial,suspended,expired',
+            'status'       => 'required|in:active,trial,suspended,expired,pending,rejected',
             'expires_at'   => 'nullable|date',
         ]);
 
@@ -141,14 +141,89 @@ class BusinessController extends Controller
             'address'      => 'nullable|string|max:500',
             'package_type' => 'sometimes|in:starter,pro,enterprise',
             'max_outlets'  => 'sometimes|integer|min:1|max:100',
-            'status'       => 'sometimes|in:active,trial,suspended,expired',
-            'expires_at'   => 'nullable|date',
+            'status'             => 'sometimes|in:active,trial,suspended,expired,pending,rejected',
+            'expires_at'         => 'nullable|date',
+            'is_unlimited_coins' => 'nullable|boolean',
         ]);
 
         $data['updated_by'] = $user->id;
         $business->update($data);
 
+        // Jika bisnis diaktifkan, otomatis aktifkan user owner_bisnis yang pending
+        if (isset($data['status']) && $data['status'] === 'active') {
+            User::where('business_id', $business->id)
+                ->where('status', 'pending')
+                ->where('role', 'owner_bisnis')
+                ->update([
+                    'status'      => 'active',
+                    'approved_by' => $user->id,
+                    'approved_at' => now(),
+                ]);
+        }
+
         return response()->json($business);
+    }
+
+    /**
+     * Superadmin Platform: Verify and activate a newly registered business
+     */
+    public function verify(Request $request, Business $business)
+    {
+        $user = $request->user();
+        if (!$user->isPlatformAdmin()) {
+            return response()->json(['message' => 'Unauthorized. Hanya Superadmin Platform yang dapat memverifikasi bisnis.'], 403);
+        }
+
+        $business->update([
+            'status'     => 'active',
+            'expires_at' => $business->expires_at && $business->expires_at->isFuture() ? $business->expires_at : now()->addMonths(1),
+            'updated_by' => $user->id,
+        ]);
+
+        // Otomatis aktifkan user owner_bisnis terkait
+        User::where('business_id', $business->id)
+            ->where('status', 'pending')
+            ->where('role', 'owner_bisnis')
+            ->update([
+                'status'      => 'active',
+                'approved_by' => $user->id,
+                'approved_at' => now(),
+            ]);
+
+        return response()->json([
+            'message'  => "Bisnis '{$business->name}' berhasil diverifikasi dan diaktifkan!",
+            'business' => $business->fresh(['outlets', 'users', 'referredBy']),
+        ]);
+    }
+
+    /**
+     * Superadmin Platform: Reject a registered business
+     */
+    public function reject(Request $request, Business $business)
+    {
+        $user = $request->user();
+        if (!$user->isPlatformAdmin()) {
+            return response()->json(['message' => 'Unauthorized. Hanya Superadmin Platform yang dapat menolak pendaftaran bisnis.'], 403);
+        }
+
+        $business->update([
+            'status'     => 'rejected',
+            'updated_by' => $user->id,
+        ]);
+
+        // Update status user owner bisnis terkait menjadi rejected
+        User::where('business_id', $business->id)
+            ->where('status', 'pending')
+            ->update([
+                'status'      => 'rejected',
+                'approved_by' => $user->id,
+                'approved_at' => now(),
+            ]);
+
+        return response()->json([
+            'message'  => "Pendaftaran bisnis '{$business->name}' telah ditolak.",
+            'business' => $business->fresh(['outlets', 'users', 'referredBy']),
+        ]);
     }
 
     /**
@@ -217,6 +292,7 @@ class BusinessController extends Controller
                     'low_coin_threshold'     => 0,
                     'is_coin_low'            => false,
                     'is_coin_out'            => false,
+                    'is_unlimited_coins'     => false,
                     'recent_mutations'       => [],
                 ]);
             }
@@ -245,6 +321,7 @@ class BusinessController extends Controller
             'business_name'          => $business->name,
             'coin_balance'           => $hasCoinCol ? $business->coin_balance : 0,
             'coins_per_transaction'  => $hasCoinCol ? $business->coins_per_transaction : 1,
+            'is_unlimited_coins'     => (bool)$business->is_unlimited,
             'remaining_transactions' => $hasCoinCol ? $business->remaining_transactions : 0,
             'low_coin_threshold'     => $hasCoinCol ? ($business->low_coin_threshold ?: 2000) : 2000,
             'is_coin_low'            => $hasCoinCol ? $business->is_coin_low : false,

@@ -7,8 +7,8 @@ $kernel->bootstrap();
 
 $biz = App\Models\Business::first();
 
-$entries = App\Models\JournalEntry::where('business_id', $biz->id)->with('lines')->get();
-echo "Total Journal Entries: " . $entries->count() . "\n";
+$entries = App\Models\JournalEntry::where('entry_type', 'SALES')->with('lines')->latest()->take(5)->get();
+echo "Found entries: " . $entries->count() . "\n";
 foreach ($entries as $e) {
     echo "JE #{$e->id} ({$e->entry_no}): date={$e->entry_date}, type={$e->entry_type}, desc={$e->description}\n";
     foreach ($e->lines as $l) {

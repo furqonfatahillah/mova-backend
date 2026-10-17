@@ -82,15 +82,27 @@ class User extends Authenticatable
         });
 
         static::saving(function (User $user) {
-            if ($user->role_id && (!$user->role || $user->isDirty('role_id'))) {
+            // Jika role diubah atau ada, sinkronkan role_id
+            if ($user->role && ($user->isDirty('role') || !$user->role_id)) {
+                $rId = Role::where('name', strtolower(trim((string)$user->role)))->value('id');
+                if ($rId) {
+                    $user->role_id = $rId;
+                }
+            } elseif ($user->role_id && ($user->isDirty('role_id') || !$user->role)) {
                 $r = Role::find($user->role_id);
                 if ($r) {
                     $user->role = $r->name;
                 }
-            } elseif ($user->role && !$user->role_id) {
-                $rId = Role::where('name', strtolower(trim((string)$user->role)))->value('id');
-                if ($rId) {
-                    $user->role_id = $rId;
+            }
+
+            // Defensive sync: jika ada ketidaksesuaian antara role dan role_id
+            if ($user->role && $user->role_id) {
+                $roleNameFromId = Role::where('id', $user->role_id)->value('name');
+                if ($roleNameFromId && strtolower($roleNameFromId) !== strtolower(trim((string)$user->role))) {
+                    $correctId = Role::where('name', strtolower(trim((string)$user->role)))->value('id');
+                    if ($correctId) {
+                        $user->role_id = $correctId;
+                    }
                 }
             }
         });
@@ -239,24 +251,30 @@ class User extends Authenticatable
 
     public function isPlatformAdmin(): bool
     {
+        if ($this->isOwnerOutlet() || $this->isPegawai()) {
+            return false;
+        }
         return Role::isPlatformRole($this->role_id ?? $this->role);
     }
 
     public function isOwnerBisnis(): bool
     {
+        if ($this->isOwnerOutlet() || $this->isPegawai()) {
+            return false;
+        }
         return Role::isBusinessOwnerRole($this->role_id ?? $this->role);
     }
 
     public function isOwnerOutlet(): bool
     {
         $name = strtolower($this->role ?? '');
-        return in_array($name, [Role::OWNER_OUTLET, Role::MANAGER_OUTLET]);
+        return in_array($name, [Role::OWNER_OUTLET, Role::MANAGER_OUTLET, Role::MANAGER]);
     }
 
     public function isPegawai(): bool
     {
         $name = strtolower($this->role ?? '');
-        return in_array($name, [Role::PEGAWAI, Role::KASIR, Role::MANAGER]);
+        return in_array($name, [Role::PEGAWAI, Role::KASIR]);
     }
 
     public function isOwner(): bool

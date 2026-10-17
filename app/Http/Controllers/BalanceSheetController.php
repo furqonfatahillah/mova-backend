@@ -377,11 +377,16 @@ class BalanceSheetController extends Controller
                       ->orWhere('account_code', 'like', '6-%');
                 });
         } else {
-            $linesQuery->where('entry_date', '<=', $to)
-                ->where(function ($q) use ($accountCode) {
-                    $q->where('account_code', $accountCode)
-                      ->orWhere('account_code', 'like', "{$accountCode}.%");
-                });
+            $isIncomeStatement = str_starts_with($accountCode, '4-') || str_starts_with($accountCode, '5-') || str_starts_with($accountCode, '6-');
+            if ($isIncomeStatement && $request->filled('from')) {
+                $linesQuery->whereBetween('entry_date', [$from, $to]);
+            } else {
+                $linesQuery->where('entry_date', '<=', $to);
+            }
+            $linesQuery->where(function ($q) use ($accountCode) {
+                $q->where('account_code', $accountCode)
+                  ->orWhere('account_code', 'like', "{$accountCode}.%");
+            });
         }
 
         if ($outletId) {
@@ -436,11 +441,16 @@ class BalanceSheetController extends Controller
                       ->orWhere('account_code', 'like', '6-%');
                 });
         } else {
-            $outletLinesQuery->where('entry_date', '<=', $to)
-                ->where(function ($q) use ($accountCode) {
-                    $q->where('account_code', $accountCode)
-                      ->orWhere('account_code', 'like', "{$accountCode}.%");
-                });
+            $isIncomeStatement = str_starts_with($accountCode, '4-') || str_starts_with($accountCode, '5-') || str_starts_with($accountCode, '6-');
+            if ($isIncomeStatement && $request->filled('from')) {
+                $outletLinesQuery->whereBetween('entry_date', [$from, $to]);
+            } else {
+                $outletLinesQuery->where('entry_date', '<=', $to);
+            }
+            $outletLinesQuery->where(function ($q) use ($accountCode) {
+                $q->where('account_code', $accountCode)
+                  ->orWhere('account_code', 'like', "{$accountCode}.%");
+            });
         }
 
         if ($businessId) {

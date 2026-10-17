@@ -16,7 +16,7 @@ class StockMovement extends Model
         'unit_price', 'total_price', 'cost_before', 'cost_after',
         'note', 'transaction_id', 'shift_id', 'transfer_id', 'batch_prep_id', 'user_id',
         'payment_type', 'supplier_name', 'purchase_no', 'payable_id',
-        'created_by', 'updated_by'
+        'created_by', 'updated_by', 'created_at', 'updated_at'
     ];
 
     protected $appends = [
@@ -87,4 +87,56 @@ class StockMovement extends Model
         $outTypes = ['SALE_USAGE', 'WASTE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT', 'PREP_USAGE'];
         return in_array($this->type, $outTypes) ? -$this->qty : $this->qty;
     }
+
+    protected static function booted(): void
+    {
+        static::created(function (StockMovement $m) {
+            static::adjustStockForMovement($m, 1);
+        });
+
+        static::deleted(function (StockMovement $m) {
+            static::adjustStockForMovement($m, -1);
+        });
+
+        static::updated(function (StockMovement $m) {
+            if ($m->isDirty(['qty', 'type', 'outlet_id', 'ingredient_id'])) {
+                $origMovement = clone $m;
+                $origMovement->qty = (float)$m->getOriginal('qty', 0);
+                $origMovement->type = $m->getOriginal('type', $m->type);
+                $origMovement->outlet_id = $m->getOriginal('outlet_id', $m->outlet_id);
+                $origMovement->ingredient_id = $m->getOriginal('ingredient_id', $m->ingredient_id);
+                static::adjustStockForMovement($origMovement, -1);
+                static::adjustStockForMovement($m, 1);
+            }
+        });
+    }
+
+    public static function adjustStockForMovement(StockMovement $m, int $direction): void
+    {
+        if ($m->type === 'INITIAL' || empty($m->ingredient_id) || empty($m->outlet_id)) {
+            return;
+        }
+
+        $signed = $m->signedQty() * $direction;
+        if ($signed == 0) {
+            return;
+        }
+
+        try {
+            $oi = OutletIngredient::firstOrCreate(
+                ['outlet_id' => $m->outlet_id, 'ingredient_id' => $m->ingredient_id],
+                ['current_stock' => 0]
+            );
+
+            // Atomically update current_stock in database
+            if ($signed > 0) {
+                $oi->increment('current_stock', $signed);
+            } else {
+                $oi->decrement('current_stock', abs($signed));
+            }
+        } catch (\Throwable $e) {
+            // Silently ignore if table unmigrated or in test teardown
+        }
+    }
 }
+

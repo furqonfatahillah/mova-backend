@@ -369,6 +369,19 @@ class MenuHppService
             ];
         }
 
+        if (empty($ingredientsBreakdown) && $currentHpp > 0) {
+            $ingredientsBreakdown[] = [
+                'type'             => 'ESTIMATED_COST',
+                'item_id'          => $menu->id,
+                'name'             => 'Estimasi HPP Dasar (Target Excel / Modal)',
+                'qty'              => 1,
+                'unit'             => $menu->unit ?: 'porsi',
+                'cost_per_unit'    => $currentHpp,
+                'subtotal'         => $currentHpp,
+                'contribution_pct' => 100.0,
+            ];
+        }
+
         // Query history
         $historyQuery = MenuHppHistory::where('menu_id', $menu->id)
             ->with(['outlet', 'ingredient', 'user'])
@@ -432,6 +445,7 @@ class MenuHppService
                 'latest_change_date'=> $latestHistory ? $latestHistory->date->format('Y-m-d') : now()->toDateString(),
             ],
             'ingredients_breakdown' => $ingredientsBreakdown,
+            'recipe_breakdown'      => $ingredientsBreakdown,
             'history'               => $historyList,
         ];
     }

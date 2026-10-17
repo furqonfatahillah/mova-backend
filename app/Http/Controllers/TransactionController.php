@@ -2325,19 +2325,6 @@ class TransactionController extends Controller
 
                             // Calculate real cost per unit pakai (supporting batch cooked / semi-finished products)
                             $ingCost = (float)$ing->costPerPakaiForOutlet($outletId);
-                            $lastMovement = StockMovement::where('ingredient_id', $ing->id)
-                                ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
-                                ->whereIn('type', ['PURCHASE', 'TRANSFER_IN', 'INITIAL', 'PREP_OUTPUT', 'ADJUSTMENT_IN'])
-                                ->latest('date')
-                                ->latest('id')
-                                ->first();
-                            if ($lastMovement) {
-                                if ((float)$lastMovement->cost_after > 0) {
-                                    $ingCost = (float)$lastMovement->cost_after;
-                                } elseif ((float)$lastMovement->unit_price > 0) {
-                                    $ingCost = (float)$lastMovement->unit_price;
-                                }
-                            }
                             if ($ingCost <= 0) {
                                 $ingCost = (float)($ing->harga / max((float)$ing->konversi, 1));
                             }

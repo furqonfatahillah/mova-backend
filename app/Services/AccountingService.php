@@ -690,8 +690,16 @@ class AccountingService
         // Prioritize actual StockMovement records created for this transaction to guarantee 100% sync with Kartu Stok!
         // Ignore resolution movements with 'Pelunasan Nota Urgent' to avoid double-counting
         $txMovements = StockMovement::with('ingredient')
-            ->where('transaction_id', $t->id)
-            ->where('type', 'SALE_USAGE')
+            ->where(function($q) use ($t, $outletId) {
+                $q->where('transaction_id', $t->id);
+                if (!empty($t->order_number)) {
+                    $q->orWhere(function($sub) use ($t, $outletId) {
+                        $sub->where('outlet_id', $outletId)
+                            ->where('note', 'like', "%{$t->order_number}%");
+                    });
+                }
+            })
+            ->whereIn('type', ['SALE_USAGE', 'WASTE'])
             ->where('note', 'not like', '%Pelunasan Nota Urgent%')
             ->get();
 

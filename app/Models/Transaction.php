@@ -40,6 +40,7 @@ class Transaction extends Model
         'payment_method_id',
         'dp_payment_method',
         'dp_reference_no',
+        'is_open_bill',
         'is_urgent_note',
         'urgent_status',
         'notes',
@@ -147,8 +148,29 @@ class Transaction extends Model
         'change_amount'  => 'float',
         'split_index'    => 'integer',
         'split_total'    => 'integer',
+        'is_open_bill'   => 'boolean',
         'is_urgent_note' => 'boolean',
     ];
+
+    public function isOpenBill(): bool
+    {
+        if (!empty($this->is_open_bill)) {
+            return true;
+        }
+        if (in_array($this->status, ['HOLD', 'SPLIT_CLOSED'])) {
+            return true;
+        }
+        if (str_contains(strtolower($this->notes ?? ''), 'open bill')) {
+            return true;
+        }
+        $je = JournalEntry::where('reference_type', 'TRANSACTION')
+            ->where('reference_id', $this->id)
+            ->first();
+        if ($je && str_contains(strtolower($je->description ?? ''), 'open bill')) {
+            return true;
+        }
+        return false;
+    }
 
     public function menu()
     {

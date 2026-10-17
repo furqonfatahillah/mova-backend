@@ -651,6 +651,7 @@ class TransactionController extends Controller
                         'customer_id'     => $customerId,
                         'order_type'      => $data['order_type'] ?? 'DINE_IN',
                         'table_number'    => $data['table_number'] ?? null,
+                        'is_open_bill'    => ($orderStatus === 'HOLD'),
                         'payment_method'  => $data['payment_method'] ?? 'CASH',
                         'dp_payment_method'=> (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null,
                         'dp_reference_no'  => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null,
@@ -1513,6 +1514,7 @@ class TransactionController extends Controller
                 $t->shift_id = $shiftId;
                 $t->date = $date;
                 $t->user_id = $request->user()->id;
+                $t->is_open_bill = true;
                 $t->status = 'PAID';
                 $t->customer_id = $customerId;
                 $t->payment_method = $data['payment_method'];
@@ -1852,6 +1854,7 @@ class TransactionController extends Controller
                     'customer_name'  => $customerName,
                     'order_type'     => $orderType,
                     'table_number'   => $tableNumber,
+                    'is_open_bill'   => true,
                     'payment_method' => $existingPaymentMethod,
                     'amount_paid'    => 0,
                     'change_amount'  => 0,

@@ -456,10 +456,21 @@ class AccountingService
         // karena bahan baku sudah keluar dari dapur saat pesanan dibuat.
         if (!in_array($t->status, ['PAID', 'HOLD', 'SPLIT_CLOSED'])) {
             self::deleteReferenceEntry('TRANSACTION', $t->id, $t->business_id ?? 1);
+            self::deleteReferenceEntry('OPEN_BILL_SETTLEMENT', $t->id, $t->business_id ?? 1);
             return;
         }
 
+        // 1. Post / Update Jurnal Asli Penjualan (Sales Journal)
+        // Jika Open Bill, sisi debet selalu mengunci ke Piutang Usaha (1-12001)
         self::buildAndRecordSalesJournal($t);
+
+        // 2. Jika transaksi ini merupakan Open Bill dan statusnya sudah lunas (PAID),
+        // bentuk JURNAL BARU untuk Pelunasan (Settlement) yang membalik / melunasi Piutang Usaha
+        if ($t->isOpenBill() && $t->status === 'PAID') {
+            self::postOpenBillSettlement($t);
+        } else {
+            self::deleteReferenceEntry('OPEN_BILL_SETTLEMENT', $t->id, $t->business_id ?? 1);
+        }
     }
 
     /**
@@ -473,6 +484,9 @@ class AccountingService
         $bizId = $t->business_id ?? 1;
         $outletId = $t->outlet_id;
 
+        // Bersihkan jurnal pelunasan open bill (jika sebelumnya sempat lunas kemudian divoid/batal)
+        self::deleteReferenceEntry('OPEN_BILL_SETTLEMENT', $t->id, $bizId);
+
         // 1. Cek apakah Jurnal Asli Penjualan sudah ada
         $origEntry = JournalEntry::with('lines')
             ->where('business_id', $bizId)
@@ -480,7 +494,8 @@ class AccountingService
             ->where('reference_id', $t->id)
             ->first();
 
-        // Cek apakah transaksi ini merupakan Open Bill yang belum pernah dibayar (HOLD atau CANCELLED tanpa pembayaran)
+        // Cek apakah transaksi ini merupakan Open Bill
+        $isOpenBillTrx = $t->isOpenBill();
         $isUnpaidOpenBill = ($t->status === 'HOLD')
             || ($t->status === 'CANCELLED' && (float)$t->amount_paid <= 0)
             || ($t->status === 'CANCELLED' && str_contains(strtolower($t->notes ?? ''), 'open bill'))
@@ -496,9 +511,9 @@ class AccountingService
             return;
         }
 
-        // Jika transaksi ini belum pernah dibayar (Open Bill), pastikan akun penerimaan di jurnal asli adalah 1-12001 (Piutang Open Bill)
+        // Jika transaksi ini merupakan Open Bill, pastikan akun penerimaan di jurnal asli adalah 1-12001 (Piutang Open Bill)
         // dan BUKAN 1-11002 (Kas Kecil Kasir), agar Kas Kecil sama sekali tidak tersentuh
-        if ($isUnpaidOpenBill) {
+        if ($isOpenBillTrx || $isUnpaidOpenBill) {
             $fixed = false;
             foreach ($origEntry->lines as $ol) {
                 $rawCode = explode('.', $ol->account_code)[0];
@@ -639,22 +654,24 @@ class AccountingService
         }
 
         // Debit side (Payment / Receivable)
-        // Jika status HOLD (Open Bill), atau transaksi CANCELLED yang belum pernah dibayar (amount_paid <= 0 atau catatan Open Bill),
-        // atau metode bayar KASBON/PIUTANG, maka masuk ke Piutang Usaha (1-12001).
-        // Kas Kecil / Kas Kasir (1-11002) SAMA SEKALI TIDAK TERSENTUH karena belum pernah ada uang yang dibayar!
+        // Jika Open Bill (baik yang masih HOLD maupun yang sudah dilunasi kemudian hari),
+        // atau transaksi CANCELLED yang belum pernah dibayar (amount_paid <= 0 atau catatan Open Bill),
+        // atau metode bayar KASBON/PIUTANG, maka jurnal penjualan asli selalu masuk ke Piutang Usaha (1-12001).
+        // Pelunasan uang kas/bank nantinya dicatat di Jurnal Pelunasan tersendiri (OPEN_BILL_SETTLEMENT)!
+        $isOpenBillTrx = $t->isOpenBill();
         $isUnpaidOpenBill = ($t->status === 'HOLD')
             || ($t->status === 'CANCELLED' && (float)$t->amount_paid <= 0)
             || ($t->status === 'CANCELLED' && str_contains(strtolower($t->notes ?? ''), 'open bill'))
             || ($t->status === 'CANCELLED' && empty($t->payment_method))
             || ($t->status === 'CANCELLED' && Transaction::where('order_number', $t->order_number)->where('status', 'HOLD')->exists());
 
-        if ($isUnpaidOpenBill || $pm === 'KASBON' || $pm === 'PIUTANG') {
+        if ($isOpenBillTrx || $isUnpaidOpenBill || $pm === 'KASBON' || $pm === 'PIUTANG') {
             $lines[] = [
                 'account_code' => '1-12001', // PIUTANG USAHA
                 'outlet_id'    => $outletId,
                 'debit'        => $totalNet,
                 'credit'       => 0,
-                'memo'         => ($isUnpaidOpenBill && $pm !== 'KASBON' && $pm !== 'PIUTANG') 
+                'memo'         => ($isOpenBillTrx || $isUnpaidOpenBill)
                     ? "Piutang Open Bill {$t->order_number}" 
                     : "Piutang Kasbon {$t->order_number}",
             ];
@@ -824,9 +841,64 @@ class AccountingService
             'entry_type'     => 'SALES',
             'reference_type' => 'TRANSACTION',
             'reference_id'   => $t->id,
-            'description'    => ($isUnpaidOpenBill)
+            'description'    => ($isOpenBillTrx || $isUnpaidOpenBill)
                 ? "Penjualan POS Open Bill #{$t->order_number} (Piutang Meja)"
                 : "Penjualan POS #{$t->order_number} ({$pm})",
+        ], $lines, $bizId);
+    }
+
+    /**
+     * 2C. POST OPEN BILL SETTLEMENT (Pelunasan Piutang Meja Open Bill)
+     * Mencatat penerimaan uang kas/bank/QRIS dan membalik / melunasi akun Piutang Usaha (1-12001)
+     * yang terbentuk saat pesanan Open Bill awal dibuat.
+     */
+    public static function postOpenBillSettlement(Transaction $t): ?JournalEntry
+    {
+        $bizId = $t->business_id ?? 1;
+        $outletId = $t->outlet_id;
+        $totalNet = (float)$t->total_price;
+        if ($totalNet <= 0) {
+            return null;
+        }
+
+        $pm = strtoupper(trim((string)$t->payment_method));
+        if (empty($pm)) {
+            $pm = 'CASH';
+        }
+
+        // Jika pelunasan menggunakan Kasbon / Piutang,
+        // piutang meja dialihkan ke modul Kasbon (Receivables)
+        if (in_array($pm, ['KASBON', 'PIUTANG'])) {
+            return null;
+        }
+
+        $receiptAcc = self::getAccountCodeForPaymentMethod($pm);
+
+        $lines = [
+            [
+                'account_code' => $receiptAcc,
+                'outlet_id'    => $outletId,
+                'debit'        => $totalNet,
+                'credit'       => 0,
+                'memo'         => "Penerimaan {$pm} Pelunasan Open Bill {$t->order_number}",
+            ],
+            [
+                'account_code' => '1-12001', // PIUTANG USAHA
+                'outlet_id'    => $outletId,
+                'debit'        => 0,
+                'credit'       => $totalNet,
+                'memo'         => "Pelunasan Piutang Open Bill {$t->order_number}",
+            ],
+        ];
+
+        return self::recordEntry([
+            'business_id'    => $bizId,
+            'outlet_id'      => $outletId,
+            'entry_date'     => $t->date ?: now()->toDateString(),
+            'entry_type'     => 'RECEIVABLE_PAYMENT',
+            'reference_type' => 'OPEN_BILL_SETTLEMENT',
+            'reference_id'   => $t->id,
+            'description'    => "Pelunasan Tagihan Open Bill #{$t->order_number} ({$pm})",
         ], $lines, $bizId);
     }
 

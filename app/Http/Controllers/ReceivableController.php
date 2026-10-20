@@ -27,7 +27,7 @@ class ReceivableController extends Controller
         // Auto-sync POS transactions paid with QRIS or E-commerce channels
         $this->syncMerchantReceivables($user?->business_id, $outletId);
 
-        $query = Receivable::with(['payments.receiver', 'payments.shift', 'outlet', 'creator', 'customer', 'transaction', 'shift'])
+        $query = Receivable::with(['payments.receiver', 'payments.shift', 'outlet', 'creator', 'customer', 'transaction.menu', 'orderTransactions.menu', 'shift'])
             ->orderBy('issue_date', 'desc')
             ->orderBy('id', 'desc');
 

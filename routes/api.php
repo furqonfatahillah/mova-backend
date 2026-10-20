@@ -37,6 +37,8 @@ use App\Http\Controllers\PurchaseReportController;
 use App\Http\Controllers\DataResetController;
 use App\Http\Controllers\AccountController;
 use App\Http\Controllers\KasAplikasiController;
+use App\Http\Controllers\AuthorityController;
+use App\Http\Controllers\PlatformPromoController;
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -87,6 +89,19 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::put('/platform/coins/rate',     [CoinPlatformController::class, 'updateRate']);
     Route::get('/platform/coins/history',  [CoinPlatformController::class, 'history']);
 
+    // SaaS Platform Promo Distribution (Website Owner / Superadmin Platform)
+    Route::get('/platform/promos',                             [PlatformPromoController::class, 'index']);
+    Route::post('/platform/promos',                            [PlatformPromoController::class, 'store']);
+    Route::get('/platform/promos/target-businesses',           [PlatformPromoController::class, 'targetBusinesses']);
+    Route::get('/platform/promos/{platformPromo}',             [PlatformPromoController::class, 'show']);
+    Route::put('/platform/promos/{platformPromo}',             [PlatformPromoController::class, 'update']);
+    Route::delete('/platform/promos/{platformPromo}',          [PlatformPromoController::class, 'destroy']);
+    Route::patch('/platform/promos/{platformPromo}/toggle',    [PlatformPromoController::class, 'toggleActive']);
+    Route::post('/platform/promos/{platformPromo}/distribute', [PlatformPromoController::class, 'distribute']);
+    Route::put('/platform/promos/{platformPromo}/businesses/{business}', [PlatformPromoController::class, 'updateBusinessDistribution']);
+    Route::delete('/platform/promos/{platformPromo}/businesses/{business}', [PlatformPromoController::class, 'revokeBusiness']);
+    Route::get('/my-business/platform-promos',                 [PlatformPromoController::class, 'myPromos']);
+
     // User Management & Approval Workflow
     Route::get('/roles',                   [UserController::class, 'roles']);
     Route::get('/users',                   [UserController::class, 'index']);
@@ -97,6 +112,14 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/users/{user}/approve',   [UserController::class, 'approve']);
     Route::post('/users/{user}/reject',    [UserController::class, 'reject']);
     Route::post('/users/{user}/suspend',   [UserController::class, 'suspend']);
+
+    // Authority & Custom Permission Management for Business Accounts
+    Route::get('/authorities/definitions',        [AuthorityController::class, 'definitions']);
+    Route::get('/authorities/users',              [AuthorityController::class, 'users']);
+    Route::get('/authorities/users/{user}',       [AuthorityController::class, 'getUserAuthority']);
+    Route::put('/authorities/users/{user}',       [AuthorityController::class, 'updateUserAuthority']);
+    Route::post('/authorities/apply-preset',      [AuthorityController::class, 'applyPreset']);
+    Route::post('/authorities/copy',              [AuthorityController::class, 'copyPermissions']);
 
     // Shifts & Shift Schedules (Master Shift & Roster Jadwal Kasir)
     Route::get('/shift-schedules/employees',      [ShiftScheduleController::class, 'employees']);

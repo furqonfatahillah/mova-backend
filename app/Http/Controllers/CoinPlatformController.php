@@ -104,6 +104,7 @@ class CoinPlatformController extends Controller
             'business_id'           => 'nullable', // null or 'ALL' or specific id
             'coins_per_transaction' => 'nullable|numeric|min:0',
             'is_unlimited_coins'    => 'nullable|boolean',
+            'expires_at'            => 'nullable|date',
         ]);
 
         $isUnlimited = isset($data['is_unlimited_coins']) ? (bool)$data['is_unlimited_coins'] : null;
@@ -115,9 +116,19 @@ class CoinPlatformController extends Controller
         }
 
         if (!empty($data['business_id']) && $data['business_id'] !== 'ALL') {
-            CoinService::updateRate((int)$data['business_id'], $rate, $isUnlimited, $request->user()->id);
+            if ($isUnlimited && empty($data['expires_at'])) {
+                return response()->json([
+                    'message' => 'Untuk mode Unlimited Koin, tanggal berakhir masa aktif (expired) wajib diinputkan.',
+                ], 422);
+            }
+
+            $expiresAt = !empty($data['expires_at']) ? $data['expires_at'] : null;
+            CoinService::updateRate((int)$data['business_id'], $rate, $isUnlimited, $request->user()->id, $expiresAt);
             $business = Business::find($data['business_id']);
             $statusText = $business->is_unlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota";
+            if ($business->expires_at) {
+                $statusText .= " s/d " . $business->expires_at->format('d/m/Y');
+            }
             return response()->json([
                 'message' => "Pengaturan koin untuk {$business->name} berhasil diubah menjadi {$statusText}.",
                 'business' => $business,
@@ -128,6 +139,9 @@ class CoinPlatformController extends Controller
         $updateData = ['coins_per_transaction' => $rate, 'updated_by' => $request->user()->id];
         if ($isUnlimited !== null) {
             $updateData['is_unlimited_coins'] = $isUnlimited;
+        }
+        if (!empty($data['expires_at'])) {
+            $updateData['expires_at'] = \Carbon\Carbon::parse($data['expires_at'])->endOfDay();
         }
         Business::query()->update($updateData);
 

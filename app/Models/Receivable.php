@@ -93,6 +93,11 @@ class Receivable extends Model
         return $this->belongsTo(Transaction::class);
     }
 
+    public function orderTransactions()
+    {
+        return $this->hasMany(Transaction::class, 'order_number', 'order_number');
+    }
+
     public function shift()
     {
         return $this->belongsTo(Shift::class);

@@ -12,6 +12,8 @@ class Discount extends Model
 
     protected $fillable = [
         'business_id',
+        'platform_promo_id',
+        'is_platform_promo',
         'name',
         'code',
         'type', // 'PERCENTAGE' or 'FIXED'
@@ -42,6 +44,8 @@ class Discount extends Model
         'max_discount_amount' => 'float',
         'is_auto_apply'       => 'boolean',
         'active'              => 'boolean',
+        'is_platform_promo'   => 'boolean',
+        'platform_promo_id'   => 'integer',
         'usage_limit'         => 'integer',
         'used_count'          => 'integer',
         'start_date'          => 'date:Y-m-d',
@@ -54,6 +58,24 @@ class Discount extends Model
         'created_by_name',
         'updated_by_name',
     ];
+
+    protected static function booted()
+    {
+        static::updated(function ($discount) {
+            if ($discount->is_platform_promo && $discount->platform_promo_id) {
+                \App\Models\PlatformPromoBusiness::where('platform_promo_id', $discount->platform_promo_id)
+                    ->where('business_id', $discount->business_id)
+                    ->update([
+                        'used_count' => (int)$discount->used_count,
+                    ]);
+            }
+        });
+    }
+
+    public function platformPromo()
+    {
+        return $this->belongsTo(PlatformPromo::class, 'platform_promo_id');
+    }
 
     public function outlet()
     {

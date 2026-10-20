@@ -10,6 +10,7 @@ use App\Models\OutletMenu;
 use App\Models\Category;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\Rule;
 
 class MenuController extends Controller
@@ -84,6 +85,8 @@ class MenuController extends Controller
             'estimated_hpp'=> 'nullable|numeric|min:0',
             'unit'         => 'nullable|string|max:20',
             'active'      => 'nullable|boolean',
+            'image'       => 'nullable|image|max:2048',
+            'image_url'   => 'nullable|string',
             'outlet_id'   => 'nullable|integer',
             'bundle_items'                  => 'nullable|array',
             'bundle_items.*.bundled_menu_id'=> 'nullable|exists:menus,id',
@@ -111,6 +114,27 @@ class MenuController extends Controller
             $data['category_id'] = $cat->id;
             $data['category'] = $cat->name;
         }
+
+        // Handle image upload
+        if ($request->hasFile('image')) {
+            $file = $request->file('image');
+            $filename = 'menu_' . ($businessId ?: 0) . '_' . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
+            $path = $file->storeAs('menu-images', $filename, 'public');
+            $data['image_url'] = '/storage/' . $path;
+        } elseif (!empty($data['image_url']) && str_starts_with($data['image_url'], 'data:image/')) {
+            if (preg_match('/^data:image\/(\w+);base64,/', $data['image_url'], $matches)) {
+                $ext = strtolower($matches[1]);
+                if ($ext === 'jpeg') $ext = 'jpg';
+                $raw = substr($data['image_url'], strpos($data['image_url'], ',') + 1);
+                $decoded = base64_decode($raw);
+                if ($decoded !== false) {
+                    $filename = 'menu_' . ($businessId ?: 0) . '_' . time() . '_' . uniqid() . '.' . $ext;
+                    Storage::disk('public')->put('menu-images/' . $filename, $decoded);
+                    $data['image_url'] = '/storage/menu-images/' . $filename;
+                }
+            }
+        }
+        unset($data['image']);
 
         $outletId = $data['outlet_id'] ?? null;
         $bundleItems = $data['bundle_items'] ?? null;
@@ -189,6 +213,9 @@ class MenuController extends Controller
             'estimated_hpp'=> 'nullable|numeric|min:0',
             'unit'         => 'nullable|string|max:20',
             'active'      => 'nullable|boolean',
+            'image'       => 'nullable|image|max:2048',
+            'image_url'   => 'nullable|string',
+            'remove_image'=> 'nullable|boolean',
             'outlet_id'   => 'nullable|integer',
             'bundle_items'                  => 'nullable|array',
             'bundle_items.*.bundled_menu_id'=> 'nullable|exists:menus,id',
@@ -205,6 +232,42 @@ class MenuController extends Controller
             $data['category_id'] = $cat->id;
             $data['category'] = $cat->name;
         }
+
+        // Handle image upload/removal on update
+        if ($request->boolean('remove_image')) {
+            if ($menu->image_url && str_starts_with($menu->image_url, '/storage/')) {
+                $oldPath = str_replace('/storage/', '', $menu->image_url);
+                Storage::disk('public')->delete($oldPath);
+            }
+            $data['image_url'] = null;
+        } elseif ($request->hasFile('image')) {
+            // Delete old image if exists
+            if ($menu->image_url && str_starts_with($menu->image_url, '/storage/')) {
+                $oldPath = str_replace('/storage/', '', $menu->image_url);
+                Storage::disk('public')->delete($oldPath);
+            }
+            $file = $request->file('image');
+            $filename = 'menu_' . ($businessId ?: 0) . '_' . time() . '_' . uniqid() . '.' . $file->getClientOriginalExtension();
+            $path = $file->storeAs('menu-images', $filename, 'public');
+            $data['image_url'] = '/storage/' . $path;
+        } elseif (!empty($data['image_url']) && str_starts_with($data['image_url'], 'data:image/')) {
+            if ($menu->image_url && str_starts_with($menu->image_url, '/storage/')) {
+                $oldPath = str_replace('/storage/', '', $menu->image_url);
+                Storage::disk('public')->delete($oldPath);
+            }
+            if (preg_match('/^data:image\/(\w+);base64,/', $data['image_url'], $matches)) {
+                $ext = strtolower($matches[1]);
+                if ($ext === 'jpeg') $ext = 'jpg';
+                $raw = substr($data['image_url'], strpos($data['image_url'], ',') + 1);
+                $decoded = base64_decode($raw);
+                if ($decoded !== false) {
+                    $filename = 'menu_' . ($businessId ?: 0) . '_' . time() . '_' . uniqid() . '.' . $ext;
+                    Storage::disk('public')->put('menu-images/' . $filename, $decoded);
+                    $data['image_url'] = '/storage/menu-images/' . $filename;
+                }
+            }
+        }
+        unset($data['image'], $data['remove_image']);
 
         $outletId = $data['outlet_id'] ?? null;
         $bundleItems = $data['bundle_items'] ?? null;
@@ -765,6 +828,7 @@ class MenuController extends Controller
     public function hppHistory(Request $request, Menu $menu)
     {
         $user = $request->user();
+        $isOutletBounded = $user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id;
         $outletId = $isOutletBounded ? (int)$user->outlet_id : ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all' ? (int)$request->outlet_id : null);
 
         $data = \App\Services\MenuHppService::getHppData(

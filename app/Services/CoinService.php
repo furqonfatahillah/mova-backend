@@ -25,6 +25,20 @@ class CoinService
             ];
         }
 
+        // Cek apakah masa aktif langganan / paket unlimited perusahaan sudah kadaluarsa
+        if ($business->status === 'expired' || ($business->expires_at && $business->expires_at->isPast())) {
+            $expStr = $business->expires_at ? $business->expires_at->format('d/m/Y') : '-';
+            return [
+                'allowed'        => false,
+                'balance'        => (float)($business->coin_balance ?: 0.00),
+                'cost'           => (float)($business->coins_per_transaction ?: 0.00),
+                'remaining'      => 0,
+                'is_unlimited'   => (bool)$business->is_unlimited,
+                'is_expired'     => true,
+                'message'        => "Transaksi tidak dapat diproses: Masa aktif langganan perusahaan Anda telah berakhir ({$expStr}). Silakan hubungi Pemilik Website untuk perpanjangan masa aktif.",
+            ];
+        }
+
         $isUnlimited = (bool)($business->is_unlimited_coins || (isset($business->coins_per_transaction) && (float)$business->coins_per_transaction <= 0));
         $cost = $isUnlimited ? 0.0 : (isset($business->coins_per_transaction) ? (float)$business->coins_per_transaction : 1.00);
         $balance = (float)($business->coin_balance ?: 0.00);
@@ -157,7 +171,7 @@ class CoinService
     /**
      * Update the cost (coins per transaction) or toggle unlimited status for a business.
      */
-    public static function updateRate(int $businessId, float $coinsPerTx, ?bool $isUnlimited = null, ?int $adminId = null): void
+    public static function updateRate(int $businessId, float $coinsPerTx, ?bool $isUnlimited = null, ?int $adminId = null, ?string $expiresAt = null): void
     {
         if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coins_per_transaction')) {
             throw new \Exception("Tabel koin belum dibuat di database server produksi. Silakan jalankan 'php artisan migrate --force' di terminal VPS server produksi Anda.");
@@ -171,9 +185,23 @@ class CoinService
         $business->coins_per_transaction = $coinsPerTx;
         if ($isUnlimited !== null) {
             $business->is_unlimited_coins = $isUnlimited;
+            $business->package_type = $isUnlimited ? 'unlimited' : 'premium';
         } elseif ($coinsPerTx == 0.0) {
             $business->is_unlimited_coins = true;
+            $business->package_type = 'unlimited';
+        } else {
+            $business->is_unlimited_coins = false;
+            $business->package_type = 'premium';
         }
+
+        if ($expiresAt !== null) {
+            $parsed = !empty($expiresAt) ? \Carbon\Carbon::parse($expiresAt)->endOfDay() : null;
+            $business->expires_at = $parsed;
+            if ($parsed && $parsed->isFuture() && $business->status === 'expired') {
+                $business->status = 'active';
+            }
+        }
+
         $business->updated_by = $adminId;
         $business->save();
     }

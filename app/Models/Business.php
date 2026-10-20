@@ -45,7 +45,10 @@ class Business extends Model
         'changed_at',
         'changed_by_name',
         'is_active',
+        'is_expired',
         'is_unlimited',
+        'is_unlimited_plan',
+        'is_premium_plan',
         'remaining_transactions',
         'is_coin_low',
         'is_coin_out',
@@ -57,13 +60,42 @@ class Business extends Model
         return $this->hasMany(CoinTransaction::class);
     }
 
+    public function getIsExpiredAttribute(): bool
+    {
+        if ($this->status === 'expired') return true;
+        if ($this->expires_at && $this->expires_at->isPast()) return true;
+        return false;
+    }
+
     public function getIsUnlimitedAttribute(): bool
     {
-        return (bool)($this->is_unlimited_coins || (isset($this->coins_per_transaction) && (float)$this->coins_per_transaction <= 0));
+        // If a business has an active coin cost per transaction (> 0), it is definitely NOT unlimited.
+        if (isset($this->coins_per_transaction) && (float)$this->coins_per_transaction > 0) {
+            return false;
+        }
+
+        return (bool)(
+            $this->is_unlimited_coins ||
+            (isset($this->coins_per_transaction) && (float)$this->coins_per_transaction <= 0) ||
+            strtolower($this->package_type ?? '') === 'unlimited'
+        );
+    }
+
+    public function getIsUnlimitedPlanAttribute(): bool
+    {
+        return $this->is_unlimited;
+    }
+
+    public function getIsPremiumPlanAttribute(): bool
+    {
+        return !$this->is_unlimited;
     }
 
     public function getRemainingTransactionsAttribute(): int
     {
+        if ($this->is_expired) {
+            return 0;
+        }
         if ($this->is_unlimited) {
             return 999999;
         }

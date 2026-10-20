@@ -898,6 +898,7 @@ class CashFlowController extends Controller
     {
         $query = CashTransaction::with(['outlet', 'user'])
             ->orderByDesc('date')
+            ->orderByDesc('created_at')
             ->orderByDesc('id');
 
         $user = $request->user();

@@ -16,6 +16,7 @@ class Menu extends Model
         'barcode',
         'name',
         'description',
+        'image_url',
         'category',
         'category_id',
         'item_type',    // RECIPE, DIRECT, SERVICE

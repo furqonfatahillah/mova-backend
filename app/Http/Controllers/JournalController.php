@@ -551,9 +551,11 @@ class JournalController extends Controller
         $totalCredit  = (float)$summaryQuery->sum('total_credit');
         $balancedCount = (clone $summaryQuery)->where('is_balanced', true)->count();
 
-        $limit = (int)$request->input('limit', 200);
-        $entries = $query->orderBy('entry_date', 'desc')
-            ->orderBy('id', 'desc')
+        $limit = (int)$request->input('limit', 300);
+        $direction = strtolower((string)$request->input('direction', $request->input('sort_order', 'desc'))) === 'asc' ? 'asc' : 'desc';
+        $entries = $query->orderBy('entry_date', $direction)
+            ->orderBy('created_at', $direction)
+            ->orderBy('id', $direction)
             ->limit($limit)
             ->get();
 

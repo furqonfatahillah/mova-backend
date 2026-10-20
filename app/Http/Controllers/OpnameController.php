@@ -259,8 +259,8 @@ class OpnameController extends Controller
     public function bulkUpsert(Request $request)
     {
         $request->validate([
-            'period_from'   => 'required|date',
-            'period_to'     => 'required|date',
+            'period_from'   => 'nullable|date',
+            'period_to'     => 'nullable|date',
             'outlet_id'     => 'nullable|exists:outlets,id',
             'opname_no'     => 'nullable|string|max:50',
             'opname_date'   => 'nullable|date',
@@ -276,11 +276,13 @@ class OpnameController extends Controller
             'items.*.notes'         => 'nullable|string',
         ]);
 
-        $opnameDate = $request->opname_date ?? now()->toDateString();
-        $today = now()->toDateString();
+        $periodFrom = $request->period_from ?: now()->toDateString();
+        $periodTo   = $request->period_to ?: now()->toDateString();
+        $opnameDate = $request->opname_date ?: now()->toDateString();
+        $today      = now()->toDateString();
 
-        // 1. Tidak boleh tanggal mundur sebelum hari ini
-        if ($opnameDate < $today || $request->period_to < $today) {
+        // 1. Untuk sesi baru, tidak boleh tanggal mundur sebelum hari ini
+        if (!$request->filled('opname_no') && ($opnameDate < $today || $periodTo < $today)) {
             return response()->json([
                 'message' => 'Tanggal pelaksanaan opname tidak boleh di-inputkan tanggal mundur (sebelum hari ini).'
             ], 422);
@@ -323,11 +325,11 @@ class OpnameController extends Controller
             ->orderByDesc('period_to')
             ->first();
 
-        if ($latestReleased) {
+        if ($latestReleased && !$request->filled('opname_no')) {
             $latestDate = $latestReleased->opname_date
                 ? (is_string($latestReleased->opname_date) ? $latestReleased->opname_date : $latestReleased->opname_date->toDateString())
                 : $latestReleased->period_to;
-            if ($opnameDate < $latestDate || $request->period_to < $latestDate) {
+            if ($opnameDate < $latestDate || $periodTo < $latestDate) {
                 return response()->json([
                     'message' => "Tanggal pelaksanaan opname ({$opnameDate}) tidak boleh mundur dari sesi opname yang telah di-release sebelumnya ({$latestDate})."
                 ], 422);
@@ -335,9 +337,14 @@ class OpnameController extends Controller
         }
 
         // Check if any item in this period & outlet already has a released/closed session
-        $existingSession = Opname::where('period_from', $request->period_from)
-            ->where('period_to', $request->period_to)
-            ->where('outlet_id', $outletId)
+        $existingSession = Opname::where('outlet_id', $outletId)
+            ->where(function ($q) use ($request, $periodFrom, $periodTo) {
+                if ($request->filled('opname_no')) {
+                    $q->where('opname_no', $request->opname_no);
+                } else {
+                    $q->where('period_from', $periodFrom)->where('period_to', $periodTo);
+                }
+            })
             ->whereNotNull('opname_no')
             ->first();
 
@@ -362,15 +369,20 @@ class OpnameController extends Controller
 
         // Precompute theoretical snapshot values
         $reportCtrl = app(ReportController::class);
-        $varianceRows = $reportCtrl->buildVarianceArray($request->period_from, $request->period_to, (int)$outletId);
+        $varianceRows = $reportCtrl->buildVarianceArray($periodFrom, $periodTo, (int)$outletId);
         $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
 
         $results = [];
         foreach ($request->items as $item) {
-            $existing = Opname::where('period_from', $request->period_from)
-                ->where('period_to', $request->period_to)
-                ->where('ingredient_id', $item['ingredient_id'])
+            $existing = Opname::where('ingredient_id', $item['ingredient_id'])
                 ->where('outlet_id', $outletId)
+                ->where(function ($q) use ($opnameNo, $periodFrom, $periodTo) {
+                    if ($opnameNo) {
+                        $q->where('opname_no', $opnameNo);
+                    } else {
+                        $q->where('period_from', $periodFrom)->where('period_to', $periodTo);
+                    }
+                })
                 ->first();
 
             $actualQty = isset($item['actual_qty']) && $item['actual_qty'] !== null ? (float)$item['actual_qty'] : null;
@@ -429,8 +441,8 @@ class OpnameController extends Controller
 
             $opname = Opname::updateOrCreate(
                 [
-                    'period_from'   => $request->period_from,
-                    'period_to'     => $request->period_to,
+                    'period_from'   => $periodFrom,
+                    'period_to'     => $periodTo,
                     'ingredient_id' => $item['ingredient_id'],
                     'outlet_id'     => $outletId,
                 ],
@@ -443,8 +455,8 @@ class OpnameController extends Controller
         if ($isClosed) {
             $this->syncOpnameStockMovements(
                 $opnameNo,
-                $request->period_from,
-                $request->period_to,
+                $periodFrom,
+                $periodTo,
                 (int)$outletId,
                 $user,
                 $opnameDate

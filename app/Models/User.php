@@ -31,6 +31,7 @@ class User extends Authenticatable
         'business_id',
         'referral_code',
         'referred_by_id',
+        'permissions',
     ];
 
     protected $appends = [
@@ -44,6 +45,8 @@ class User extends Authenticatable
         'is_owner_bisnis',
         'is_owner_outlet',
         'is_pegawai',
+        'effective_permissions',
+        'is_custom_permissions',
     ];
 
     /**
@@ -68,6 +71,7 @@ class User extends Authenticatable
             'approved_at'       => 'datetime',
             'password'          => 'hashed',
             'role_id'           => 'integer',
+            'permissions'       => 'array',
         ];
     }
 
@@ -311,5 +315,28 @@ class User extends Authenticatable
         }
 
         return false;
+    }
+
+    public function getEffectivePermissionsAttribute(): array
+    {
+        if ($this->isPlatformAdmin() || $this->isOwnerBisnis()) {
+            return \App\Services\AuthorityService::getAllPermissionKeys();
+        }
+
+        if ($this->permissions !== null && is_array($this->permissions)) {
+            return $this->permissions;
+        }
+
+        return \App\Services\AuthorityService::getDefaultPermissionsForRole($this->role);
+    }
+
+    public function getIsCustomPermissionsAttribute(): bool
+    {
+        return $this->permissions !== null;
+    }
+
+    public function hasPermission(string $permission): bool
+    {
+        return in_array($permission, $this->effective_permissions, true);
     }
 }

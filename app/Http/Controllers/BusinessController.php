@@ -84,7 +84,7 @@ class BusinessController extends Controller
             'email'        => 'nullable|email',
             'phone'        => 'nullable|string|max:50',
             'address'      => 'nullable|string|max:500',
-            'package_type' => 'required|in:starter,pro,enterprise',
+            'package_type' => 'required|in:starter,pro,enterprise,unlimited,premium',
             'max_outlets'  => 'required|integer|min:1|max:100',
             'status'       => 'required|in:active,trial,suspended,expired,pending,rejected',
             'expires_at'   => 'nullable|date',
@@ -139,7 +139,7 @@ class BusinessController extends Controller
             'email'        => 'nullable|email',
             'phone'        => 'nullable|string|max:50',
             'address'      => 'nullable|string|max:500',
-            'package_type' => 'sometimes|in:starter,pro,enterprise',
+            'package_type' => 'sometimes|in:starter,pro,enterprise,unlimited,premium',
             'max_outlets'  => 'sometimes|integer|min:1|max:100',
             'status'             => 'sometimes|in:active,trial,suspended,expired,pending,rejected',
             'expires_at'         => 'nullable|date',
@@ -315,13 +315,19 @@ class BusinessController extends Controller
                 ->get()
             : [];
 
+        $isUnlimited = (bool)$business->is_unlimited;
+
         return response()->json([
             'is_platform_admin'      => false,
             'business_id'            => $business->id,
             'business_name'          => $business->name,
+            'package_type'           => $isUnlimited ? 'unlimited' : 'premium',
+            'is_unlimited_plan'      => $isUnlimited,
+            'is_premium_plan'        => !$isUnlimited,
+            'expires_at'             => $business->expires_at,
             'coin_balance'           => $hasCoinCol ? $business->coin_balance : 0,
             'coins_per_transaction'  => $hasCoinCol ? $business->coins_per_transaction : 1,
-            'is_unlimited_coins'     => (bool)$business->is_unlimited,
+            'is_unlimited_coins'     => $isUnlimited,
             'remaining_transactions' => $hasCoinCol ? $business->remaining_transactions : 0,
             'low_coin_threshold'     => $hasCoinCol ? ($business->low_coin_threshold ?: 2000) : 2000,
             'is_coin_low'            => $hasCoinCol ? $business->is_coin_low : false,

@@ -39,7 +39,7 @@ class CoinService
             ];
         }
 
-        $isUnlimited = (bool)($business->is_unlimited_coins || (isset($business->coins_per_transaction) && (float)$business->coins_per_transaction <= 0));
+        $isUnlimited = (bool)$business->is_unlimited;
         $cost = $isUnlimited ? 0.0 : (isset($business->coins_per_transaction) ? (float)$business->coins_per_transaction : 1.00);
         $balance = (float)($business->coin_balance ?: 0.00);
         $remaining = $isUnlimited ? 999999 : ($cost > 0 ? (int) floor($balance / $cost) : 999999);
@@ -87,9 +87,9 @@ class CoinService
         return DB::transaction(function () use ($businessId, $orderNumber, $outletId, $userId, $customNotes) {
             $business = Business::where('id', $businessId)->lockForUpdate()->firstOrFail();
 
-            $isUnlimited = (bool)($business->is_unlimited_coins || (isset($business->coins_per_transaction) && (float)$business->coins_per_transaction <= 0));
+            $isUnlimited = (bool)$business->is_unlimited;
             if ($isUnlimited) {
-                // Mode Unlimited: Transaksi tidak memotong koin sama sekali
+                // Mode Unlimited / Demo: Transaksi tidak memotong koin sama sekali
                 return null;
             }
 
@@ -171,7 +171,7 @@ class CoinService
     /**
      * Update the cost (coins per transaction) or toggle unlimited status for a business.
      */
-    public static function updateRate(int $businessId, float $coinsPerTx, ?bool $isUnlimited = null, ?int $adminId = null, ?string $expiresAt = null): void
+    public static function updateRate(int $businessId, float $coinsPerTx, ?bool $isUnlimited = null, ?int $adminId = null, ?string $expiresAt = null, ?string $packageType = null): void
     {
         if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coins_per_transaction')) {
             throw new \Exception("Tabel koin belum dibuat di database server produksi. Silakan jalankan 'php artisan migrate --force' di terminal VPS server produksi Anda.");
@@ -183,7 +183,18 @@ class CoinService
 
         $business = Business::findOrFail($businessId);
         $business->coins_per_transaction = $coinsPerTx;
-        if ($isUnlimited !== null) {
+
+        if ($packageType === 'demo' || (strtolower($business->package_type ?? '') === 'demo' && $packageType === null && $isUnlimited !== false)) {
+            $business->package_type = 'demo';
+            $business->is_unlimited_coins = true;
+            $business->coins_per_transaction = 0;
+        } elseif ($packageType) {
+            $business->package_type = $packageType;
+            $business->is_unlimited_coins = ($packageType === 'unlimited' || $packageType === 'demo') ? true : (bool)$isUnlimited;
+            if ($packageType === 'unlimited' || $packageType === 'demo') {
+                $business->coins_per_transaction = 0;
+            }
+        } elseif ($isUnlimited !== null) {
             $business->is_unlimited_coins = $isUnlimited;
             $business->package_type = $isUnlimited ? 'unlimited' : 'premium';
         } elseif ($coinsPerTx == 0.0) {

@@ -104,13 +104,19 @@ class CoinPlatformController extends Controller
             'business_id'           => 'nullable', // null or 'ALL' or specific id
             'coins_per_transaction' => 'nullable|numeric|min:0',
             'is_unlimited_coins'    => 'nullable|boolean',
+            'package_type'          => 'nullable|string|in:unlimited,premium,demo',
             'expires_at'            => 'nullable|date',
         ]);
 
+        $pkg = $data['package_type'] ?? null;
+        $isDemo = $pkg === 'demo';
         $isUnlimited = isset($data['is_unlimited_coins']) ? (bool)$data['is_unlimited_coins'] : null;
         $rate = isset($data['coins_per_transaction']) ? (float)$data['coins_per_transaction'] : ($isUnlimited ? 0.0 : 1.0);
 
-        if ($isUnlimited === true || $rate == 0.0) {
+        if ($isDemo) {
+            $isUnlimited = true;
+            $rate = 0.0;
+        } elseif ($isUnlimited === true || $rate == 0.0) {
             $isUnlimited = true;
             $rate = 0.0;
         }
@@ -118,14 +124,16 @@ class CoinPlatformController extends Controller
         if (!empty($data['business_id']) && $data['business_id'] !== 'ALL') {
             if ($isUnlimited && empty($data['expires_at'])) {
                 return response()->json([
-                    'message' => 'Untuk mode Unlimited Koin, tanggal berakhir masa aktif (expired) wajib diinputkan.',
+                    'message' => 'Untuk mode Unlimited / Demo Koin, tanggal berakhir masa aktif (expired) wajib diinputkan.',
                 ], 422);
             }
 
             $expiresAt = !empty($data['expires_at']) ? $data['expires_at'] : null;
-            CoinService::updateRate((int)$data['business_id'], $rate, $isUnlimited, $request->user()->id, $expiresAt);
+            CoinService::updateRate((int)$data['business_id'], $rate, $isUnlimited, $request->user()->id, $expiresAt, $pkg);
             $business = Business::find($data['business_id']);
-            $statusText = $business->is_unlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota";
+            $statusText = $business->is_demo
+                ? 'Demo (Full Premium + Bebas Koin)'
+                : ($business->is_unlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota");
             if ($business->expires_at) {
                 $statusText .= " s/d " . $business->expires_at->format('d/m/Y');
             }

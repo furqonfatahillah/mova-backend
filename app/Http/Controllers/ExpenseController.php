@@ -98,6 +98,10 @@ class ExpenseController extends Controller
             });
         }
 
+        if ($request->filled('shift_id')) {
+            $query->where('shift_id', $request->shift_id);
+        }
+
         $limit = $request->input('limit', 500);
         return response()->json($query->limit($limit)->get());
     }
@@ -126,6 +130,10 @@ class ExpenseController extends Controller
 
         if ($request->filled('to')) {
             $query->where('date', '<=', $request->to);
+        }
+
+        if ($request->filled('shift_id')) {
+            $query->where('shift_id', $request->shift_id);
         }
 
         $expenses = $query->get();
@@ -211,6 +219,18 @@ class ExpenseController extends Controller
             ? (int)$user->outlet_id
             : (!empty($data['outlet_id']) ? (int)$data['outlet_id'] : ($user->outlet_id ?? null));
 
+        // Strict rule: Bank payment methods are ONLY allowed in Cabang Pusat
+        if (in_array(strtoupper(trim((string)$paymentMethod)), ['TRANSFER', 'DEBIT', 'BANK'])) {
+            if ($outletId) {
+                $outlet = \App\Models\Outlet::find($outletId);
+                if ($outlet && !$outlet->is_main) {
+                    return response()->json([
+                        'message' => 'Pilihan pembayaran Bank hanya dapat dilakukan di Cabang Pusat.',
+                    ], 422);
+                }
+            }
+        }
+
         $expenseNo = OperatingExpense::generateExpenseNo($businessId, $data['date']);
 
         $shiftId = $request->input('shift_id');
@@ -281,6 +301,19 @@ class ExpenseController extends Controller
         if (!$canViewAllOutlets && $user->outlet_id) {
             if ($expense->outlet_id && (int)$expense->outlet_id !== (int)$user->outlet_id) {
                 return response()->json(['message' => 'Anda tidak memiliki hak akses untuk mengubah beban operasional di cabang lain.'], 403);
+            }
+        }
+
+        $targetOutletId = array_key_exists('outlet_id', $data) ? $data['outlet_id'] : $expense->outlet_id;
+        $targetPaymentMethod = $data['payment_method'] ?? $expense->payment_method;
+        if (in_array(strtoupper(trim((string)$targetPaymentMethod)), ['TRANSFER', 'DEBIT', 'BANK'])) {
+            if ($targetOutletId) {
+                $outlet = \App\Models\Outlet::find($targetOutletId);
+                if ($outlet && !$outlet->is_main) {
+                    return response()->json([
+                        'message' => 'Pilihan pembayaran Bank hanya dapat dilakukan di Cabang Pusat.',
+                    ], 422);
+                }
             }
         }
 

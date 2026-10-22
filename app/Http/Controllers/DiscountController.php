@@ -11,7 +11,7 @@ class DiscountController extends Controller
 {
     public function index(Request $request)
     {
-        $query = Discount::with(['outlet', 'rewardMenu', 'creator', 'updater', 'platformPromo'])
+        $query = Discount::with(['outlet', 'rewardMenu', 'creator', 'updater', 'platformPromo', 'platformPromoBusiness.approver', 'platformPromoBusiness.rejector'])
             ->orderByDesc('id');
 
         if ($request->has('active') && $request->active !== '' && $request->active !== 'ALL') {

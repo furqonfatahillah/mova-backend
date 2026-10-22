@@ -122,17 +122,25 @@ class MenuController extends Controller
             $path = $file->storeAs('menu-images', $filename, 'public');
             $data['image_url'] = '/storage/' . $path;
         } elseif (!empty($data['image_url']) && str_starts_with($data['image_url'], 'data:image/')) {
-            if (preg_match('/^data:image\/(\w+);base64,/', $data['image_url'], $matches)) {
-                $ext = strtolower($matches[1]);
-                if ($ext === 'jpeg') $ext = 'jpg';
+            $savedUrl = null;
+            if (preg_match('/^data:image\/([a-zA-Z0-9\+\.\-]+)(?:;[a-zA-Z0-9=_\-]+)*;base64,/', $data['image_url'], $matches)) {
+                $mimeExt = strtolower($matches[1]);
+                $ext = match ($mimeExt) {
+                    'jpeg', 'pjpeg' => 'jpg',
+                    'png' => 'png',
+                    'webp' => 'webp',
+                    'gif' => 'gif',
+                    default => 'jpg',
+                };
                 $raw = substr($data['image_url'], strpos($data['image_url'], ',') + 1);
                 $decoded = base64_decode($raw);
-                if ($decoded !== false) {
+                if ($decoded !== false && strlen($decoded) > 0) {
                     $filename = 'menu_' . ($businessId ?: 0) . '_' . time() . '_' . uniqid() . '.' . $ext;
                     Storage::disk('public')->put('menu-images/' . $filename, $decoded);
-                    $data['image_url'] = '/storage/menu-images/' . $filename;
+                    $savedUrl = '/storage/menu-images/' . $filename;
                 }
             }
+            $data['image_url'] = $savedUrl;
         }
         unset($data['image']);
 
@@ -251,20 +259,33 @@ class MenuController extends Controller
             $path = $file->storeAs('menu-images', $filename, 'public');
             $data['image_url'] = '/storage/' . $path;
         } elseif (!empty($data['image_url']) && str_starts_with($data['image_url'], 'data:image/')) {
-            if ($menu->image_url && str_starts_with($menu->image_url, '/storage/')) {
-                $oldPath = str_replace('/storage/', '', $menu->image_url);
-                Storage::disk('public')->delete($oldPath);
-            }
-            if (preg_match('/^data:image\/(\w+);base64,/', $data['image_url'], $matches)) {
-                $ext = strtolower($matches[1]);
-                if ($ext === 'jpeg') $ext = 'jpg';
+            $savedUrl = null;
+            if (preg_match('/^data:image\/([a-zA-Z0-9\+\.\-]+)(?:;[a-zA-Z0-9=_\-]+)*;base64,/', $data['image_url'], $matches)) {
+                $mimeExt = strtolower($matches[1]);
+                $ext = match ($mimeExt) {
+                    'jpeg', 'pjpeg' => 'jpg',
+                    'png' => 'png',
+                    'webp' => 'webp',
+                    'gif' => 'gif',
+                    default => 'jpg',
+                };
                 $raw = substr($data['image_url'], strpos($data['image_url'], ',') + 1);
                 $decoded = base64_decode($raw);
-                if ($decoded !== false) {
+                if ($decoded !== false && strlen($decoded) > 0) {
+                    // Delete old image only after successful decode
+                    if ($menu->image_url && str_starts_with($menu->image_url, '/storage/')) {
+                        $oldPath = str_replace('/storage/', '', $menu->image_url);
+                        Storage::disk('public')->delete($oldPath);
+                    }
                     $filename = 'menu_' . ($businessId ?: 0) . '_' . time() . '_' . uniqid() . '.' . $ext;
                     Storage::disk('public')->put('menu-images/' . $filename, $decoded);
-                    $data['image_url'] = '/storage/menu-images/' . $filename;
+                    $savedUrl = '/storage/menu-images/' . $filename;
                 }
+            }
+            if ($savedUrl) {
+                $data['image_url'] = $savedUrl;
+            } else {
+                $data['image_url'] = $menu->image_url;
             }
         }
         unset($data['image'], $data['remove_image']);

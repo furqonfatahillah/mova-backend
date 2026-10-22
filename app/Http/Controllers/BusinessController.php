@@ -35,7 +35,7 @@ class BusinessController extends Controller
 
         $query = Business::query()
             ->withCount(['outlets', 'users', 'menus', 'ingredients'])
-            ->with(['referredBy.business']);
+            ->with(['referredBy.business', 'referralCode']);
 
         if ($request->filled('search')) {
             $s = $request->search;
@@ -45,6 +45,10 @@ class BusinessController extends Controller
                   ->orWhere('email', 'like', "%{$s}%")
                   ->orWhere('phone', 'like', "%{$s}%")
                   ->orWhere('referral_code_used', 'like', "%{$s}%")
+                  ->orWhereHas('referralCode', function ($rq) use ($s) {
+                      $rq->where('code', 'like', "%{$s}%")
+                         ->orWhere('recipient_name', 'like', "%{$s}%");
+                  })
                   ->orWhereHas('referredBy', function ($rq) use ($s) {
                       $rq->where('name', 'like', "%{$s}%")
                          ->orWhere('email', 'like', "%{$s}%")
@@ -59,9 +63,15 @@ class BusinessController extends Controller
 
         if ($request->filled('has_referral')) {
             if ($request->has_referral === 'yes' || $request->has_referral === '1') {
-                $query->whereNotNull('referred_by_id');
+                $query->where(function ($q) {
+                    $q->whereNotNull('referred_by_id')
+                      ->orWhereNotNull('referral_code_id')
+                      ->orWhereNotNull('referral_code_used');
+                });
             } elseif ($request->has_referral === 'no' || $request->has_referral === '0') {
-                $query->whereNull('referred_by_id');
+                $query->whereNull('referred_by_id')
+                      ->whereNull('referral_code_id')
+                      ->whereNull('referral_code_used');
             }
         }
 
@@ -84,11 +94,16 @@ class BusinessController extends Controller
             'email'        => 'nullable|email',
             'phone'        => 'nullable|string|max:50',
             'address'      => 'nullable|string|max:500',
-            'package_type' => 'required|in:starter,pro,enterprise,unlimited,premium',
+            'package_type' => 'required|in:starter,pro,enterprise,unlimited,premium,demo',
             'max_outlets'  => 'required|integer|min:1|max:100',
             'status'       => 'required|in:active,trial,suspended,expired,pending,rejected',
             'expires_at'   => 'nullable|date',
         ]);
+
+        if (($data['package_type'] ?? '') === 'demo') {
+            $data['is_unlimited_coins'] = true;
+            $data['coins_per_transaction'] = 0;
+        }
 
         $slug = Str::slug($data['name']);
         $originalSlug = $slug;
@@ -139,12 +154,17 @@ class BusinessController extends Controller
             'email'        => 'nullable|email',
             'phone'        => 'nullable|string|max:50',
             'address'      => 'nullable|string|max:500',
-            'package_type' => 'sometimes|in:starter,pro,enterprise,unlimited,premium',
+            'package_type' => 'sometimes|in:starter,pro,enterprise,unlimited,premium,demo',
             'max_outlets'  => 'sometimes|integer|min:1|max:100',
             'status'             => 'sometimes|in:active,trial,suspended,expired,pending,rejected',
             'expires_at'         => 'nullable|date',
             'is_unlimited_coins' => 'nullable|boolean',
         ]);
+
+        if (isset($data['package_type']) && $data['package_type'] === 'demo') {
+            $data['is_unlimited_coins'] = true;
+            $data['coins_per_transaction'] = 0;
+        }
 
         $data['updated_by'] = $user->id;
         $business->update($data);
@@ -315,15 +335,17 @@ class BusinessController extends Controller
                 ->get()
             : [];
 
+        $isDemo = (bool)$business->is_demo;
         $isUnlimited = (bool)$business->is_unlimited;
 
         return response()->json([
             'is_platform_admin'      => false,
             'business_id'            => $business->id,
             'business_name'          => $business->name,
-            'package_type'           => $isUnlimited ? 'unlimited' : 'premium',
+            'package_type'           => $isDemo ? 'demo' : ($isUnlimited ? 'unlimited' : 'premium'),
+            'is_demo_plan'           => $isDemo,
             'is_unlimited_plan'      => $isUnlimited,
-            'is_premium_plan'        => !$isUnlimited,
+            'is_premium_plan'        => $isDemo ? true : !$isUnlimited,
             'expires_at'             => $business->expires_at,
             'coin_balance'           => $hasCoinCol ? $business->coin_balance : 0,
             'coins_per_transaction'  => $hasCoinCol ? $business->coins_per_transaction : 1,

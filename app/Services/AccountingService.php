@@ -1463,7 +1463,8 @@ class AccountingService
         $expData = self::calculateShiftExpenses($shift);
         $cashExpenses = (float)$expData['cash_expenses'];
 
-        $expectedCash = max(0, round($initialCash + $cashSales - $cashExpenses, 2));
+        // Real expected cash in drawer based on cash in vs cash out (can be negative if expenses were partially paid/covered by cashier)
+        $expectedCash = round($initialCash + $cashSales - $cashExpenses, 2);
         $closingCash = $shift->closing_cash !== null ? (float)$shift->closing_cash : null;
         $diff = $closingCash !== null ? round($closingCash - $expectedCash, 2) : 0.0;
 
@@ -1661,6 +1662,13 @@ class AccountingService
                 $lines[] = ['account_code' => $destCode,   'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Penerimaan Setoran Kas Aplikasi ke Bank {$ct->account}"];
                 $lines[] = ['account_code' => '1-11004',   'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Penyetoran Kas Aplikasi (QRIS) ke Bank {$ct->account}"];
             }
+        } elseif ($cat === 'SETOR_KAS_BESAR_KE_BANK') {
+            // Setoran Kas Besar ke Rekening Bank (1 Arah: Kas Besar -> Bank):
+            // Bank (1-11003) Debit, Kas Besar (1-11001) Kredit
+            $bankDesc = $ct->account ?: 'Rekening Bank';
+            $memoNotes = $ct->notes ? " ({$ct->notes})" : '';
+            $lines[] = ['account_code' => '1-11003', 'outlet_id' => $outletId, 'debit' => $amount, 'credit' => 0, 'memo' => "Penerimaan Setoran Kas Besar ke {$bankDesc}{$memoNotes}"];
+            $lines[] = ['account_code' => '1-11001', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $amount, 'memo' => "Penyetoran Kas Besar ke {$bankDesc}{$memoNotes}"];
         } elseif (str_contains($cat, 'KARYAWAN') || str_contains($cat, 'KASBON_STAFF')) {
             // Kasbon Karyawan (dialihkan ke 1-12001 Piutang Usaha)
             $srcCode = ($acc === 'BANK_MAIN' || str_contains($acc, 'BANK')) ? '1-11003' : ($acc === 'KAS_BESAR' ? '1-11001' : '1-11002');

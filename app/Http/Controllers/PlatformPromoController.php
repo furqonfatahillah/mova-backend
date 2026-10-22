@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\PlatformPromo;
 use App\Models\PlatformPromoBusiness;
+use App\Models\PlatformPromoPayment;
 use App\Models\Business;
 use App\Models\Discount;
 use Illuminate\Http\Request;
@@ -60,7 +61,12 @@ class PlatformPromoController extends Controller
                 'platform_promo_id',
                 DB::raw('SUM(used_count) as total_used'),
                 DB::raw('SUM(usage_limit) as total_quota'),
-                DB::raw('COUNT(DISTINCT business_id) as business_count')
+                DB::raw('SUM(amount_payable) as total_payable'),
+                DB::raw('SUM(amount_paid) as total_paid'),
+                DB::raw('COUNT(DISTINCT business_id) as business_count'),
+                DB::raw("COUNT(CASE WHEN approval_status = 'PENDING' THEN 1 END) as pending_approvals"),
+                DB::raw("COUNT(CASE WHEN approval_status = 'ACCEPTED' THEN 1 END) as accepted_count"),
+                DB::raw("COUNT(CASE WHEN approval_status = 'REJECTED' THEN 1 END) as rejected_count")
             )
             ->groupBy('platform_promo_id')
             ->get()
@@ -68,17 +74,27 @@ class PlatformPromoController extends Controller
 
         $result = $promos->map(function ($p) use ($aggregates) {
             $agg = $aggregates->get($p->id);
-            $p->total_used = (int)($agg?->total_used ?? 0);
-            $p->total_quota = (int)($agg?->total_quota ?? 0);
-            $p->business_count = (int)($agg?->business_count ?? 0);
+            $p->total_used         = (int)($agg?->total_used ?? 0);
+            $p->total_quota        = (int)($agg?->total_quota ?? 0);
+            $p->total_payable      = (float)($agg?->total_payable ?? 0);
+            $p->total_paid         = (float)($agg?->total_paid ?? 0);
+            $p->remaining_payment  = max(0, $p->total_payable - $p->total_paid);
+            $p->business_count     = (int)($agg?->business_count ?? 0);
+            $p->pending_approvals  = (int)($agg?->pending_approvals ?? 0);
+            $p->accepted_count     = (int)($agg?->accepted_count ?? 0);
+            $p->rejected_count     = (int)($agg?->rejected_count ?? 0);
             return $p;
         });
 
         // Platform-wide overview stats
-        $totalActivePromos = PlatformPromo::where('is_active', true)->count();
-        $totalDistributionsCount = PlatformPromoBusiness::count();
-        $totalRedemptionsCount = PlatformPromoBusiness::sum('used_count');
+        $totalActivePromos            = PlatformPromo::where('is_active', true)->count();
+        $totalDistributionsCount      = PlatformPromoBusiness::count();
+        $totalRedemptionsCount        = PlatformPromoBusiness::sum('used_count');
         $totalUniqueBusinessesReached = PlatformPromoBusiness::distinct('business_id')->count('business_id');
+        $totalAmountPayablePlatform   = (float)PlatformPromoBusiness::sum('amount_payable');
+        $totalAmountPaidPlatform      = (float)PlatformPromoBusiness::sum('amount_paid');
+        $totalRemainingPaymentPlatform= max(0, $totalAmountPayablePlatform - $totalAmountPaidPlatform);
+        $totalPendingApprovals        = PlatformPromoBusiness::where('approval_status', 'PENDING')->count();
 
         return response()->json([
             'promos' => $result,
@@ -88,6 +104,10 @@ class PlatformPromoController extends Controller
                 'total_distributions'       => $totalDistributionsCount,
                 'total_redemptions'         => (int)$totalRedemptionsCount,
                 'unique_businesses_reached' => $totalUniqueBusinessesReached,
+                'total_amount_payable'      => $totalAmountPayablePlatform,
+                'total_amount_paid'         => $totalAmountPaidPlatform,
+                'total_remaining_payment'   => $totalRemainingPaymentPlatform,
+                'total_pending_approvals'   => $totalPendingApprovals,
             ],
         ]);
     }
@@ -100,19 +120,20 @@ class PlatformPromoController extends Controller
         $this->authorizePlatformAdmin($request);
 
         $validated = $request->validate([
-            'title'               => 'required|string|max:150',
-            'code'                => 'required|string|max:50|unique:platform_promos,code',
-            'description'         => 'nullable|string',
-            'type'                => 'required|string|in:PERCENTAGE,FIXED',
-            'value'               => 'required|numeric|min:0.01',
-            'min_order_amount'    => 'nullable|numeric|min:0',
-            'max_discount_amount' => 'nullable|numeric|min:0',
-            'default_usage_limit' => 'required|integer|min:1',
-            'start_date'          => 'nullable|date',
-            'end_date'            => 'nullable|date|after_or_equal:start_date',
-            'banner_color'        => 'nullable|string|max:30',
-            'badge_text'          => 'nullable|string|max:50',
-            'is_active'           => 'nullable|boolean',
+            'title'                  => 'required|string|max:150',
+            'code'                   => 'required|string|max:50|unique:platform_promos,code',
+            'description'            => 'nullable|string',
+            'type'                   => 'required|string|in:PERCENTAGE,FIXED',
+            'value'                  => 'required|numeric|min:0.01',
+            'min_order_amount'       => 'nullable|numeric|min:0',
+            'max_discount_amount'    => 'nullable|numeric|min:0',
+            'default_usage_limit'    => 'required|integer|min:1',
+            'default_subsidy_amount' => 'nullable|numeric|min:0',
+            'start_date'             => 'nullable|date',
+            'end_date'               => 'nullable|date|after_or_equal:start_date',
+            'banner_color'           => 'nullable|string|max:30',
+            'badge_text'             => 'nullable|string|max:50',
+            'is_active'              => 'nullable|boolean',
         ]);
 
         $validated['code'] = strtoupper(trim($validated['code']));
@@ -121,6 +142,7 @@ class PlatformPromoController extends Controller
         $validated['banner_color'] = $validated['banner_color'] ?: '#4F46E5';
         $validated['min_order_amount'] = (float)($validated['min_order_amount'] ?? 0);
         $validated['max_discount_amount'] = isset($validated['max_discount_amount']) && $validated['max_discount_amount'] !== '' ? (float)$validated['max_discount_amount'] : null;
+        $validated['default_subsidy_amount'] = (float)($validated['default_subsidy_amount'] ?? 0);
 
         $promo = PlatformPromo::create($validated);
         $promo->load(['creator', 'updater']);
@@ -144,6 +166,9 @@ class PlatformPromoController extends Controller
             'distributions.business' => fn($q) => $q->withCount('outlets'),
             'distributions.discount',
             'distributions.distributor',
+            'distributions.approver',
+            'distributions.rejector',
+            'distributions.payments.creator',
         ]);
 
         return response()->json($platformPromo);
@@ -157,28 +182,30 @@ class PlatformPromoController extends Controller
         $this->authorizePlatformAdmin($request);
 
         $validated = $request->validate([
-            'title'               => 'required|string|max:150',
-            'code'                => [
+            'title'                  => 'required|string|max:150',
+            'code'                   => [
                 'required', 'string', 'max:50',
                 Rule::unique('platform_promos', 'code')->ignore($platformPromo->id)
             ],
-            'description'         => 'nullable|string',
-            'type'                => 'required|string|in:PERCENTAGE,FIXED',
-            'value'               => 'required|numeric|min:0.01',
-            'min_order_amount'    => 'nullable|numeric|min:0',
-            'max_discount_amount' => 'nullable|numeric|min:0',
-            'default_usage_limit' => 'required|integer|min:1',
-            'start_date'          => 'nullable|date',
-            'end_date'            => 'nullable|date|after_or_equal:start_date',
-            'banner_color'        => 'nullable|string|max:30',
-            'badge_text'          => 'nullable|string|max:50',
-            'is_active'           => 'nullable|boolean',
+            'description'            => 'nullable|string',
+            'type'                   => 'required|string|in:PERCENTAGE,FIXED',
+            'value'                  => 'required|numeric|min:0.01',
+            'min_order_amount'       => 'nullable|numeric|min:0',
+            'max_discount_amount'    => 'nullable|numeric|min:0',
+            'default_usage_limit'    => 'required|integer|min:1',
+            'default_subsidy_amount' => 'nullable|numeric|min:0',
+            'start_date'             => 'nullable|date',
+            'end_date'               => 'nullable|date|after_or_equal:start_date',
+            'banner_color'           => 'nullable|string|max:30',
+            'badge_text'             => 'nullable|string|max:50',
+            'is_active'              => 'nullable|boolean',
         ]);
 
         $validated['code'] = strtoupper(trim($validated['code']));
         $validated['updated_by'] = $request->user()->id;
         $validated['min_order_amount'] = (float)($validated['min_order_amount'] ?? 0);
         $validated['max_discount_amount'] = isset($validated['max_discount_amount']) && $validated['max_discount_amount'] !== '' ? (float)$validated['max_discount_amount'] : null;
+        $validated['default_subsidy_amount'] = (float)($validated['default_subsidy_amount'] ?? 0);
 
         $platformPromo->update($validated);
 
@@ -191,7 +218,6 @@ class PlatformPromoController extends Controller
                 'value'               => $platformPromo->value,
                 'min_order_amount'    => $platformPromo->min_order_amount,
                 'max_discount_amount' => $platformPromo->max_discount_amount,
-                'active'              => $platformPromo->is_active,
             ]);
 
         $platformPromo->load(['creator', 'updater']);
@@ -230,10 +256,22 @@ class PlatformPromoController extends Controller
         $platformPromo->updated_by = $request->user()->id;
         $platformPromo->save();
 
-        // Sync to discounts
-        Discount::where('platform_promo_id', $platformPromo->id)->update([
-            'active' => $platformPromo->is_active,
-        ]);
+        // If inactive, disable all child discounts
+        if (!$platformPromo->is_active) {
+            Discount::where('platform_promo_id', $platformPromo->id)->update([
+                'active' => false,
+            ]);
+        } else {
+            // If active, enable only discounts that were ACCEPTED by the owner
+            $acceptedBizIds = PlatformPromoBusiness::where('platform_promo_id', $platformPromo->id)
+                ->where('approval_status', 'ACCEPTED')
+                ->where('status', 'ACTIVE')
+                ->pluck('business_id');
+
+            Discount::where('platform_promo_id', $platformPromo->id)
+                ->whereIn('business_id', $acceptedBizIds)
+                ->update(['active' => true]);
+        }
 
         return response()->json([
             'message'   => $platformPromo->is_active ? 'Promo diaktifkan.' : 'Promo dinonaktifkan.',
@@ -242,7 +280,9 @@ class PlatformPromoController extends Controller
     }
 
     /**
-     * Distribute promo to target businesses (The core requirement: "disebar ke owner bisnis")
+     * Distribute promo to target businesses
+     * Allows setting per-business quota and compensation amount (uang pengganti promo)
+     * Distribution initiates in 'PENDING' approval status awaiting Business Owner's accept/reject
      */
     public function distribute(Request $request, PlatformPromo $platformPromo)
     {
@@ -253,6 +293,7 @@ class PlatformPromoController extends Controller
             'business_ids.*' => 'exists:businesses,id',
             'target_all'     => 'nullable|boolean',
             'usage_limit'    => 'nullable|integer|min:1',
+            'amount_payable' => 'nullable|numeric|min:0',
             'start_date'     => 'nullable|date',
             'end_date'       => 'nullable|date',
             'notes'          => 'nullable|string|max:500',
@@ -269,19 +310,24 @@ class PlatformPromoController extends Controller
             return response()->json(['message' => 'Pilih minimal satu bisnis untuk menerima promo.'], 422);
         }
 
-        $usageLimit = (int)($validated['usage_limit'] ?? $platformPromo->default_usage_limit ?? 50);
+        $usageLimit    = (int)($validated['usage_limit'] ?? $platformPromo->default_usage_limit ?? 50);
+        $amountPayable = isset($validated['amount_payable']) && $validated['amount_payable'] !== ''
+            ? (float)$validated['amount_payable']
+            : (float)(($platformPromo->default_subsidy_amount ?? 0) * $usageLimit);
+
         $startDate  = $validated['start_date'] ?? $platformPromo->start_date?->format('Y-m-d') ?? now()->toDateString();
         $endDate    = $validated['end_date'] ?? $platformPromo->end_date?->format('Y-m-d') ?? now()->addMonths(1)->toDateString();
         $notes      = $validated['notes'] ?? null;
         $userId     = $request->user()->id;
 
         $distributedCount = 0;
-        $updatedCount = 0;
+        $updatedCount     = 0;
 
         DB::transaction(function () use (
             $platformPromo,
             $businessIds,
             $usageLimit,
+            $amountPayable,
             $startDate,
             $endDate,
             $notes,
@@ -293,8 +339,8 @@ class PlatformPromoController extends Controller
                 $biz = Business::find($bizId);
                 if (!$biz) continue;
 
-                // 1. Create or update the synced Discount in the tenant business
-                // This allows the tenant POS to seamlessly recognize and apply the promo
+                // 1. Create or fetch the synced Discount in the tenant business
+                // Note: Initially active = false until approved by Business Owner!
                 $discount = Discount::withoutGlobalScopes()
                     ->where('business_id', $bizId)
                     ->where('platform_promo_id', $platformPromo->id)
@@ -316,8 +362,8 @@ class PlatformPromoController extends Controller
                         'usage_limit'         => $usageLimit,
                         'used_count'          => 0,
                         'is_auto_apply'       => false,
-                        'active'              => $platformPromo->is_active,
-                        'notes'               => "Promo Platform Superadmin: " . ($notes ?: $platformPromo->description),
+                        'active'              => false, // Pending Owner Approval
+                        'notes'               => "Promo Platform Superadmin (Menunggu Persetujuan Owner): " . ($notes ?: $platformPromo->description),
                         'created_by'          => $userId,
                         'updated_by'          => $userId,
                     ]);
@@ -332,7 +378,6 @@ class PlatformPromoController extends Controller
                         'start_date'          => $startDate,
                         'end_date'            => $endDate,
                         'usage_limit'         => $usageLimit,
-                        'active'              => $platformPromo->is_active,
                         'notes'               => "Promo Platform Superadmin: " . ($notes ?: $platformPromo->description),
                         'updated_by'          => $userId,
                     ]);
@@ -353,6 +398,10 @@ class PlatformPromoController extends Controller
                         'start_date'        => $startDate,
                         'end_date'          => $endDate,
                         'status'            => 'ACTIVE',
+                        'approval_status'   => 'PENDING', // Awaiting Owner Bisnis Approval
+                        'amount_payable'    => $amountPayable,
+                        'amount_paid'       => 0,
+                        'payment_status'    => 'UNPAID',
                         'notes'             => $notes,
                         'distributed_at'    => now(),
                         'distributed_by'    => $userId,
@@ -362,9 +411,11 @@ class PlatformPromoController extends Controller
                     $promoBiz->update([
                         'discount_id'    => $discount->id,
                         'usage_limit'    => $usageLimit,
+                        'amount_payable' => $amountPayable,
                         'start_date'     => $startDate,
                         'end_date'       => $endDate,
                         'status'         => 'ACTIVE',
+                        'approval_status'=> $promoBiz->approval_status === 'REJECTED' ? 'PENDING' : $promoBiz->approval_status,
                         'notes'          => $notes ?: $promoBiz->notes,
                         'distributed_at' => now(),
                         'distributed_by' => $userId,
@@ -375,37 +426,73 @@ class PlatformPromoController extends Controller
         });
 
         return response()->json([
-            'message' => "Promo '{$platformPromo->title}' berhasil disebar ke {$distributedCount} bisnis baru (dan diperbarui pada {$updatedCount} bisnis).",
+            'message' => "Promo '{$platformPromo->title}' berhasil disebar ke {$distributedCount} bisnis baru (dan diperbarui pada {$updatedCount} bisnis) dengan status menunggu persetujuan owner bisnis.",
             'stats'   => [
                 'distributed_new' => $distributedCount,
                 'updated'         => $updatedCount,
                 'total_targeted'  => count($businessIds),
+                'amount_payable'  => $amountPayable,
             ],
         ]);
     }
 
     /**
-     * Update distribution parameters for a single business (quota, expired date, status)
+     * Update distribution parameters for a single business (quota, compensation amount, expired date, status)
      */
     public function updateBusinessDistribution(Request $request, PlatformPromo $platformPromo, Business $business)
     {
         $this->authorizePlatformAdmin($request);
 
         $validated = $request->validate([
-            'usage_limit' => 'required|integer|min:1',
-            'start_date'  => 'nullable|date',
-            'end_date'    => 'nullable|date',
-            'status'      => 'required|string|in:ACTIVE,REVOKED,EXPIRED,QUOTA_DEPLETED',
-            'notes'       => 'nullable|string|max:500',
+            'usage_limit'     => 'required|integer|min:1',
+            'amount_payable'  => 'required|numeric|min:0',
+            'amount_paid'     => 'nullable|numeric|min:0',
+            'start_date'      => 'nullable|date',
+            'end_date'        => 'nullable|date',
+            'status'          => 'required|string|in:ACTIVE,REVOKED,EXPIRED,QUOTA_DEPLETED',
+            'approval_status' => 'nullable|string|in:PENDING,ACCEPTED,REJECTED',
+            'notes'           => 'nullable|string|max:500',
         ]);
 
         $promoBiz = PlatformPromoBusiness::where('platform_promo_id', $platformPromo->id)
             ->where('business_id', $business->id)
             ->firstOrFail();
 
-        $promoBiz->update($validated);
+        $amountPayable = (float)$validated['amount_payable'];
+        $amountPaid    = isset($validated['amount_paid']) ? (float)$validated['amount_paid'] : (float)$promoBiz->amount_paid;
+
+        $paymentStatus = 'UNPAID';
+        if ($amountPaid >= $amountPayable && $amountPayable > 0) {
+            $paymentStatus = 'PAID';
+        } elseif ($amountPaid > 0) {
+            $paymentStatus = 'PARTIALLY_PAID';
+        }
+
+        $updateData = [
+            'usage_limit'    => $validated['usage_limit'],
+            'amount_payable' => $amountPayable,
+            'amount_paid'    => $amountPaid,
+            'payment_status' => $paymentStatus,
+            'start_date'     => $validated['start_date'] ?? $promoBiz->start_date,
+            'end_date'       => $validated['end_date'] ?? $promoBiz->end_date,
+            'status'         => $validated['status'],
+            'notes'          => $validated['notes'] ?? $promoBiz->notes,
+        ];
+
+        if (!empty($validated['approval_status'])) {
+            $updateData['approval_status'] = $validated['approval_status'];
+            if ($validated['approval_status'] === 'ACCEPTED' && !$promoBiz->approved_at) {
+                $updateData['approved_at'] = now();
+                $updateData['approved_by'] = $request->user()->id;
+            }
+        }
+
+        $promoBiz->update($updateData);
 
         // Sync to tenant Discount
+        // Active ONLY IF approval_status is ACCEPTED and distribution is ACTIVE
+        $isDiscountActive = ($promoBiz->approval_status === 'ACCEPTED') && ($promoBiz->status === 'ACTIVE') && $platformPromo->is_active;
+
         if ($promoBiz->discount_id) {
             $discount = Discount::withoutGlobalScopes()->find($promoBiz->discount_id);
             if ($discount) {
@@ -413,14 +500,125 @@ class PlatformPromoController extends Controller
                     'usage_limit' => $validated['usage_limit'],
                     'start_date'  => $validated['start_date'] ?? $discount->start_date,
                     'end_date'    => $validated['end_date'] ?? $discount->end_date,
-                    'active'      => $validated['status'] === 'ACTIVE',
+                    'active'      => $isDiscountActive,
                 ]);
             }
         }
 
         return response()->json([
             'message'      => "Distribusi promo untuk bisnis '{$business->name}' berhasil diperbarui.",
-            'distribution' => $promoBiz->fresh(['business', 'discount']),
+            'distribution' => $promoBiz->fresh(['business', 'discount', 'approver', 'rejector', 'payments.creator']),
+        ]);
+    }
+
+    /**
+     * Record a payment/reimbursement from Platform to Business for promo replacement
+     */
+    public function storeBusinessPayment(Request $request, PlatformPromo $platformPromo, Business $business)
+    {
+        $this->authorizePlatformAdmin($request);
+
+        $validated = $request->validate([
+            'amount'         => 'required|numeric|min:1',
+            'payment_date'   => 'required|date',
+            'payment_method' => 'nullable|string|max:50',
+            'reference_no'   => 'nullable|string|max:100',
+            'notes'          => 'nullable|string|max:500',
+        ]);
+
+        $promoBiz = PlatformPromoBusiness::where('platform_promo_id', $platformPromo->id)
+            ->where('business_id', $business->id)
+            ->firstOrFail();
+
+        $payment = PlatformPromoPayment::create([
+            'platform_promo_business_id' => $promoBiz->id,
+            'amount'                     => (float)$validated['amount'],
+            'payment_date'               => $validated['payment_date'],
+            'payment_method'             => $validated['payment_method'] ?: 'Transfer Bank',
+            'reference_no'               => $validated['reference_no'] ?? null,
+            'notes'                      => $validated['notes'] ?? null,
+            'created_by'                 => $request->user()->id,
+        ]);
+
+        // Recalculate total paid
+        $totalPaid = (float)PlatformPromoPayment::where('platform_promo_business_id', $promoBiz->id)->sum('amount');
+        $paymentStatus = 'UNPAID';
+        if ($totalPaid >= (float)$promoBiz->amount_payable && (float)$promoBiz->amount_payable > 0) {
+            $paymentStatus = 'PAID';
+        } elseif ($totalPaid > 0) {
+            $paymentStatus = 'PARTIALLY_PAID';
+        }
+
+        $promoBiz->update([
+            'amount_paid'       => $totalPaid,
+            'payment_status'    => $paymentStatus,
+            'last_payment_date' => $validated['payment_date'],
+        ]);
+
+        return response()->json([
+            'message'      => "Pembayaran uang pengganti promo sebesar Rp " . number_format($payment->amount, 0, ',', '.') . " berhasil dicatat.",
+            'payment'      => $payment->load('creator'),
+            'distribution' => $promoBiz->fresh(['business', 'discount', 'payments.creator']),
+        ]);
+    }
+
+    /**
+     * List payment history for a business distribution
+     */
+    public function listBusinessPayments(Request $request, PlatformPromo $platformPromo, Business $business)
+    {
+        $this->authorizePlatformAdmin($request);
+
+        $promoBiz = PlatformPromoBusiness::where('platform_promo_id', $platformPromo->id)
+            ->where('business_id', $business->id)
+            ->firstOrFail();
+
+        $payments = PlatformPromoPayment::where('platform_promo_business_id', $promoBiz->id)
+            ->with('creator')
+            ->orderByDesc('payment_date')
+            ->orderByDesc('id')
+            ->get();
+
+        return response()->json([
+            'distribution' => $promoBiz,
+            'payments'     => $payments,
+        ]);
+    }
+
+    /**
+     * Delete a payment record
+     */
+    public function destroyBusinessPayment(Request $request, PlatformPromo $platformPromo, Business $business, $paymentId)
+    {
+        $this->authorizePlatformAdmin($request);
+
+        $promoBiz = PlatformPromoBusiness::where('platform_promo_id', $platformPromo->id)
+            ->where('business_id', $business->id)
+            ->firstOrFail();
+
+        $payment = PlatformPromoPayment::where('platform_promo_business_id', $promoBiz->id)
+            ->where('id', $paymentId)
+            ->firstOrFail();
+
+        $payment->delete();
+
+        // Recalculate total paid
+        $totalPaid = (float)PlatformPromoPayment::where('platform_promo_business_id', $promoBiz->id)->sum('amount');
+        $paymentStatus = 'UNPAID';
+        if ($totalPaid >= (float)$promoBiz->amount_payable && (float)$promoBiz->amount_payable > 0) {
+            $paymentStatus = 'PAID';
+        } elseif ($totalPaid > 0) {
+            $paymentStatus = 'PARTIALLY_PAID';
+        }
+
+        $promoBiz->update([
+            'amount_paid'    => $totalPaid,
+            'payment_status' => $paymentStatus,
+        ]);
+
+        return response()->json([
+            'message'      => 'Catatan pembayaran kompensasi promo berhasil dihapus.',
+            'distribution' => $promoBiz->fresh(['business', 'discount', 'payments.creator']),
         ]);
     }
 
@@ -507,10 +705,105 @@ class PlatformPromoController extends Controller
         }
 
         $distributions = PlatformPromoBusiness::where('business_id', $businessId)
-            ->with(['platformPromo'])
+            ->with(['platformPromo', 'approver', 'rejector', 'payments'])
             ->orderByDesc('id')
             ->get();
 
         return response()->json($distributions);
+    }
+
+    /**
+     * Owner Bisnis: Accept / Approve Promo from Superadmin
+     * Activates the promo in this business so POS cashiers can immediately use it!
+     */
+    public function acceptPromo(Request $request, $id)
+    {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+
+        if (!$businessId) {
+            return response()->json(['message' => 'Akun Anda tidak terhubung dengan bisnis.'], 403);
+        }
+
+        $promoBiz = PlatformPromoBusiness::where('id', $id)
+            ->where('business_id', $businessId)
+            ->firstOrFail();
+
+        if ($promoBiz->status === 'REVOKED') {
+            return response()->json(['message' => 'Promo ini telah dicabut oleh Platform Admin.'], 422);
+        }
+
+        DB::transaction(function () use ($promoBiz, $user) {
+            $promoBiz->update([
+                'approval_status'  => 'ACCEPTED',
+                'approved_at'      => now(),
+                'approved_by'      => $user->id,
+                'rejected_at'      => null,
+                'rejected_by'      => null,
+                'rejection_reason' => null,
+                'status'           => 'ACTIVE',
+            ]);
+
+            // Activate discount in POS
+            if ($promoBiz->discount_id) {
+                Discount::withoutGlobalScopes()
+                    ->where('id', $promoBiz->discount_id)
+                    ->update([
+                        'active' => true,
+                        'notes'  => "Promo Platform Superadmin (Disetujui oleh Owner: {$user->name})",
+                    ]);
+            }
+        });
+
+        return response()->json([
+            'message'      => 'Promo berhasil diterima! Promo ini sekarang aktif di kasir POS outlet Anda.',
+            'distribution' => $promoBiz->fresh(['platformPromo', 'approver', 'discount']),
+        ]);
+    }
+
+    /**
+     * Owner Bisnis: Reject Promo from Superadmin
+     * Keeps discount disabled in POS
+     */
+    public function rejectPromo(Request $request, $id)
+    {
+        $user = $request->user();
+        $businessId = $user?->business_id;
+
+        if (!$businessId) {
+            return response()->json(['message' => 'Akun Anda tidak terhubung dengan bisnis.'], 403);
+        }
+
+        $validated = $request->validate([
+            'rejection_reason' => 'nullable|string|max:500',
+        ]);
+
+        $promoBiz = PlatformPromoBusiness::where('id', $id)
+            ->where('business_id', $businessId)
+            ->firstOrFail();
+
+        DB::transaction(function () use ($promoBiz, $user, $validated) {
+            $promoBiz->update([
+                'approval_status'  => 'REJECTED',
+                'rejected_at'      => now(),
+                'rejected_by'      => $user->id,
+                'rejection_reason' => $validated['rejection_reason'] ?? 'Ditolak oleh Owner Bisnis.',
+            ]);
+
+            // Disable discount in POS
+            if ($promoBiz->discount_id) {
+                Discount::withoutGlobalScopes()
+                    ->where('id', $promoBiz->discount_id)
+                    ->update([
+                        'active' => false,
+                        'notes'  => "Promo Platform Superadmin (Ditolak oleh Owner: {$user->name})",
+                    ]);
+            }
+        });
+
+        return response()->json([
+            'message'      => 'Promo telah ditolak. Promo ini tidak akan diaktifkan di kasir POS.',
+            'distribution' => $promoBiz->fresh(['platformPromo', 'rejector', 'discount']),
+        ]);
     }
 }

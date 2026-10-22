@@ -454,12 +454,22 @@ class ShiftController extends Controller
                 // Cek sumber modal shift ini (apakah dari Kas Besar)
                 $kbTx = $modalKasBesarTxs[$s->id] ?? null;
                 $kbAmount = $kbTx ? (float)$kbTx->amount : 0.0;
+                if ($kbAmount == 0.0 && preg_match('/(?:Tarik Kas Besar|diambil dari Kas Besar)[^\d]*Rp\s*([\d\.]+)/i', $s->notes ?? '', $m)) {
+                    $kbAmount = (float)str_replace('.', '', $m[1]);
+                }
                 $isFromKasBesar = $kbAmount > 0 || str_contains($s->notes ?? '', 'Kas Besar');
 
                 if ($isFromKasBesar) {
                     $s->initial_cash_source = 'KAS_BESAR';
                     $effectiveKb = $kbAmount > 0 ? $kbAmount : (float)$s->initial_cash;
                     $expectedInitial = round($prevRemainingInDrawer + $effectiveKb, 2);
+
+                    // Auto-sync jika shift masih OPEN dan modal awal sebelumnya hanya mencatat nominal Kas Besar
+                    if ($s->status === 'OPEN' && $prevRemainingInDrawer > 0 && abs((float)$s->initial_cash - $effectiveKb) < 0.01) {
+                        $s->initial_cash = $expectedInitial;
+                        $s->save();
+                    }
+
                     $s->initial_cash_difference = round((float)$s->initial_cash - $expectedInitial, 2);
                 } elseif ($prevRemainingInDrawer == 0.0) {
                     // Kas fisik shift sebelumnya sudah habis disetor (sisa laci Rp 0).
@@ -739,7 +749,7 @@ class ShiftController extends Controller
         }
 
         $expData = $this->getShiftExpenses($shift);
-        $expectedCash = max(0, (float)$shift->initial_cash + $cashSales - $expData['cash_expenses']);
+        $expectedCash = round((float)$shift->initial_cash + $cashSales - $expData['cash_expenses'], 2);
 
         $prevShiftForActive = Shift::where('outlet_id', $shift->outlet_id)
             ->where('status', 'CLOSED')
@@ -783,12 +793,24 @@ class ShiftController extends Controller
                 ->where('type', 'OUT')
                 ->first();
             $kbAmount = $kbTx ? (float)$kbTx->amount : 0.0;
+            if ($kbAmount == 0.0 && preg_match('/(?:Tarik Kas Besar|diambil dari Kas Besar)[^\d]*Rp\s*([\d\.]+)/i', $shift->notes ?? '', $m)) {
+                $kbAmount = (float)str_replace('.', '', $m[1]);
+            }
             $isFromKasBesar = $kbAmount > 0 || str_contains($shift->notes ?? '', 'Kas Besar');
 
             if ($isFromKasBesar) {
                 $shift->initial_cash_source = 'KAS_BESAR';
                 $effectiveKb = $kbAmount > 0 ? $kbAmount : (float)$shift->initial_cash;
                 $expectedInitial = round($prevRemainingInDrawer + $effectiveKb, 2);
+
+                // Auto-sync jika shift masih OPEN dan modal awal sebelumnya hanya mencatat nominal Kas Besar
+                if ($shift->status === 'OPEN' && $prevRemainingInDrawer > 0 && abs((float)$shift->initial_cash - $effectiveKb) < 0.01) {
+                    $shift->initial_cash = $expectedInitial;
+                    $shift->save();
+                    // Recalculate expectedCash
+                    $expectedCash = round((float)$shift->initial_cash + $cashSales - $expData['cash_expenses'], 2);
+                }
+
                 $shift->initial_cash_difference = round((float)$shift->initial_cash - $expectedInitial, 2);
             } elseif ($prevRemainingInDrawer == 0.0) {
                 // Kas fisik shift sebelumnya sudah habis disetor (sisa laci Rp 0).
@@ -1152,17 +1174,60 @@ class ShiftController extends Controller
             }
         }
 
+        // Cek sisa kas fisik di laci dari shift sebelumnya untuk validasi serah-terima laci
+        $prevClosedShift = Shift::where('outlet_id', $outletId)
+            ->where('status', 'CLOSED')
+            ->orderByDesc('closed_at')
+            ->orderByDesc('id')
+            ->first();
+
+        $expectedDrawerCash = null;
+        $handoverDiff = 0.0;
+        if ($prevClosedShift && $prevClosedShift->closing_cash !== null) {
+            $prevClosing = (float)$prevClosedShift->closing_cash;
+            $depositStatus = $prevClosedShift->deposit_status;
+            $prevDepAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING')
+                ? (float)($prevClosedShift->deposit_amount ?? 0)
+                : 0.0;
+            if ($prevDepAmt == 0.0) {
+                $depTx = \App\Models\CashTransaction::where('shift_id', $prevClosedShift->id)
+                    ->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
+                    ->whereIn('status', ['APPROVED', 'PENDING'])
+                    ->sum('amount');
+                if ($depTx > 0) {
+                    $prevDepAmt = (float)$depTx;
+                }
+            }
+            $expectedDrawerCash = max(0.0, round($prevClosing - $prevDepAmt, 2));
+        }
+
         $initialCashSource = strtoupper(trim($data['initial_cash_source'] ?? 'DRAWER'));
         $initialCash = (float)($data['initial_cash'] ?? 0);
         $kasBesarAmount = (float)($data['kas_besar_amount'] ?? 0);
 
+        // Jika memilih ambil dari Kas Besar:
+        // Modal fisik total di laci kasir = Sisa kas laci sebelumnya + nominal ditarik dari Kas Besar
         if ($initialCashSource === 'KAS_BESAR') {
-            $initialCash = $kasBesarAmount > 0 ? $kasBesarAmount : $initialCash;
+            $prevRem = $expectedDrawerCash ?? 0.0;
+            $expectedTotalInitial = round($prevRem + $kasBesarAmount, 2);
+
+            // Jika frontend mengirim modal awal yang belum menambahkan sisa laci (hanya mengirim nominal kas besar atau 0)
+            if ($initialCash <= 0 || abs($initialCash - $kasBesarAmount) < 0.01) {
+                $initialCash = $expectedTotalInitial;
+            }
+
+            if ($expectedDrawerCash !== null) {
+                $handoverDiff = round($initialCash - $expectedTotalInitial, 2);
+            }
+        } elseif ($initialCashSource === 'DRAWER') {
+            if ($expectedDrawerCash !== null) {
+                $handoverDiff = round($initialCash - $expectedDrawerCash, 2);
+            }
         }
 
         // VALIDASI PERSETUJUAN MANAGER ATAU OWNER JIKA MENGAMBIL DARI KAS BESAR
         $approverUser = null;
-        if ($initialCashSource === 'KAS_BESAR' && $initialCash > 0) {
+        if ($initialCashSource === 'KAS_BESAR' && ($kasBesarAmount > 0 || $initialCash > 0)) {
             $isCallerOwnerOrManager = $user->isOwnerOrManager();
 
             if ($isCallerOwnerOrManager) {
@@ -1196,39 +1261,10 @@ class ShiftController extends Controller
             }
         }
 
-        // Cek sisa kas fisik di laci dari shift sebelumnya untuk validasi serah-terima laci
-        $prevClosedShift = Shift::where('outlet_id', $outletId)
-            ->where('status', 'CLOSED')
-            ->orderByDesc('closed_at')
-            ->orderByDesc('id')
-            ->first();
-
-        $expectedDrawerCash = null;
-        $handoverDiff = 0.0;
-        if ($prevClosedShift && $prevClosedShift->closing_cash !== null) {
-            $prevClosing = (float)$prevClosedShift->closing_cash;
-            $depositStatus = $prevClosedShift->deposit_status;
-            $prevDepAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING')
-                ? (float)($prevClosedShift->deposit_amount ?? 0)
-                : 0.0;
-            if ($prevDepAmt == 0.0) {
-                $depTx = \App\Models\CashTransaction::where('shift_id', $prevClosedShift->id)
-                    ->whereIn('category', ['SETORAN_KASIR', 'CASH_DEPOSIT'])
-                    ->whereIn('status', ['APPROVED', 'PENDING'])
-                    ->sum('amount');
-                if ($depTx > 0) {
-                    $prevDepAmt = (float)$depTx;
-                }
-            }
-            $expectedDrawerCash = max(0.0, round($prevClosing - $prevDepAmt, 2));
-            if ($initialCashSource === 'DRAWER') {
-                $handoverDiff = round($initialCash - $expectedDrawerCash, 2);
-            }
-        }
-
         $shiftNotes = $data['notes'] ?? null;
-        if ($initialCashSource === 'KAS_BESAR' && $initialCash > 0 && $approverUser) {
-            $kbNote = "Modal awal Rp " . number_format($initialCash, 0, ',', '.') . " diambil dari Kas Besar (Disetujui: {$approverUser->name} - {$approverUser->role_label}).";
+        if ($initialCashSource === 'KAS_BESAR' && $kasBesarAmount > 0 && $approverUser) {
+            $prevDrawerText = ($expectedDrawerCash ?? 0) > 0 ? " (Sisa laci lalu: Rp " . number_format($expectedDrawerCash, 0, ',', '.') . " + Kas Besar: Rp " . number_format($kasBesarAmount, 0, ',', '.') . " = Total Rp " . number_format($initialCash, 0, ',', '.') . ")" : "";
+            $kbNote = "Modal awal Rp " . number_format($initialCash, 0, ',', '.') . "{$prevDrawerText} [Tarik Kas Besar Rp " . number_format($kasBesarAmount, 0, ',', '.') . " Disetujui: {$approverUser->name} - {$approverUser->role_label}].";
             $shiftNotes = $shiftNotes ? ($shiftNotes . " | " . $kbNote) : $kbNote;
         } elseif ($initialCashSource === 'DRAWER' && $expectedDrawerCash !== null && abs($handoverDiff) >= 0.01) {
             $diffFormatted = $handoverDiff > 0
@@ -1284,9 +1320,10 @@ class ShiftController extends Controller
             } catch (\Throwable $e) {
                 \Log::error("Failed to post journal for SALDO_AWAL shift #{$shift->id}: " . $e->getMessage());
             }
-        } elseif ($initialCashSource === 'KAS_BESAR' && $initialCash > 0 && $approverUser) {
+        } elseif ($initialCashSource === 'KAS_BESAR' && ($kasBesarAmount > 0 || $initialCash > 0) && $approverUser) {
             // 2. Shift selanjutnya: Jika memilih ambil uang dari Kas Besar, buat transaksi kas & jurnal disetujui Manager/Owner
             try {
+                $actualKbAmount = $kasBesarAmount > 0 ? $kasBesarAmount : $initialCash;
                 $ct = \App\Models\CashTransaction::create([
                     'business_id'    => $businessId,
                     'outlet_id'      => $outletId,
@@ -1298,10 +1335,10 @@ class ShiftController extends Controller
                     'activity_type'  => 'OPERATING',
                     'account'        => 'KAS_BESAR',
                     'payment_method' => 'CASH',
-                    'amount'         => $initialCash,
+                    'amount'         => $actualKbAmount,
                     'date'           => now()->toDateString(),
                     'status'         => 'APPROVED',
-                    'notes'          => "Pengambilan modal awal kasir dari Kas Besar untuk {$shift->shift_name}. Disetujui oleh: {$approverUser->name} ({$approverUser->role_label})",
+                    'notes'          => "Pengambilan modal awal kasir dari Kas Besar untuk {$shift->shift_name} sebesar Rp " . number_format($actualKbAmount, 0, ',', '.') . " (Total modal di laci kasir: Rp " . number_format($initialCash, 0, ',', '.') . "). Disetujui oleh: {$approverUser->name} ({$approverUser->role_label})",
                     'user_id'        => $user->id,
                     'created_by'     => $user->id,
                     'approved_by'    => $approverUser->id,
@@ -1520,7 +1557,7 @@ class ShiftController extends Controller
         }
 
         $expData = $this->getShiftExpenses($shift);
-        $expectedCash = max(0, (float)$shift->initial_cash + $cashSales - $expData['cash_expenses']);
+        $expectedCash = round((float)$shift->initial_cash + $cashSales - $expData['cash_expenses'], 2);
 
         // Group actual menus sold (exclude dummy equal split installment rows, include SPLIT_CLOSED actual items)
         $actualMenuTransactions = $shift->transactions()
@@ -1901,7 +1938,7 @@ class ShiftController extends Controller
         }
 
         $expData = $this->getShiftExpenses($shift);
-        $expectedCash = max(0, (float)$shift->initial_cash + $cashSales - $expData['cash_expenses']);
+        $expectedCash = round((float)$shift->initial_cash + $cashSales - $expData['cash_expenses'], 2);
 
         // Group actual menus sold
         $actualMenuTransactions = $shift->transactions()

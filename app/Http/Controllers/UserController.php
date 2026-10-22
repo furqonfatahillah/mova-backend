@@ -3,9 +3,11 @@
 namespace App\Http\Controllers;
 
 use App\Models\User;
+use App\Models\UserOld;
 use App\Models\Role;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\DB;
 
 class UserController extends Controller
 {
@@ -392,13 +394,85 @@ class UserController extends Controller
             return response()->json(['message' => 'Anda tidak dapat menghapus akun Anda sendiri.'], 422);
         }
 
-        if ($user->isOwnerWebsite() || $user->isSuperadminPlatform() || $user->isOwnerBisnis()) {
-            return response()->json(['message' => 'Akun Owner utama tidak dapat dihapus.'], 422);
+        // Akun Owner Website utama absolut tidak dapat dihapus
+        if ($user->isOwnerWebsite()) {
+            return response()->json(['message' => 'Akun Owner Website platform tidak dapat dihapus.'], 422);
         }
 
-        $user->tokens()->delete();
-        $user->delete();
+        // Jika bukan platform admin dan mencoba menghapus superadmin atau owner bisnis
+        if (!$currentUser->isPlatformAdmin() && ($user->isSuperadminPlatform() || $user->isOwnerBisnis())) {
+            return response()->json(['message' => 'Hanya Superadmin Platform yang dapat menghapus akun Owner Bisnis.'], 403);
+        }
 
-        return response()->json(['message' => 'Pengguna berhasil dihapus.']);
+        $archive = null;
+        DB::transaction(function () use ($user, $currentUser, $request, &$archive) {
+            // 1. Salin snapshot data user ke tabel users_old agar riwayat masa lalu tetap aman
+            $archive = UserOld::create([
+                'original_user_id'    => $user->id,
+                'business_id'         => $user->business_id,
+                'outlet_id'           => $user->outlet_id,
+                'role_id'             => $user->role_id,
+                'role'                => $user->role,
+                'name'                => $user->name,
+                'email'               => $user->email,
+                'phone'               => $user->phone ?? null,
+                'status'              => $user->status,
+                'referral_code'       => $user->referral_code ?? null,
+                'snapshot_data'       => $user->toArray(),
+                'deleted_by'          => $currentUser->id,
+                'deletion_reason'     => $request->input('reason', 'Dihapus oleh admin/superadmin'),
+                'original_created_at' => $user->created_at,
+                'deleted_at'          => now(),
+            ]);
+
+            // 2. Cabut semua sesi/token aktif pengguna
+            $user->tokens()->delete();
+
+            // 3. Rename email unik & kode referral agar tidak menabrak constraint unik jika didaftarkan kembali
+            $originalEmail = $user->email;
+            $user->email = $originalEmail . '.deleted_' . time() . '_' . $user->id;
+            if ($user->referral_code) {
+                $user->referral_code = $user->referral_code . '_DEL_' . time();
+            }
+            $user->status = 'suspended';
+            $user->save();
+
+            // 4. Lakukan Soft Delete (mengisi kolom deleted_at pada tabel users)
+            $user->delete();
+        });
+
+        return response()->json([
+            'message'    => "Pengguna {$user->name} berhasil dihapus dan seluruh datanya diarsipkan ke riwayat (users_old).",
+            'archive_id' => $archive->id ?? null,
+        ]);
+    }
+
+    /**
+     * Menampilkan daftar arsip pengguna yang telah dihapus (users_old)
+     */
+    public function archives(Request $request)
+    {
+        $currentUser = $request->user();
+        if (!$currentUser->isPlatformAdmin() && !$currentUser->isOwnerBisnis()) {
+            return response()->json(['message' => 'Anda tidak memiliki wewenang melihat arsip pengguna.'], 403);
+        }
+
+        $query = UserOld::with(['deletedBy', 'business', 'outlet'])
+            ->orderBy('deleted_at', 'desc');
+
+        if (!$currentUser->isPlatformAdmin()) {
+            $query->where('business_id', $currentUser->business_id);
+        }
+
+        if ($request->filled('search')) {
+            $s = trim($request->search);
+            $query->where(function ($q) use ($s) {
+                $q->where('name', 'like', "%{$s}%")
+                  ->orWhere('email', 'like', "%{$s}%")
+                  ->orWhere('role', 'like', "%{$s}%");
+            });
+        }
+
+        return response()->json($query->paginate($request->input('per_page', 20)));
     }
 }

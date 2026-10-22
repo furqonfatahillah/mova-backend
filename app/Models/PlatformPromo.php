@@ -18,6 +18,7 @@ class PlatformPromo extends Model
         'min_order_amount',
         'max_discount_amount',
         'default_usage_limit',
+        'default_subsidy_amount',
         'start_date',
         'end_date',
         'banner_color',
@@ -28,13 +29,14 @@ class PlatformPromo extends Model
     ];
 
     protected $casts = [
-        'value'               => 'float',
-        'min_order_amount'    => 'float',
-        'max_discount_amount' => 'float',
-        'default_usage_limit' => 'integer',
-        'is_active'           => 'boolean',
-        'start_date'          => 'date:Y-m-d',
-        'end_date'            => 'date:Y-m-d',
+        'value'                  => 'float',
+        'min_order_amount'       => 'float',
+        'max_discount_amount'    => 'float',
+        'default_usage_limit'    => 'integer',
+        'default_subsidy_amount' => 'float',
+        'is_active'              => 'boolean',
+        'start_date'             => 'date:Y-m-d',
+        'end_date'               => 'date:Y-m-d',
     ];
 
     protected $appends = [

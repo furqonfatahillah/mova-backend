@@ -84,13 +84,14 @@ class CashTransaction extends Model
             'LOAN_REPAYMENT'    => ['label' => 'Pembayaran Pokok Pinjaman', 'activity' => 'FINANCING', 'default_type' => 'OUT'],
 
             // OPERATING & SETORAN
-            'SETORAN_KASIR'        => ['label' => 'Setoran Uang Kasir ke Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'IN'],
-            'SETOR_KAS_APLIKASI'   => ['label' => 'Setoran Kas Aplikasi (QRIS) ke Bank', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
-            'TARIK_MODAL_KASIR'    => ['label' => 'Ambil Modal Kasir dari Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
-            'SELISIH_SERAH_TERIMA' => ['label' => 'Selisih Serah Terima Kas Laci', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
-            'SUPPLIER_PURCHASE'    => ['label' => 'Belanja Bahan Baku Langsung', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
-            'OTHER_INCOME'         => ['label' => 'Pendapatan Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'IN'],
-            'OTHER_EXPENSE'        => ['label' => 'Biaya Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'SETORAN_KASIR'           => ['label' => 'Setoran Uang Kasir ke Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'IN'],
+            'SETOR_KAS_APLIKASI'      => ['label' => 'Setoran Kas Aplikasi (QRIS) ke Bank', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'SETOR_KAS_BESAR_KE_BANK' => ['label' => 'Setoran Kas Besar ke Rekening Bank', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'TARIK_MODAL_KASIR'       => ['label' => 'Ambil Modal Kasir dari Kas Besar', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'SELISIH_SERAH_TERIMA'    => ['label' => 'Selisih Serah Terima Kas Laci', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'SUPPLIER_PURCHASE'       => ['label' => 'Belanja Bahan Baku Langsung', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
+            'OTHER_INCOME'            => ['label' => 'Pendapatan Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'IN'],
+            'OTHER_EXPENSE'           => ['label' => 'Biaya Kas Operasional Lain', 'activity' => 'OPERATING', 'default_type' => 'OUT'],
         ];
     }
 
@@ -141,12 +142,17 @@ class CashTransaction extends Model
 
     public function approver()
     {
-        return $this->belongsTo(User::class, 'approved_by');
+        return $this->belongsTo(User::class, 'approved_by')->withTrashed();
+    }
+
+    public function approvedBy()
+    {
+        return $this->belongsTo(User::class, 'approved_by')->withTrashed();
     }
 
     public function approvedByUser()
     {
-        return $this->belongsTo(User::class, 'approved_by');
+        return $this->belongsTo(User::class, 'approved_by')->withTrashed();
     }
 
     public function getCategoryLabelAttribute(): string

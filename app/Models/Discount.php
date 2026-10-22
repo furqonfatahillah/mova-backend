@@ -77,6 +77,11 @@ class Discount extends Model
         return $this->belongsTo(PlatformPromo::class, 'platform_promo_id');
     }
 
+    public function platformPromoBusiness()
+    {
+        return $this->hasOne(PlatformPromoBusiness::class, 'discount_id');
+    }
+
     public function outlet()
     {
         return $this->belongsTo(Outlet::class);

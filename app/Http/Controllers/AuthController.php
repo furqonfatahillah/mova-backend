@@ -5,6 +5,8 @@ namespace App\Http\Controllers;
 use App\Models\Business;
 use App\Models\Outlet;
 use App\Models\User;
+use App\Models\ReferralCode;
+use App\Models\ReferralUsage;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
@@ -33,19 +35,44 @@ class AuthController extends Controller
             ]);
 
             // Validate referral code if provided
-            $referrer = null;
+            $refCodeObj = null;
+            $referrerUser = null;
             $cleanReferralCode = null;
             if (!empty($data['referral_code'])) {
                 $cleanReferralCode = strtoupper(trim($data['referral_code']));
-                $referrer = User::where('referral_code', $cleanReferralCode)->first();
-                if (!$referrer) {
-                    throw ValidationException::withMessages([
-                        'referral_code' => ["Kode referral '{$cleanReferralCode}' tidak ditemukan atau tidak valid."],
-                    ]);
+
+                // 1. Check in Superadmin generated referral_codes table
+                $refCodeObj = ReferralCode::where('code', $cleanReferralCode)->first();
+                if ($refCodeObj) {
+                    if (!$refCodeObj->is_active) {
+                        throw ValidationException::withMessages([
+                            'referral_code' => ["Kode referral '{$cleanReferralCode}' saat ini dinonaktifkan."],
+                        ]);
+                    }
+                    if ($refCodeObj->expires_at && $refCodeObj->expires_at->isPast()) {
+                        throw ValidationException::withMessages([
+                            'referral_code' => ["Kode referral '{$cleanReferralCode}' telah kedaluwarsa."],
+                        ]);
+                    }
+                    if ($refCodeObj->max_uses !== null && $refCodeObj->times_used >= $refCodeObj->max_uses) {
+                        throw ValidationException::withMessages([
+                            'referral_code' => ["Kuota penggunaan kode referral '{$cleanReferralCode}' telah habis."],
+                        ]);
+                    }
+                } else {
+                    // 2. Check legacy user referral code for backward compatibility
+                    $referrerUser = User::where('referral_code', $cleanReferralCode)->first();
+                    if (!$referrerUser) {
+                        throw ValidationException::withMessages([
+                            'referral_code' => ["Kode referral '{$cleanReferralCode}' tidak ditemukan atau tidak valid."],
+                        ]);
+                    }
                 }
             }
 
-            $result = DB::transaction(function () use ($data, $referrer, $cleanReferralCode) {
+            $ipAddress = $request->ip();
+
+            $result = DB::transaction(function () use ($data, $refCodeObj, $referrerUser, $cleanReferralCode, $ipAddress) {
                 $slug = Str::slug($data['business_name']);
                 $origSlug = $slug;
                 $c = 1;
@@ -54,20 +81,24 @@ class AuthController extends Controller
                     $c++;
                 }
 
-                // 1. Buat Bisnis / Tenant
+                // 1. Buat Bisnis / Tenant (Langsung Aktif dengan Mode Unlimited Gratis)
                 $business = Business::create([
-                    'name'               => $data['business_name'],
-                    'slug'               => $slug,
-                    'owner_name'         => $data['name'],
-                    'email'              => $data['email'],
-                    'phone'              => $data['business_phone'] ?? null,
-                    'address'            => $data['business_address'] ?? null,
-                    'referred_by_id'     => $referrer?->id,
-                    'referral_code_used' => $cleanReferralCode,
-                    'package_type'       => 'pro',
-                    'max_outlets'        => 5,
-                    'status'             => 'pending', // Wajib diverifikasi oleh Superadmin Platform
-                    'expires_at'         => now()->addMonths(1), // Masa trial 30 hari disiapkan
+                    'name'                  => $data['business_name'],
+                    'slug'                  => $slug,
+                    'owner_name'            => $data['name'],
+                    'email'                 => $data['email'],
+                    'phone'                 => $data['business_phone'] ?? null,
+                    'address'               => $data['business_address'] ?? null,
+                    'referred_by_id'        => $refCodeObj?->created_by ?? $referrerUser?->id,
+                    'referral_code_id'      => $refCodeObj?->id,
+                    'referral_code_used'    => $cleanReferralCode,
+                    'package_type'          => 'unlimited',
+                    'max_outlets'           => 10,
+                    'status'                => 'active', // Langsung Aktif tanpa perlu approval
+                    'is_unlimited_coins'    => true,     // Mode Unlimited Gratis
+                    'coins_per_transaction' => 0,        // Bebas potong koin
+                    'coin_balance'          => 10000,
+                    'expires_at'            => null,     // Gratis permanen tanpa batas waktu
                 ]);
 
                 // 2. Buat Cabang Pertama untuk Bisnis ini
@@ -86,7 +117,7 @@ class AuthController extends Controller
                     'active'      => true,
                 ]);
 
-                // 3. Buat User Owner Bisnis (Status Pending Menunggu Verifikasi Superadmin)
+                // 3. Buat User Owner Bisnis (Langsung Aktif)
                 $user = User::create([
                     'business_id'    => $business->id,
                     'outlet_id'      => $outlet->id,
@@ -94,26 +125,49 @@ class AuthController extends Controller
                     'email'          => $data['email'],
                     'password'       => Hash::make($data['password']),
                     'role'           => 'owner_bisnis',
-                    'status'         => 'pending',
-                    'referred_by_id' => $referrer?->id,
-                    'approved_at'    => null,
+                    'status'         => 'active', // Langsung Aktif
+                    'referred_by_id' => $refCodeObj?->created_by ?? $referrerUser?->id,
+                    'approved_at'    => now(),
                 ]);
 
                 $business->update(['created_by' => $user->id]);
                 $outlet->update(['created_by' => $user->id]);
 
+                // 4. Inisialisasi Chart of Accounts (COA) untuk bisnis baru
+                \App\Models\Account::seedForBusiness((int)$business->id);
+
+                // 5. Catat penggunaan kode referral dan increment counter
+                if ($refCodeObj) {
+                    $refCodeObj->increment('times_used');
+
+                    ReferralUsage::create([
+                        'referral_code_id' => $refCodeObj->id,
+                        'business_id'      => $business->id,
+                        'user_id'          => $user->id,
+                        'registered_at'    => now(),
+                        'ip_address'       => $ipAddress,
+                        'notes'            => "Pendaftaran bisnis {$business->name} oleh {$user->name}",
+                    ]);
+                }
+
+                // 6. Generate Sanctum Token untuk Langsung Login
+                $token = $user->createToken('pos_auth_token')->plainTextToken;
+
                 return [
+                    'token'    => $token,
                     'user'     => $user->load(['outlet', 'business', 'referredBy']),
-                    'business' => $business->load(['referredBy']),
+                    'business' => $business->load(['referredBy', 'referralCode']),
                     'outlet'   => $outlet,
                 ];
             });
 
             return response()->json([
-                'message'  => "Pendaftaran bisnis '{$result['business']->name}' berhasil! Akun bisnis Anda sedang menunggu verifikasi & persetujuan dari Superadmin Platform sebelum dapat digunakan.",
-                'status'   => 'pending',
+                'message'  => "Pendaftaran bisnis '{$result['business']->name}' berhasil! Akun Anda aktif secara otomatis dengan Mode Unlimited Gratis.",
+                'status'   => 'active',
+                'token'    => $result['token'],
                 'user'     => $result['user'],
                 'business' => $result['business'],
+                'outlet'   => $result['outlet'],
             ], 201);
         }
 
@@ -142,15 +196,18 @@ class AuthController extends Controller
             'email'       => $data['email'],
             'password'    => Hash::make($data['password']),
             'role'        => $role,
-            'status'      => 'pending',
+            'status'      => 'active', // Langsung Aktif tanpa pending
+            'approved_at' => now(),
         ]);
 
-        $approverRoleText = 'Owner Bisnis';
+        $token = $user->createToken('pos_auth_token')->plainTextToken;
 
         return response()->json([
-            'message' => "Pendaftaran berhasil! Akun Anda sedang menunggu persetujuan (approval) dari {$approverRoleText} sebelum dapat digunakan untuk masuk.",
-            'status'  => 'pending',
+            'message' => "Pendaftaran berhasil! Akun Anda langsung aktif dan dapat langsung digunakan.",
+            'status'  => 'active',
+            'token'   => $token,
             'user'    => $user->load(['outlet', 'business']),
+            'outlet'  => $user->outlet,
         ], 201);
     }
 

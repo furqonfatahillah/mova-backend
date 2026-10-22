@@ -20,6 +20,7 @@ class Business extends Model
         'max_outlets',
         'status',
         'referred_by_id',
+        'referral_code_id',
         'referral_code_used',
         'coin_balance',
         'coins_per_transaction',
@@ -46,6 +47,7 @@ class Business extends Model
         'changed_by_name',
         'is_active',
         'is_expired',
+        'is_demo',
         'is_unlimited',
         'is_unlimited_plan',
         'is_premium_plan',
@@ -67,8 +69,17 @@ class Business extends Model
         return false;
     }
 
+    public function getIsDemoAttribute(): bool
+    {
+        return strtolower($this->package_type ?? '') === 'demo';
+    }
+
     public function getIsUnlimitedAttribute(): bool
     {
+        if ($this->is_demo) {
+            return true;
+        }
+
         // If a business has an active coin cost per transaction (> 0), it is definitely NOT unlimited.
         if (isset($this->coins_per_transaction) && (float)$this->coins_per_transaction > 0) {
             return false;
@@ -88,6 +99,9 @@ class Business extends Model
 
     public function getIsPremiumPlanAttribute(): bool
     {
+        if ($this->is_demo) {
+            return true;
+        }
         return !$this->is_unlimited;
     }
 
@@ -130,6 +144,11 @@ class Business extends Model
     public function getReferredByNameAttribute(): ?string
     {
         return $this->referredBy?->name;
+    }
+
+    public function referralCode()
+    {
+        return $this->belongsTo(ReferralCode::class, 'referral_code_id');
     }
 
     public function outlets()

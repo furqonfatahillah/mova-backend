@@ -37,8 +37,20 @@ use App\Http\Controllers\PurchaseReportController;
 use App\Http\Controllers\DataResetController;
 use App\Http\Controllers\AccountController;
 use App\Http\Controllers\KasAplikasiController;
+use App\Http\Controllers\KasBesarController;
 use App\Http\Controllers\AuthorityController;
 use App\Http\Controllers\PlatformPromoController;
+use App\Http\Controllers\ReferralCodeController;
+use App\Http\Controllers\CoinTopupRequestController;
+
+// Service root health check
+Route::get('/', function () {
+    return response()->json([
+        'status' => 'ok',
+        'service' => 'MOVA POS API Service',
+        'timestamp' => now()->toIso8601String(),
+    ]);
+});
 
 // Public auth & utility routes
 Route::post('/register', [AuthController::class, 'register']);
@@ -48,6 +60,8 @@ Route::post('/verify-reset-code',   [AuthController::class, 'verifyResetCode']);
 Route::post('/reset-password',      [AuthController::class, 'resetPassword']);
 Route::get('/public/businesses', [BusinessController::class, 'publicList']);
 Route::get('/public/outlets', [OutletController::class, 'publicList']);
+Route::get('/public/referral-codes/validate/{code}', [ReferralCodeController::class, 'validatePublicCode']);
+Route::get('/public/platform/bank-info', [CoinTopupRequestController::class, 'getBankAndRateInfo']);
 Route::post('/payment-gateways/midtrans/webhook', [PaymentConfigurationController::class, 'handleMidtransWebhook']);
 
 // Storage media handler for API prefix
@@ -75,6 +89,8 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/businesses/{business}/reject', [BusinessController::class, 'reject']);
     Route::get('/my-business',       [BusinessController::class, 'myBusiness']);
     Route::get('/my-business/coins', [BusinessController::class, 'myCoins']);
+    Route::get('/my-business/coin-topup-requests', [CoinTopupRequestController::class, 'myRequests']);
+    Route::post('/my-business/coin-topup-requests', [CoinTopupRequestController::class, 'submitRequest']);
     Route::put('/my-business',       [BusinessController::class, 'updateMyBusiness']);
 
     // Master Tables (ID-based Lookup)
@@ -88,6 +104,11 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/platform/coins/topup',   [CoinPlatformController::class, 'topUp']);
     Route::put('/platform/coins/rate',     [CoinPlatformController::class, 'updateRate']);
     Route::get('/platform/coins/history',  [CoinPlatformController::class, 'history']);
+    Route::get('/platform/coin-topup-requests',           [CoinTopupRequestController::class, 'index']);
+    Route::post('/platform/coin-topup-requests/{id}/approve', [CoinTopupRequestController::class, 'approve']);
+    Route::post('/platform/coin-topup-requests/{id}/reject',  [CoinTopupRequestController::class, 'reject']);
+    Route::get('/platform/coin-conversion-rate',          [CoinTopupRequestController::class, 'getBankAndRateInfo']);
+    Route::put('/platform/coin-conversion-rate',          [CoinTopupRequestController::class, 'updateConversionRate']);
 
     // SaaS Platform Promo Distribution (Website Owner / Superadmin Platform)
     Route::get('/platform/promos',                             [PlatformPromoController::class, 'index']);
@@ -100,10 +121,26 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::post('/platform/promos/{platformPromo}/distribute', [PlatformPromoController::class, 'distribute']);
     Route::put('/platform/promos/{platformPromo}/businesses/{business}', [PlatformPromoController::class, 'updateBusinessDistribution']);
     Route::delete('/platform/promos/{platformPromo}/businesses/{business}', [PlatformPromoController::class, 'revokeBusiness']);
+    Route::get('/platform/promos/{platformPromo}/businesses/{business}/payments',              [PlatformPromoController::class, 'listBusinessPayments']);
+    Route::post('/platform/promos/{platformPromo}/businesses/{business}/payments',             [PlatformPromoController::class, 'storeBusinessPayment']);
+    Route::delete('/platform/promos/{platformPromo}/businesses/{business}/payments/{payment}', [PlatformPromoController::class, 'destroyBusinessPayment']);
+
+    // Tenant / Owner Bisnis: View & Approve/Reject Platform Promos
     Route::get('/my-business/platform-promos',                 [PlatformPromoController::class, 'myPromos']);
+    Route::post('/my-business/platform-promos/{id}/accept',    [PlatformPromoController::class, 'acceptPromo']);
+    Route::post('/my-business/platform-promos/{id}/reject',    [PlatformPromoController::class, 'rejectPromo']);
+
+    // SaaS Platform Referral Codes & Usage Tracking (Website Owner / Superadmin Platform)
+    Route::apiResource('platform/referral-codes', ReferralCodeController::class);
+    Route::patch('/platform/referral-codes/{referralCode}/toggle-active', [ReferralCodeController::class, 'toggleActive']);
+    Route::get('/platform/referral-codes/{referralCode}/payouts', [ReferralCodeController::class, 'payouts']);
+    Route::post('/platform/referral-codes/{referralCode}/payout', [ReferralCodeController::class, 'storePayout']);
+    Route::delete('/platform/referral-codes/payouts/{payout}', [ReferralCodeController::class, 'destroyPayout']);
 
     // User Management & Approval Workflow
     Route::get('/roles',                   [UserController::class, 'roles']);
+    Route::get('/users/archives',          [UserController::class, 'archives']);
+    Route::get('/users-old',               [UserController::class, 'archives']);
     Route::get('/users',                   [UserController::class, 'index']);
     Route::post('/users',                  [UserController::class, 'store']);
     Route::get('/users/{user}',            [UserController::class, 'show']);
@@ -344,6 +381,10 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     Route::get('/kas-aplikasi/summary',     [KasAplikasiController::class, 'summary']);
     Route::post('/kas-aplikasi/setor',      [KasAplikasiController::class, 'deposit']);
     Route::post('/kas-aplikasi/upload-qris',[KasAplikasiController::class, 'uploadQrisImage']);
+
+    // Kas Besar (Brankas) & Setor ke Bank (One-way only)
+    Route::get('/kas-besar/summary',        [KasBesarController::class, 'summary']);
+    Route::post('/kas-besar/setor-bank',     [KasBesarController::class, 'depositToBank']);
 
     // Rekening Bank & Payment Gateway Settings (Midtrans & Xendit)
     Route::get('/bank-accounts',                    [PaymentConfigurationController::class, 'indexBankAccounts']);

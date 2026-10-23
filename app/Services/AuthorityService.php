@@ -19,6 +19,11 @@ class AuthorityService
                     'label'       => 'Akses Kasir POS',
                     'description' => 'Membuka antarmuka kasir dan memproses pesanan / pembayaran penjualan',
                 ],
+                'pos_promo' => [
+                    'key'         => 'pos_promo',
+                    'label'       => 'Akses Promo & Voucher Kasir',
+                    'description' => 'Menerapkan promo diskon dan voucher promo di keranjang pesanan kasir',
+                ],
                 'pos_custom_discount' => [
                     'key'         => 'pos_custom_discount',
                     'label'       => 'Diskon Manual Kasir',
@@ -96,6 +101,7 @@ class AuthorityService
                     'key'         => 'stock_batch_prep',
                     'label'       => 'Produksi Dapur (Batch Prep)',
                     'description' => 'Mencatat olahan setengah jadi (sirup, saus, adonan prep)',
+                    'is_premium'  => true,
                 ],
                 'stock_card_view' => [
                     'key'         => 'stock_card_view',
@@ -114,6 +120,7 @@ class AuthorityService
                     'key'         => 'master_menu',
                     'label'       => 'Master Menu, Resep & Harga',
                     'description' => 'Menambah dan mengedit produk, formula resep, varian harga & bundling',
+                    'is_premium'  => false,
                 ],
                 'master_ingredient' => [
                     'key'         => 'master_ingredient',
@@ -139,11 +146,13 @@ class AuthorityService
                     'key'         => 'master_outlet',
                     'label'       => 'Profil Cabang Outlet',
                     'description' => 'Melihat dan memperbarui informasi identitas cabang outlet',
+                    'is_premium'  => false,
                 ],
                 'master_payment' => [
                     'key'         => 'master_payment',
                     'label'       => 'Pengaturan Rekening & QRIS',
                     'description' => 'Mengatur rekening bank penerima, QRIS statis, dan payment gateway',
+                    'is_premium'  => false,
                 ],
             ],
         ],
@@ -167,6 +176,7 @@ class AuthorityService
                     'key'         => 'finance_cash_flow',
                     'label'       => 'Laporan Arus Kas (Cash Flow)',
                     'description' => 'Melihat laporan arus kas masuk dan kas keluar operasional & pendanaan',
+                    'is_premium'  => true,
                 ],
                 'finance_kas_aplikasi' => [
                     'key'         => 'finance_kas_aplikasi',
@@ -177,11 +187,13 @@ class AuthorityService
                     'key'         => 'finance_neraca',
                     'label'       => 'Laporan Neraca (Balance Sheet)',
                     'description' => 'Melihat posisi saldo aset, kewajiban hutang, dan modal ekuitas usaha',
+                    'is_premium'  => true,
                 ],
                 'finance_journal' => [
                     'key'         => 'finance_journal',
                     'label'       => 'Jurnal Umum & Buku Besar Akuntansi',
                     'description' => 'Melihat pembukuan debit-kredit jurnal umum dan audit jurnal abnormal',
+                    'is_premium'  => true,
                 ],
                 'finance_payables' => [
                     'key'         => 'finance_payables',
@@ -205,11 +217,13 @@ class AuthorityService
                     'key'         => 'analytics_dashboard',
                     'label'       => 'Dashboard Metrik Bisnis',
                     'description' => 'Melihat grafik pendapatan, tren omset, dan ringkasan eksekutif cabang',
+                    'is_premium'  => false,
                 ],
                 'report_sales' => [
                     'key'         => 'report_sales',
                     'label'       => 'Laporan Penjualan Lengkap',
                     'description' => 'Melihat rincian seluruh riwayat penjualan dan ekspor ke Excel/PDF',
+                    'is_premium'  => false,
                 ],
                 'report_purchase' => [
                     'key'         => 'report_purchase',
@@ -220,16 +234,19 @@ class AuthorityService
                     'key'         => 'analytics_variance',
                     'label'       => 'Analisis Varian Bahan & Menu',
                     'description' => 'Mendeteksi selisih pemakaian bahan nyata di lapangan vs hitungan resep',
+                    'is_premium'  => true,
                 ],
                 'analytics_profitability' => [
                     'key'         => 'analytics_profitability',
                     'label'       => 'Profitability & Margin Engineering',
                     'description' => 'Melihat klasifikasi menu Stars, Plowhorses, Puzzles, dan margin laba',
+                    'is_premium'  => true,
                 ],
                 'analytics_root_cause' => [
                     'key'         => 'analytics_root_cause',
                     'label'       => 'Root Cause Analysis',
                     'description' => 'Menganalisis akar penyebab kebocoran biaya dan bahan',
+                    'is_premium'  => true,
                 ],
             ],
         ],
@@ -243,6 +260,7 @@ class AuthorityService
                     'key'         => 'manage_users',
                     'label'       => 'Kelola Akun Pegawai',
                     'description' => 'Menambah akun baru, mengedit data pegawai, dan menyetujui akun pending',
+                    'is_premium'  => false,
                 ],
                 'manage_authority' => [
                     'key'         => 'manage_authority',
@@ -318,6 +336,7 @@ class AuthorityService
                 'permissions' => [
                     // POS
                     'pos_checkout',
+                    'pos_promo',
                     'pos_custom_discount',
                     'pos_open_bill',
                     'pos_split_bill',

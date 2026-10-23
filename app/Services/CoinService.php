@@ -89,7 +89,7 @@ class CoinService
 
             $isUnlimited = (bool)$business->is_unlimited;
             if ($isUnlimited) {
-                // Mode Unlimited / Demo: Transaksi tidak memotong koin sama sekali
+                // Mode Unlimited: Transaksi tidak memotong koin sama sekali
                 return null;
             }
 
@@ -184,22 +184,22 @@ class CoinService
         $business = Business::findOrFail($businessId);
         $business->coins_per_transaction = $coinsPerTx;
 
-        if ($packageType === 'demo' || (strtolower($business->package_type ?? '') === 'demo' && $packageType === null && $isUnlimited !== false)) {
-            $business->package_type = 'demo';
-            $business->is_unlimited_coins = true;
-            $business->coins_per_transaction = 0;
-        } elseif ($packageType) {
+        if ($packageType) {
             $business->package_type = $packageType;
-            $business->is_unlimited_coins = ($packageType === 'unlimited' || $packageType === 'demo') ? true : (bool)$isUnlimited;
-            if ($packageType === 'unlimited' || $packageType === 'demo') {
+            $business->is_unlimited_coins = ($packageType === 'unlimited') ? true : (bool)$isUnlimited;
+            if ($packageType === 'unlimited') {
                 $business->coins_per_transaction = 0;
             }
         } elseif ($isUnlimited !== null) {
             $business->is_unlimited_coins = $isUnlimited;
             $business->package_type = $isUnlimited ? 'unlimited' : 'premium';
+            if ($isUnlimited) {
+                $business->coins_per_transaction = 0;
+            }
         } elseif ($coinsPerTx == 0.0) {
             $business->is_unlimited_coins = true;
             $business->package_type = 'unlimited';
+            $business->coins_per_transaction = 0;
         } else {
             $business->is_unlimited_coins = false;
             $business->package_type = 'premium';

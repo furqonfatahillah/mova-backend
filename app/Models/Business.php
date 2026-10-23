@@ -64,6 +64,9 @@ class Business extends Model
 
     public function getIsExpiredAttribute(): bool
     {
+        if ($this->is_unlimited || $this->is_unlimited_coins) {
+            return false;
+        }
         if ($this->status === 'expired') return true;
         if ($this->expires_at && $this->expires_at->isPast()) return true;
         return false;
@@ -71,12 +74,13 @@ class Business extends Model
 
     public function getIsDemoAttribute(): bool
     {
-        return strtolower($this->package_type ?? '') === 'demo';
+        return false;
     }
 
     public function getIsUnlimitedAttribute(): bool
     {
-        if ($this->is_demo) {
+        // If package_type is unlimited or is_unlimited_coins flag is true, it IS unlimited
+        if (strtolower($this->package_type ?? '') === 'unlimited' || (bool)$this->is_unlimited_coins) {
             return true;
         }
 
@@ -86,9 +90,7 @@ class Business extends Model
         }
 
         return (bool)(
-            $this->is_unlimited_coins ||
-            (isset($this->coins_per_transaction) && (float)$this->coins_per_transaction <= 0) ||
-            strtolower($this->package_type ?? '') === 'unlimited'
+            (isset($this->coins_per_transaction) && (float)$this->coins_per_transaction <= 0)
         );
     }
 
@@ -99,9 +101,6 @@ class Business extends Model
 
     public function getIsPremiumPlanAttribute(): bool
     {
-        if ($this->is_demo) {
-            return true;
-        }
         return !$this->is_unlimited;
     }
 

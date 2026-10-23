@@ -586,23 +586,8 @@ class ShiftController extends Controller
                 $depositAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING') ? (float)$depositAmount : 0.0;
                 $remainingCashInDrawer = $lastShift->closing_cash !== null ? max(0, round((float)$lastShift->closing_cash - $depositAmt, 2)) : 0.0;
 
-                $kasBesarBalance = 0.0;
-                $jl = \App\Models\JournalLine::where('account_code', '1-11001')
-                    ->when($outletId, fn($q) => $q->where(function ($sub) use ($outletId) {
-                        $sub->where('outlet_id', $outletId)->orWhereNull('outlet_id');
-                    }))
-                    ->selectRaw('SUM(debit) - SUM(credit) as bal')
-                    ->first();
-                if ($jl && $jl->bal !== null) {
-                    $kasBesarBalance = (float)$jl->bal;
-                } else {
-                    $ctBal = \App\Models\CashTransaction::where('account', 'KAS_BESAR')
-                        ->where('status', 'APPROVED')
-                        ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
-                        ->selectRaw('SUM(CASE WHEN type = "IN" THEN amount ELSE -amount END) as bal')
-                        ->value('bal');
-                    $kasBesarBalance = (float)($ctBal ?? 0);
-                }
+                $bizId = (int)($lastShift->business_id ?: ($user?->business_id ?: 1));
+                $kasBesarBalance = self::getKasBesarBalance($bizId, $outletId);
 
                 $lastClosedData = [
                     'id'                       => $lastShift->id,
@@ -937,22 +922,9 @@ class ShiftController extends Controller
         $depositAmt = ($depositStatus === 'APPROVED' || $depositStatus === 'PENDING') ? (float)$depositAmount : 0.0;
         $remainingCashInDrawer = $lastShift->closing_cash !== null ? max(0, round((float)$lastShift->closing_cash - $depositAmt, 2)) : 0.0;
 
-        // Ambil saldo riil Kas Besar saat ini untuk outlet ini:
-        $kasBesarBalance = 0.0;
-        $jl = \App\Models\JournalLine::where('account_code', '1-11001')
-            ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
-            ->selectRaw('SUM(debit) - SUM(credit) as bal')
-            ->first();
-        if ($jl && $jl->bal !== null) {
-            $kasBesarBalance = (float)$jl->bal;
-        } else {
-            $ctBal = \App\Models\CashTransaction::where('account', 'KAS_BESAR')
-                ->where('status', 'APPROVED')
-                ->when($outletId, fn($q) => $q->where('outlet_id', $outletId))
-                ->selectRaw('SUM(CASE WHEN type = "IN" THEN amount ELSE -amount END) as bal')
-                ->value('bal');
-            $kasBesarBalance = (float)($ctBal ?? 0);
-        }
+        // Ambil saldo riil Kas Besar saat ini untuk outlet ini (murni Kas Besar, bukan Bank):
+        $bizId = (int)($lastShift->business_id ?: ($user?->business_id ?: 1));
+        $kasBesarBalance = self::getKasBesarBalance($bizId, $outletId);
 
         return response()->json([
             'id'                         => $lastShift->id,
@@ -1015,6 +987,77 @@ class ShiftController extends Controller
             })(),
             'notes'                      => $lastShift->notes,
         ]);
+    }
+
+    /**
+     * Hitung saldo riil Kas Besar (Brankas Toko / COA 1-11001) secara presisi.
+     * HANYA menghitung fisik Kas Besar / Brankas Toko, dan SAMA SEKALI TIDAK MENGHITUNG:
+     * - Bank (1-11003 / BANK_MAIN / Rekening Bank)
+     * - Kas Aplikasi / QRIS / E-Commerce (1-11004)
+     * - Kas Kecil Kasir / Laci Kasir (1-11002)
+     */
+    public static function getKasBesarBalance(int $businessId, ?int $outletId = null): float
+    {
+        // 1. Double-entry Journal Lines strictly matching Kas Besar (1-11001 and sub-accounts 1-11001.01, etc.)
+        $jlQuery = \App\Models\JournalLine::where(function ($q) {
+                $q->where('account_code', '1-11001')
+                  ->orWhere('account_code', 'like', '1-11001.%');
+            })
+            ->whereHas('journalEntry', function ($q) use ($businessId) {
+                $q->where('business_id', $businessId);
+            });
+
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $jlQuery->where(function ($q) use ($outletId) {
+                $q->where('journal_lines.outlet_id', $outletId)
+                  ->orWhereNull('journal_lines.outlet_id');
+            });
+        }
+
+        $allTimeInflowJl = (float)(clone $jlQuery)->sum('debit');
+        $allTimeOutflowJl = (float)(clone $jlQuery)->sum('credit');
+
+        // 2. Unposted CashTransactions linked strictly to Kas Besar (Brankas)
+        $linkedCashIds = \App\Models\JournalEntry::where('business_id', $businessId)
+            ->where('reference_type', 'CASH_TRANSACTION')
+            ->whereNotNull('reference_id')
+            ->pluck('reference_id')
+            ->toArray();
+
+        $ctQuery = \App\Models\CashTransaction::where('business_id', $businessId)
+            ->where(function ($q) {
+                $q->where('account', 'KAS_BESAR')
+                  ->orWhere('account', 'like', '%KAS BESAR%')
+                  ->orWhere('account', 'like', '%BRANKAS%');
+            })
+            ->where(function ($q) {
+                // Strictly exclude bank, drawer cash, and app cash accounts
+                $q->where('account', '!=', 'BANK_MAIN')
+                  ->where('account', 'not like', '%BANK%')
+                  ->where('account', '!=', 'KAS_KECIL')
+                  ->where('account', '!=', 'PETTY_CASH')
+                  ->where('account', '!=', 'KAS_APLIKASI');
+            })
+            ->where(function ($q) {
+                $q->where('status', 'APPROVED')->orWhereNull('status');
+            });
+
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            $ctQuery->where(function ($q) use ($outletId) {
+                $q->where('outlet_id', $outletId)->orWhereNull('outlet_id');
+            });
+        }
+
+        if (!empty($linkedCashIds)) {
+            $ctQuery->whereNotIn('id', $linkedCashIds);
+        }
+
+        $allTimeInflowCt = (float)(clone $ctQuery)->where('type', 'IN')->sum('amount');
+        $allTimeOutflowCt = (float)(clone $ctQuery)->where('type', 'OUT')->sum('amount');
+
+        $currentBalance = round(($allTimeInflowJl + $allTimeInflowCt) - ($allTimeOutflowJl + $allTimeOutflowCt), 2);
+
+        return max(0.0, $currentBalance);
     }
 
     /**
@@ -2391,7 +2434,18 @@ class ShiftController extends Controller
         $amount = (float)$data['amount'];
         $notes = $data['notes'] ?? "Setoran Closing Shift #{$shift->id} ({$shift->shift_name}) ke " . ($account === 'BANK_MAIN' ? 'Rekening Bank' : 'Kas Besar');
 
-        $result = DB::transaction(function () use ($businessId, $shift, $depositDate, $account, $amount, $notes, $user) {
+        $physicalCash = $shift->closing_cash !== null ? max(0.0, (float)$shift->closing_cash) : null;
+        $excess = ($physicalCash !== null && $amount > $physicalCash) ? round($amount - $physicalCash, 2) : 0.0;
+
+        // Bersihkan tag lama jika ada dan sematkan tag selisih lebih
+        $cleanNotes = trim(preg_replace('/\s*\[(?:SPLIT_PENDAPATAN_LAIN|SELISIH_LEBIH_SETOR):[0-9.]+\]/', '', $notes));
+        if ($excess > 0) {
+            $notes = $cleanNotes . " [SPLIT_PENDAPATAN_LAIN:{$excess}]";
+        } else {
+            $notes = $cleanNotes;
+        }
+
+        $result = DB::transaction(function () use ($businessId, $shift, $depositDate, $account, $amount, $notes, $user, $excess) {
             $transactionNo = \App\Models\CashTransaction::generateTransactionNo($businessId, $depositDate);
 
             // Find existing transaction for this shift if resubmitted
@@ -2443,7 +2497,11 @@ class ShiftController extends Controller
             }
 
             // Append audit note to shift
-            $depositNote = "Pengajuan Setor: Rp " . number_format($amount, 0, ',', '.') . " ke {$accountLabel} (Menunggu Approval Owner)";
+            if ($excess > 0) {
+                $depositNote = "Pengajuan Setor: Rp " . number_format($amount, 0, ',', '.') . " ke {$accountLabel} (Termasuk Selisih Lebih Rp " . number_format($excess, 0, ',', '.') . " masuk Pendapatan Lain-Lain, Menunggu Approval Owner)";
+            } else {
+                $depositNote = "Pengajuan Setor: Rp " . number_format($amount, 0, ',', '.') . " ke {$accountLabel} (Menunggu Approval Owner)";
+            }
             $combinedNotes = $shift->notes ? $shift->notes . "\n" . $depositNote : $depositNote;
 
             $shift->update([
@@ -2505,13 +2563,20 @@ class ShiftController extends Controller
         $account = $shift->deposit_account ?: 'KAS_BESAR';
         $depositDate = $shift->closed_at ? $shift->closed_at->toDateString() : now()->toDateString();
 
-        $result = DB::transaction(function () use ($businessId, $shift, $amount, $account, $depositDate, $user) {
+        $physicalCash = $shift->closing_cash !== null ? max(0.0, (float)$shift->closing_cash) : null;
+        $excess = ($physicalCash !== null && $amount > $physicalCash) ? round($amount - $physicalCash, 2) : 0.0;
+
+        $result = DB::transaction(function () use ($businessId, $shift, $amount, $account, $depositDate, $user, $excess) {
             $accountLabel = $account === 'BANK_MAIN' ? 'Rekening Bank' : 'Kas Besar';
 
             // Find or create the CashTransaction
             $trx = \App\Models\CashTransaction::where('shift_id', $shift->id)
                 ->where('category', 'SETORAN_KASIR')
                 ->first();
+
+            $existingNotes = $trx ? ($trx->notes ?: $shift->deposit_notes) : $shift->deposit_notes;
+            $cleanNotes = trim(preg_replace('/\s*\[(?:SPLIT_PENDAPATAN_LAIN|SELISIH_LEBIH_SETOR):[0-9.]+\]/', '', $existingNotes ?: "Setoran Shift #{$shift->id} disetujui oleh {$user->name}"));
+            $trxNotes = $excess > 0 ? "{$cleanNotes} [SPLIT_PENDAPATAN_LAIN:{$excess}]" : $cleanNotes;
 
             if (!$trx) {
                 $transactionNo = \App\Models\CashTransaction::generateTransactionNo($businessId, $depositDate);
@@ -2529,7 +2594,7 @@ class ShiftController extends Controller
                     'amount'           => $amount,
                     'account'          => $account,
                     'payment_method'   => 'CASH',
-                    'notes'            => $shift->deposit_notes ?: "Setoran Shift #{$shift->id} disetujui oleh {$user->name}",
+                    'notes'            => $trxNotes,
                     'user_id'          => $shift->user_id,
                     'approved_by'      => $user->id,
                     'approved_at'      => now(),
@@ -2541,6 +2606,7 @@ class ShiftController extends Controller
                     'status'           => 'APPROVED',
                     'amount'           => $amount,
                     'account'          => $account,
+                    'notes'            => $trxNotes,
                     'approved_by'      => $user->id,
                     'approved_at'      => now(),
                     'rejection_reason' => null,
@@ -2549,20 +2615,23 @@ class ShiftController extends Controller
             }
 
             // Update shift status
-            $approvalNote = "Setoran DISETUJUI oleh {$user->name} pada " . now()->format('d/m/Y H:i') . " (Rp " . number_format($amount, 0, ',', '.') . " ke {$accountLabel})";
+            $approvalNote = $excess > 0
+                ? "Setoran DISETUJUI oleh {$user->name} pada " . now()->format('d/m/Y H:i') . " (Rp " . number_format($amount, 0, ',', '.') . " ke {$accountLabel}, termasuk Selisih Lebih Rp " . number_format($excess, 0, ',', '.') . " dibukukan ke Pendapatan Lain-Lain)"
+                : "Setoran DISETUJUI oleh {$user->name} pada " . now()->format('d/m/Y H:i') . " (Rp " . number_format($amount, 0, ',', '.') . " ke {$accountLabel})";
             $combinedNotes = $shift->notes ? $shift->notes . "\n" . $approvalNote : $approvalNote;
 
             $shift->update([
                 'deposit_status'           => 'APPROVED',
                 'deposit_amount'           => $amount,
                 'deposit_account'          => $account,
+                'deposit_notes'            => $trxNotes,
                 'deposit_approved_at'      => now(),
                 'deposit_approved_by'      => $user->id,
                 'deposit_rejection_reason' => null,
                 'notes'                    => $combinedNotes,
             ]);
 
-            // Now post double-entry journal (transfer from Kas Kecil to Kas Besar / Bank)
+            // Now post double-entry journal (transfer from Kas Kecil to Kas Besar / Bank, split excess to Pendapatan Lain-Lain)
             try {
                 \App\Services\AccountingService::postCashTransaction($trx);
             } catch (\Throwable $e) {
@@ -2572,8 +2641,11 @@ class ShiftController extends Controller
             return $trx;
         });
 
+        $accountLabel = $account === 'BANK_MAIN' ? 'Rekening Bank' : 'Kas Besar';
+        $message = 'Setoran Kasir Shift #' . $shift->id . ' senilai Rp ' . number_format($amount, 0, ',', '.') . ' telah berhasil disetujui. Dana resmi dibukukan ke ' . $accountLabel . ($excess > 0 ? ' (Selisih lebih Rp ' . number_format($excess, 0, ',', '.') . ' masuk ke Pendapatan Lain-Lain).' : '.');
+
         return response()->json([
-            'message'            => 'Setoran Kasir Shift #' . $shift->id . ' senilai Rp ' . number_format($amount, 0, ',', '.') . ' telah berhasil disetujui. Dana resmi dibukukan ke Kas Besar/Bank.',
+            'message'            => $message,
             'cash_transaction'   => $result,
             'deposit_status'     => 'APPROVED',
             'is_deposited'       => true,

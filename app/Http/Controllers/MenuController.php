@@ -8,6 +8,7 @@ use App\Models\Recipe;
 use App\Models\RecipeItem;
 use App\Models\OutletMenu;
 use App\Models\Category;
+use App\Models\Business;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
@@ -583,6 +584,15 @@ class MenuController extends Controller
     /** Save a new recipe version for a menu */
     public function storeRecipe(Request $request, Menu $menu)
     {
+        $user = $request->user();
+        $business = ($user && !$user->isPlatformAdmin()) ? ($user->business ?: $menu->business) : $menu->business;
+        if ($business && $business->is_unlimited && (!$user || !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Fitur Input Resep Standar (BOM) & HPP otomatis terkunci pada Paket Unlimited Gratis. Silakan beralih ke Paket Premium (Sistem Koin) untuk mengaktifkan input resep bahan baku.',
+                'error'   => 'RECIPE_LOCKED_FOR_UNLIMITED_PLAN',
+            ], 403);
+        }
+
         $data = $request->validate([
             'date'         => 'required|date',
             'items'        => 'required|array|min:1',
@@ -650,6 +660,15 @@ class MenuController extends Controller
     /** Delete a specific recipe version of a menu */
     public function destroyRecipe(Request $request, Menu $menu, Recipe $recipe)
     {
+        $user = $request->user();
+        $business = ($user && !$user->isPlatformAdmin()) ? ($user->business ?: $menu->business) : $menu->business;
+        if ($business && $business->is_unlimited && (!$user || !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Pengelolaan resep terkunci pada Paket Unlimited Gratis. Silakan beralih ke Paket Premium.',
+                'error'   => 'RECIPE_LOCKED_FOR_UNLIMITED_PLAN',
+            ], 403);
+        }
+
         if ((int)$recipe->menu_id !== (int)$menu->id) {
             return response()->json(['message' => 'Resep tidak sesuai dengan menu yang dipilih.'], 404);
         }
@@ -705,6 +724,14 @@ class MenuController extends Controller
     /** Delete all recipes of a menu */
     public function destroyAllRecipes(Request $request, Menu $menu)
     {
+        $user = $request->user();
+        $business = ($user && !$user->isPlatformAdmin()) ? ($user->business ?: $menu->business) : $menu->business;
+        if ($business && $business->is_unlimited && (!$user || !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Pengelolaan resep terkunci pada Paket Unlimited Gratis. Silakan beralih ke Paket Premium.',
+                'error'   => 'RECIPE_LOCKED_FOR_UNLIMITED_PLAN',
+            ], 403);
+        }
         $hasSales = \App\Models\Transaction::where('menu_id', $menu->id)->exists();
         if (!$hasSales && \Illuminate\Support\Facades\Schema::hasTable('stock_movements') && \Illuminate\Support\Facades\Schema::hasColumn('stock_movements', 'menu_id')) {
             $hasSales = \Illuminate\Support\Facades\DB::table('stock_movements')->where('menu_id', $menu->id)->exists();
@@ -750,6 +777,15 @@ class MenuController extends Controller
     /** Delete a single recipe item (bahan per satuan dalam resep) */
     public function destroyRecipeItem(Request $request, Menu $menu, Recipe $recipe, $item)
     {
+        $user = $request->user();
+        $business = ($user && !$user->isPlatformAdmin()) ? ($user->business ?: $menu->business) : $menu->business;
+        if ($business && $business->is_unlimited && (!$user || !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Pengelolaan resep terkunci pada Paket Unlimited Gratis. Silakan beralih ke Paket Premium.',
+                'error'   => 'RECIPE_LOCKED_FOR_UNLIMITED_PLAN',
+            ], 403);
+        }
+
         if ((int)$recipe->menu_id !== (int)$menu->id) {
             return response()->json(['message' => 'Resep tidak sesuai dengan menu yang dipilih.'], 404);
         }
@@ -818,6 +854,15 @@ class MenuController extends Controller
     /** Direct delete recipe item by item ID */
     public function destroyRecipeItemDirect(Request $request, $item)
     {
+        $user = $request->user();
+        $business = $user?->business;
+        if ($business && $business->is_unlimited && (!$user || !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Pengelolaan resep terkunci pada Paket Unlimited Gratis. Silakan beralih ke Paket Premium.',
+                'error'   => 'RECIPE_LOCKED_FOR_UNLIMITED_PLAN',
+            ], 403);
+        }
+
         $recipeItem = RecipeItem::with(['recipe.menu', 'ingredient'])->find($item);
         if (!$recipeItem) {
             return response()->json(['message' => 'Item bahan resep tidak ditemukan.'], 404);
@@ -834,6 +879,15 @@ class MenuController extends Controller
     /** Direct delete recipe by recipe ID */
     public function destroyRecipeDirect(Request $request, Recipe $recipe)
     {
+        $user = $request->user();
+        $business = $user?->business;
+        if ($business && $business->is_unlimited && (!$user || !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Pengelolaan resep terkunci pada Paket Unlimited Gratis. Silakan beralih ke Paket Premium.',
+                'error'   => 'RECIPE_LOCKED_FOR_UNLIMITED_PLAN',
+            ], 403);
+        }
+
         $menu = $recipe->menu;
         if (!$menu) {
             \Illuminate\Support\Facades\DB::table('recipe_items')->where('recipe_id', $recipe->id)->delete();
@@ -1025,6 +1079,15 @@ class MenuController extends Controller
         if ($user?->isSuperadminPlatform()) {
             $businessId = $request->header('X-Business-Id') ?? $request->query('business_id') ?? $request->input('business_id') ?? $businessId;
         }
+
+        $business = $businessId ? Business::find($businessId) : $user?->business;
+        if ($business && $business->is_unlimited && (!$user || !$user->isPlatformAdmin())) {
+            return response()->json([
+                'message' => 'Fitur Import Resep Standar (BOM) terkunci pada Paket Unlimited Gratis. Silakan beralih ke Paket Premium (Sistem Koin) untuk mengaktifkan input resep bahan baku.',
+                'error'   => 'RECIPE_LOCKED_FOR_UNLIMITED_PLAN',
+            ], 403);
+        }
+
         $items = $request->input('items', []);
 
         $importedMenuCount = 0;

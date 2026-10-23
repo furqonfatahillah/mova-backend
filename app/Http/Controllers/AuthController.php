@@ -226,14 +226,14 @@ class AuthController extends Controller
             ]);
         }
 
+        // Auto-aktivasi akun jika masih pending agar bisa langsung login tanpa perlu persetujuan
         if ($user->status === 'pending') {
-            $isBizOwner = $user->role === 'owner_bisnis' || ($user->business && $user->business->status === 'pending');
-            $msg = $isBizOwner
-                ? 'Pendaftaran akun bisnis Anda sedang menunggu verifikasi & persetujuan dari Superadmin Platform. Silakan tunggu hingga disetujui atau hubungi admin platform.'
-                : 'Akun Anda sedang menunggu persetujuan (approval) dari Owner Bisnis / Admin. Silakan hubungi admin untuk aktivasi akun.';
-            throw ValidationException::withMessages([
-                'email' => [$msg],
+            $user->update([
+                'status'      => 'active',
+                'approved_at' => now(),
             ]);
+            $user->status = 'active';
+            $user->approved_at = now();
         }
 
         if ($user->status === 'rejected') {
@@ -254,11 +254,18 @@ class AuthController extends Controller
 
         // Cek status bisnis (SaaS subscription)
         if ($user->business && !$user->isSuperadminPlatform()) {
+            // Auto-aktivasi bisnis jika masih berstatus pending ke Mode Unlimited Gratis
             if ($user->business->status === 'pending') {
-                throw ValidationException::withMessages([
-                    'email' => ['Akun bisnis Anda sedang menunggu verifikasi & persetujuan dari Superadmin Platform. Silakan hubungi pengelola platform.'],
+                $user->business->update([
+                    'status'                => 'active',
+                    'package_type'          => 'unlimited',
+                    'is_unlimited_coins'    => true,
+                    'coins_per_transaction' => 0,
+                    'expires_at'            => null,
                 ]);
+                $user->business->refresh();
             }
+
             if ($user->business->status === 'rejected') {
                 throw ValidationException::withMessages([
                     'email' => ['Pendaftaran bisnis Anda telah ditolak oleh Superadmin Platform. Silakan hubungi pengelola platform.'],
@@ -269,7 +276,10 @@ class AuthController extends Controller
                     'email' => ['Akses bisnis Anda telah dinonaktifkan sementara oleh pengelola platform. Silakan hubungi pengelola.'],
                 ]);
             }
-            if ($user->business->status === 'expired' || ($user->business->expires_at && $user->business->expires_at->isPast())) {
+
+            // Mode Unlimited Gratis tidak memiliki masa kedaluwarsa
+            $isUnlimitedBiz = (bool)($user->business->is_unlimited || $user->business->is_unlimited_coins || strtolower((string)$user->business->package_type) === 'unlimited');
+            if (!$isUnlimitedBiz && ($user->business->status === 'expired' || ($user->business->expires_at && $user->business->expires_at->isPast()))) {
                 throw ValidationException::withMessages([
                     'email' => ['Masa aktif langganan bisnis Anda telah berakhir. Silakan hubungi pengelola untuk perpanjangan sewa.'],
                 ]);

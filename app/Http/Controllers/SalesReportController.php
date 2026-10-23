@@ -114,9 +114,13 @@ class SalesReportController extends Controller
             $menuId = $t->menu_id ?: ('CUSTOM_' . ($t->notes ?: 'Lain-lain'));
             if (!isset($grouped[$menuId])) {
                 $menu = $t->menu;
-                $calculatedHpp = $menu ? (float)$menu->calculateHpp($t->date, $outletId ?: $t->outlet_id) : 0.0;
-                if ($calculatedHpp <= 0 && $menu) {
-                    $calculatedHpp = (float)($menu->cost_price ?: 0);
+                $isUnlimitedTrx = (bool)($t->is_unlimited_mode ?? $t->business?->is_unlimited);
+                $calculatedHpp = 0.0;
+                if (!$isUnlimitedTrx) {
+                    $calculatedHpp = $menu ? (float)$menu->calculateHpp($t->date, $outletId ?: $t->outlet_id) : 0.0;
+                    if ($calculatedHpp <= 0 && $menu && $menu->item_type === 'DIRECT') {
+                        $calculatedHpp = (float)($menu->cost_price ?: 0);
+                    }
                 }
 
                 $grouped[$menuId] = [
@@ -672,9 +676,13 @@ class SalesReportController extends Controller
             }
 
             $qty = (int)$t->qty;
-            $hpp = $menu ? (float)$menu->calculateHpp($t->date, $t->outlet_id) : 0.0;
-            if ($hpp <= 0 && $menu) {
-                $hpp = (float)($menu->cost_price ?: 0);
+            $isUnlimitedTrx = (bool)($t->is_unlimited_mode ?? $t->business?->is_unlimited);
+            $hpp = 0.0;
+            if (!$isUnlimitedTrx) {
+                $hpp = $menu ? (float)$menu->calculateHpp($t->date, $t->outlet_id) : 0.0;
+                if ($hpp <= 0 && $menu && $menu->item_type === 'DIRECT') {
+                    $hpp = (float)($menu->cost_price ?: 0);
+                }
             }
             $price = (float)($menu?->price ?: ($t->total_price / max(1, $qty)));
             $subtotal = (float)$t->subtotal;

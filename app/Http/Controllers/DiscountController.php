@@ -9,8 +9,31 @@ use Illuminate\Support\Facades\DB;
 
 class DiscountController extends Controller
 {
+    /**
+     * Check if user is authorized to manage master discounts and promos
+     */
+    protected function authorizeManageDiscount(Request $request)
+    {
+        $user = $request->user();
+        if (!$user) {
+            abort(401, 'Unauthenticated.');
+        }
+
+        if ($user->isPlatformAdmin() || $user->isOwnerBisnis() || $user->isOwnerOutlet()) {
+            return;
+        }
+
+        if ($user->hasPermission('master_discount')) {
+            return;
+        }
+
+        abort(403, 'Akses ditolak. Akun Anda tidak memiliki otoritas untuk mengakses atau mengelola promo & diskon.');
+    }
+
     public function index(Request $request)
     {
+        $this->authorizeManageDiscount($request);
+
         $query = Discount::with(['outlet', 'rewardMenu', 'creator', 'updater', 'platformPromo', 'platformPromoBusiness.approver', 'platformPromoBusiness.rejector'])
             ->orderByDesc('id');
 
@@ -57,6 +80,8 @@ class DiscountController extends Controller
 
     public function store(Request $request)
     {
+        $this->authorizeManageDiscount($request);
+
         $businessId = $request->user()->business_id;
 
         $validated = $request->validate([
@@ -102,14 +127,18 @@ class DiscountController extends Controller
         return response()->json($discount, 201);
     }
 
-    public function show(Discount $discount)
+    public function show(Request $request, Discount $discount)
     {
+        $this->authorizeManageDiscount($request);
+
         $discount->load(['outlet', 'rewardMenu', 'creator', 'updater']);
         return response()->json($discount);
     }
 
     public function update(Request $request, Discount $discount)
     {
+        $this->authorizeManageDiscount($request);
+
         $businessId = $request->user()->business_id;
 
         $validated = $request->validate([
@@ -153,8 +182,10 @@ class DiscountController extends Controller
         return response()->json($discount);
     }
 
-    public function destroy(Discount $discount)
+    public function destroy(Request $request, Discount $discount)
     {
+        $this->authorizeManageDiscount($request);
+
         // If discount already used in transactions, keep for historical records and deactivate
         $usageCount = $discount->transactions()->count();
         if ($usageCount > 0) {
@@ -168,8 +199,10 @@ class DiscountController extends Controller
         return response()->json(['message' => 'Promo berhasil dihapus.']);
     }
 
-    public function toggleActive(Discount $discount)
+    public function toggleActive(Request $request, Discount $discount)
     {
+        $this->authorizeManageDiscount($request);
+
         $discount->active = !$discount->active;
         $discount->updated_by = auth()->id();
         $discount->save();
@@ -185,6 +218,11 @@ class DiscountController extends Controller
      */
     public function availableForPos(Request $request)
     {
+        $user = $request->user();
+        if ($user && $user->isPegawai() && !$user->hasPermission('pos_promo') && !$user->hasPermission('master_discount')) {
+            return response()->json([]);
+        }
+
         $outletId = $request->outlet_id ?? $request->user()->outlet_id;
         $date = $request->date ?? date('Y-m-d');
 
@@ -207,6 +245,14 @@ class DiscountController extends Controller
      */
     public function validateCode(Request $request)
     {
+        $user = $request->user();
+        if ($user && $user->isPegawai() && !$user->hasPermission('pos_promo') && !$user->hasPermission('master_discount')) {
+            return response()->json([
+                'valid'   => false,
+                'message' => 'Otoritas akun Anda tidak diizinkan untuk menerapkan promo atau voucher.',
+            ], 403);
+        }
+
         $data = $request->validate([
             'code'        => 'required|string',
             'subtotal'    => 'required|numeric|min:0',

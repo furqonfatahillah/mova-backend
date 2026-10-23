@@ -7,6 +7,8 @@ use App\Models\Outlet;
 use App\Models\User;
 use Illuminate\Http\Request;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 
 class BusinessController extends Controller
 {
@@ -94,16 +96,15 @@ class BusinessController extends Controller
             'email'        => 'nullable|email',
             'phone'        => 'nullable|string|max:50',
             'address'      => 'nullable|string|max:500',
-            'package_type' => 'required|in:starter,pro,enterprise,unlimited,premium,demo',
+            'package_type' => 'required|in:starter,pro,enterprise,unlimited,premium',
             'max_outlets'  => 'required|integer|min:1|max:100',
             'status'       => 'required|in:active,trial,suspended,expired,pending,rejected',
             'expires_at'   => 'nullable|date',
+            'password'     => 'nullable|string|min:6',
         ]);
 
-        if (($data['package_type'] ?? '') === 'demo') {
-            $data['is_unlimited_coins'] = true;
-            $data['coins_per_transaction'] = 0;
-        }
+        $passwordInput = $data['password'] ?? null;
+        unset($data['password']);
 
         $slug = Str::slug($data['name']);
         $originalSlug = $slug;
@@ -115,7 +116,43 @@ class BusinessController extends Controller
         $data['slug'] = $slug;
         $data['created_by'] = $user->id;
 
-        $business = Business::create($data);
+        $business = DB::transaction(function () use ($data, $user, $passwordInput) {
+            $b = Business::create($data);
+
+            // 1. Buat outlet utama default agar langsung bisa dipakai
+            $outlet = Outlet::create([
+                'business_id' => $b->id,
+                'code'        => 'OUT-001',
+                'name'        => "Outlet Utama - {$b->name}",
+                'address'     => $b->address,
+                'phone'       => $b->phone,
+                'pic_name'    => $b->owner_name,
+                'is_main'     => true,
+                'active'      => true,
+                'created_by'  => $user->id,
+            ]);
+
+            // 2. Buat akun login Owner Bisnis jika email diisi
+            if (!empty($b->email)) {
+                $rawPass = !empty($passwordInput) ? $passwordInput : 'password123';
+                User::create([
+                    'business_id' => $b->id,
+                    'outlet_id'   => $outlet->id,
+                    'name'        => $b->owner_name,
+                    'email'       => $b->email,
+                    'password'    => Hash::make($rawPass),
+                    'role'        => 'owner_bisnis',
+                    'status'      => $b->status === 'pending' ? 'pending' : 'active',
+                    'approved_by' => $user->id,
+                    'approved_at' => now(),
+                ]);
+            }
+
+            // 3. Inisialisasi Chart of Accounts (COA) untuk modul akuntansi & stok
+            \App\Models\Account::seedForBusiness((int)$b->id);
+
+            return $b;
+        });
 
         return response()->json($business, 201);
     }
@@ -154,17 +191,12 @@ class BusinessController extends Controller
             'email'        => 'nullable|email',
             'phone'        => 'nullable|string|max:50',
             'address'      => 'nullable|string|max:500',
-            'package_type' => 'sometimes|in:starter,pro,enterprise,unlimited,premium,demo',
+            'package_type' => 'sometimes|in:starter,pro,enterprise,unlimited,premium',
             'max_outlets'  => 'sometimes|integer|min:1|max:100',
             'status'             => 'sometimes|in:active,trial,suspended,expired,pending,rejected',
             'expires_at'         => 'nullable|date',
             'is_unlimited_coins' => 'nullable|boolean',
         ]);
-
-        if (isset($data['package_type']) && $data['package_type'] === 'demo') {
-            $data['is_unlimited_coins'] = true;
-            $data['coins_per_transaction'] = 0;
-        }
 
         $data['updated_by'] = $user->id;
         $business->update($data);
@@ -335,17 +367,16 @@ class BusinessController extends Controller
                 ->get()
             : [];
 
-        $isDemo = (bool)$business->is_demo;
         $isUnlimited = (bool)$business->is_unlimited;
 
         return response()->json([
             'is_platform_admin'      => false,
             'business_id'            => $business->id,
             'business_name'          => $business->name,
-            'package_type'           => $isDemo ? 'demo' : ($isUnlimited ? 'unlimited' : 'premium'),
-            'is_demo_plan'           => $isDemo,
+            'package_type'           => $isUnlimited ? 'unlimited' : 'premium',
+            'is_demo_plan'           => false,
             'is_unlimited_plan'      => $isUnlimited,
-            'is_premium_plan'        => $isDemo ? true : !$isUnlimited,
+            'is_premium_plan'        => !$isUnlimited,
             'expires_at'             => $business->expires_at,
             'coin_balance'           => $hasCoinCol ? $business->coin_balance : 0,
             'coins_per_transaction'  => $hasCoinCol ? $business->coins_per_transaction : 1,

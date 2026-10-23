@@ -23,7 +23,21 @@ class CoinTopupRequestController extends Controller
      */
     public static function getCurrentConversionRate(): float
     {
-        return (float) Cache::get('platform_coin_conversion_rate', 100.00);
+        if (Cache::has('platform_coin_conversion_rate')) {
+            return (float) Cache::get('platform_coin_conversion_rate');
+        }
+
+        $filePath = storage_path('app/platform_coin_rate.json');
+        if (file_exists($filePath)) {
+            $data = json_decode(file_get_contents($filePath), true);
+            if (isset($data['rate_per_coin']) && (float) $data['rate_per_coin'] > 0) {
+                $rate = (float) $data['rate_per_coin'];
+                Cache::forever('platform_coin_conversion_rate', $rate);
+                return $rate;
+            }
+        }
+
+        return 100.00;
     }
 
     /**
@@ -31,7 +45,21 @@ class CoinTopupRequestController extends Controller
      */
     public static function setConversionRate(float $rate): void
     {
-        Cache::forever('platform_coin_conversion_rate', max(1.0, $rate));
+        $val = max(1.0, $rate);
+        Cache::forever('platform_coin_conversion_rate', $val);
+
+        try {
+            $dir = storage_path('app');
+            if (!is_dir($dir)) {
+                mkdir($dir, 0755, true);
+            }
+            file_put_contents(storage_path('app/platform_coin_rate.json'), json_encode([
+                'rate_per_coin' => $val,
+                'updated_at'    => now()->toIso8601String(),
+            ]));
+        } catch (\Throwable $e) {
+            // ignore file write failure
+        }
     }
 
     /**
@@ -90,6 +118,17 @@ class CoinTopupRequestController extends Controller
                 "Top-up {$lockedReq->amount_coins} koin (" . rupiah_fmt($lockedReq->amount_rupiah) . ") via " . self::BANK_NAME . " - {$lockedReq->request_no}" . ($customNotes ? " ({$customNotes})" : ""),
                 $approverId
             );
+
+            // 1b. Peralihan dari mode unlimited ke mode koin setelah top-up disetujui (aktifkan mode koin & buka resep)
+            $targetBiz = \App\Models\Business::find($lockedReq->business_id);
+            if ($targetBiz && ($targetBiz->is_unlimited || $targetBiz->package_type === 'unlimited')) {
+                $targetBiz->package_type = 'premium';
+                $targetBiz->is_unlimited_coins = false;
+                if (!$targetBiz->coins_per_transaction || (float)$targetBiz->coins_per_transaction <= 0) {
+                    $targetBiz->coins_per_transaction = 1.0;
+                }
+                $targetBiz->save();
+            }
 
             // 2. Calculate & record referral commission for si A (if business is linked to referral code)
             $commPercent = 0.00;
@@ -362,11 +401,13 @@ class CoinTopupRequestController extends Controller
             'rate_per_coin' => 'required|numeric|min:1',
         ]);
 
-        self::setConversionRate((float) $data['rate_per_coin']);
+        $rate = (float) $data['rate_per_coin'];
+        self::setConversionRate($rate);
 
         return response()->json([
-            'message'       => "Tarif konversi koin berhasil diubah menjadi Rp " . number_format($data['rate_per_coin'], 0, ',', '.') . " per 1 koin.",
-            'rate_per_coin' => (float) $data['rate_per_coin'],
+            'success'       => true,
+            'message'       => "Tarif konversi koin berhasil diubah menjadi Rp " . number_format($rate, 0, ',', '.') . " per 1 koin (Rumus pengajuan: Nominal Rupiah / " . (int)$rate . ").",
+            'rate_per_coin' => $rate,
         ]);
     }
 

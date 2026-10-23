@@ -278,22 +278,27 @@ class Menu extends Model
         }
 
         // 3. Jika olahan resep (RECIPE), hitung total harga bahan baku cabang terkait
-        $recipe = $this->activeRecipe($date);
-        if ($recipe) {
-            $sum = 0.0;
-            foreach ($recipe->items as $item) {
-                $ing = $item->ingredient;
-                if ($ing) {
-                    $hargaPakai = $ing->costPerPakaiForOutlet($outletId);
-                    $sum += (float)$item->qty * $hargaPakai;
+        if ($this->is_recipe) {
+            $recipe = $this->activeRecipe($date);
+            if ($recipe) {
+                $sum = 0.0;
+                foreach ($recipe->items as $item) {
+                    $ing = $item->ingredient;
+                    if ($ing) {
+                        $hargaPakai = $ing->costPerPakaiForOutlet($outletId);
+                        $sum += (float)$item->qty * $hargaPakai;
+                    }
+                }
+                if ($sum > 0) {
+                    return round($sum, 2);
                 }
             }
-            if ($sum > 0) {
-                return round($sum, 2);
-            }
+            // Jika olahan resep belum di-inputkan resep/gramasi, HPP adalah 0.0 (tidak mengambil fallback estimasi/cost_price)
+            return 0.0;
         }
 
-        // Fallback jika belum memiliki resep atau kalkulasi resep masih 0
+        // Fallback untuk barang DIRECT / SERVICE
         return $this->costPriceForOutlet($outletId);
     }
 }
+

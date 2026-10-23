@@ -726,7 +726,7 @@ class UrgentNoteController extends Controller
                         'pending_qty'    => $qty,
                         'unit'           => $menu->unit ?: 'pcs',
                         'status'         => 'PENDING',
-                        'notes'          => "Nota Urgent POS Retail #{$trx->order_number} – {$menu->name}",
+                        'notes'          => "Nota Urgent POS Konsinyasi #{$trx->order_number} – {$menu->name}",
                         'created_by'     => $trx->user_id,
                     ]);
                 }

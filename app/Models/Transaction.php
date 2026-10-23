@@ -12,6 +12,7 @@ class Transaction extends Model
 
     protected $fillable = [
         'business_id',
+        'is_unlimited_mode',
         'order_number',
         'client_order_id',
         'parent_order_number',
@@ -138,19 +139,28 @@ class Transaction extends Model
     }
 
     protected $casts = [
-        'qty'            => 'integer',
-        'recipe_version' => 'integer',
-        'total_price'     => 'float',
-        'subtotal'        => 'float',
-        'discount_amount' => 'float',
-        'discount_rate'   => 'float',
-        'amount_paid'     => 'float',
-        'change_amount'  => 'float',
-        'split_index'    => 'integer',
-        'split_total'    => 'integer',
-        'is_open_bill'   => 'boolean',
-        'is_urgent_note' => 'boolean',
+        'qty'               => 'integer',
+        'recipe_version'    => 'integer',
+        'total_price'       => 'float',
+        'subtotal'          => 'float',
+        'discount_amount'   => 'float',
+        'discount_rate'     => 'float',
+        'amount_paid'       => 'float',
+        'change_amount'     => 'float',
+        'split_index'       => 'integer',
+        'split_total'       => 'integer',
+        'is_open_bill'      => 'boolean',
+        'is_urgent_note'    => 'boolean',
+        'is_unlimited_mode' => 'boolean',
     ];
+
+    public function getIsUnlimitedModeAttribute(): bool
+    {
+        if (array_key_exists('is_unlimited_mode', $this->attributes) && $this->attributes['is_unlimited_mode'] !== null) {
+            return (bool)$this->attributes['is_unlimited_mode'];
+        }
+        return (bool)($this->business?->is_unlimited ?? false);
+    }
 
     public function isOpenBill(): bool
     {

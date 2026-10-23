@@ -79,6 +79,12 @@ class User extends Authenticatable
     protected static function booted(): void
     {
         static::creating(function ($user) {
+            if (empty($user->status)) {
+                $user->status = 'active';
+            }
+            if (empty($user->approved_at)) {
+                $user->approved_at = now();
+            }
             if (\Illuminate\Support\Facades\Schema::hasColumn('users', 'referral_code')) {
                 if (empty($user->referral_code)) {
                     $user->referral_code = static::generateUniqueReferralCode();

@@ -54,20 +54,20 @@ class KasBesarController extends Controller
             });
         }
 
-        // 2. Base query for CashTransactions linked to Kas Besar
+        // 2. Base query for CashTransactions linked strictly to Kas Besar (Brankas Toko)
         $ctBase = CashTransaction::where('business_id', $businessId)
             ->where(function ($q) {
                 $q->where('account', 'KAS_BESAR')
                   ->orWhere('account', 'like', '%KAS BESAR%')
-                  ->orWhere('account', 'like', '%BRANKAS%')
-                  ->orWhereIn('category', [
-                      'SETOR_KAS_BESAR_KE_BANK',
-                      'SETORAN_KASIR',
-                      'SETORAN_SHIFT',
-                      'TARIK_MODAL_KASIR',
-                      'MODAL_KAS_BESAR',
-                      'SETORAN_KAS_KASIR_KE_KAS_BESAR'
-                  ]);
+                  ->orWhere('account', 'like', '%BRANKAS%');
+            })
+            ->where(function ($q) {
+                // Strictly exclude bank, drawer cash, and app cash accounts
+                $q->where('account', '!=', 'BANK_MAIN')
+                  ->where('account', 'not like', '%BANK%')
+                  ->where('account', '!=', 'KAS_KECIL')
+                  ->where('account', '!=', 'PETTY_CASH')
+                  ->where('account', '!=', 'KAS_APLIKASI');
             })
             ->where(function ($q) {
                 $q->where('status', 'APPROVED')->orWhereNull('status');
@@ -572,19 +572,20 @@ class KasBesarController extends Controller
             ->pluck('reference_id')
             ->toArray();
 
+        // Base query for CashTransactions linked strictly to Kas Besar (Brankas Toko)
         $ctBase = CashTransaction::where('business_id', $businessId)
             ->where(function ($q) {
                 $q->where('account', 'KAS_BESAR')
                   ->orWhere('account', 'like', '%KAS BESAR%')
-                  ->orWhere('account', 'like', '%BRANKAS%')
-                  ->orWhereIn('category', [
-                      'SETOR_KAS_BESAR_KE_BANK',
-                      'SETORAN_KASIR',
-                      'SETORAN_SHIFT',
-                      'TARIK_MODAL_KASIR',
-                      'MODAL_KAS_BESAR',
-                      'SETORAN_KAS_KASIR_KE_KAS_BESAR'
-                  ]);
+                  ->orWhere('account', 'like', '%BRANKAS%');
+            })
+            ->where(function ($q) {
+                // Strictly exclude bank, drawer cash, and app cash accounts
+                $q->where('account', '!=', 'BANK_MAIN')
+                  ->where('account', 'not like', '%BANK%')
+                  ->where('account', '!=', 'KAS_KECIL')
+                  ->where('account', '!=', 'PETTY_CASH')
+                  ->where('account', '!=', 'KAS_APLIKASI');
             })
             ->where(function ($q) {
                 $q->where('status', 'APPROVED')->orWhereNull('status');

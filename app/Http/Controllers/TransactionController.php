@@ -622,6 +622,8 @@ class TransactionController extends Controller
             ) {
                 // Thread-safe atomic order number generation inside active database transaction
                 $orderNumber = OrderNumberService::generateNextOrderNumber($businessId, $shiftDate);
+                $businessObj = \App\Models\Business::find($businessId);
+                $isUnlimited = (bool)($businessObj && $businessObj->is_unlimited);
                 $results = [];
 
                 foreach ($preparedItems as $prep) {
@@ -630,14 +632,15 @@ class TransactionController extends Controller
                     $qty    = $prep['qty'];
 
                     $trx = Transaction::create([
-                        'business_id'     => $businessId,
-                        'order_number'    => $orderNumber,
-                        'client_order_id' => $clientOrderId,
-                        'status'          => $orderStatus,
-                        'date'            => $shiftDate,
-                        'menu_id'         => $menu->id,
-                        'qty'             => $qty,
-                        'recipe_version'  => $recipe?->version ?? null,
+                        'business_id'       => $businessId,
+                        'is_unlimited_mode' => $isUnlimited,
+                        'order_number'      => $orderNumber,
+                        'client_order_id'   => $clientOrderId,
+                        'status'            => $orderStatus,
+                        'date'              => $shiftDate,
+                        'menu_id'           => $menu->id,
+                        'qty'               => $qty,
+                        'recipe_version'    => $recipe?->version ?? null,
                         'total_price'     => $prep['net_total'],
                         'subtotal'        => $prep['subtotal'],
                         'discount_id'     => $discInfo['discount_id'],
@@ -678,7 +681,7 @@ class TransactionController extends Controller
                             'total_price'        => (float)($opt->price * $qty),
                         ]);
 
-                        if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient) {
+                        if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient && !$isUnlimited) {
                             $requiredModQty = (float)($opt->qty * $qty);
                             $this->processIngredientStockDeduction(
                                 $businessId,
@@ -713,7 +716,8 @@ class TransactionController extends Controller
                     }
 
                     // Deduct recipe ingredients with Urgent Note support (both PAID and Open Bill HOLD)
-                    if ($recipe) {
+                    // In Mode Unlimited: resep & gramasi dikunci sehingga bahan baku tidak dipotong untuk menu resep
+                    if ($recipe && !$isUnlimited) {
                         foreach ($recipe->items as $item) {
                             if ($item->ingredient) {
                                 $requiredIngQty = (float)($item->qty * $qty);
@@ -758,7 +762,7 @@ class TransactionController extends Controller
                                 }
 
                                 $bmRecipe = $bm->activeRecipe($shiftDate);
-                                if ($bmRecipe) {
+                                if ($bmRecipe && !$isUnlimited) {
                                     foreach ($bmRecipe->items as $item) {
                                         if ($item->ingredient) {
                                             $this->processIngredientStockDeduction(
@@ -783,7 +787,7 @@ class TransactionController extends Controller
                             }
 
                             // 2. Direct Ingredient in Bundle
-                            if ($bi->ingredient_id && $bi->ingredient) {
+                            if ($bi->ingredient_id && $bi->ingredient && !$isUnlimited) {
                                 $this->processIngredientStockDeduction(
                                     $businessId,
                                     $outletId,
@@ -1143,33 +1147,36 @@ class TransactionController extends Controller
         $trx = DB::transaction(function () use ($data, $menu, $recipe, $options, $totalItemPrice, $request, $shiftId, $shiftDate, $outletId, $businessId, $orderStatus, $isUrgentOrder, $clientOrderId) {
             // Thread-safe atomic order number generation inside active transaction
             $orderNumber = OrderNumberService::generateNextOrderNumber($businessId, $shiftDate);
+            $businessObj = \App\Models\Business::find($businessId);
+            $isUnlimited = (bool)($businessObj && $businessObj->is_unlimited);
             $qty = (int)$data['qty'];
             $trx = Transaction::create([
-                'business_id'     => $businessId,
-                'order_number'    => $orderNumber,
-                'client_order_id' => $clientOrderId,
-                'status'          => $orderStatus,
-                'date'           => $shiftDate,
-                'menu_id'        => $menu->id,
-                'qty'            => $qty,
-                'recipe_version' => $recipe?->version ?? null,
-                'total_price'    => $totalItemPrice,
-                'amount_paid'    => $orderStatus === 'HOLD' ? 0 : ($data['amount_paid'] ?? null),
-                'change_amount'  => $orderStatus === 'HOLD' ? 0 : ($data['change_amount'] ?? null),
-                'customer_name'  => $data['customer_name'] ?? null,
-                'customer_id'    => $data['customer_id'] ?? null,
-                'order_type'     => $data['order_type'] ?? 'DINE_IN',
-                'table_number'   => $data['table_number'] ?? null,
-                'payment_method' => $data['payment_method'] ?? 'CASH',
-                'dp_payment_method'=> (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null,
-                'dp_reference_no'  => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null,
-                'is_urgent_note' => $isUrgentOrder,
-                'urgent_status'  => $isUrgentOrder ? 'PENDING' : 'NONE',
-                'notes'          => $data['notes'] ?? null,
-                'user_id'        => $request->user()->id,
-                'created_by'     => $request->user()->id,
-                'shift_id'       => $shiftId,
-                'outlet_id'      => $outletId,
+                'business_id'       => $businessId,
+                'is_unlimited_mode' => $isUnlimited,
+                'order_number'      => $orderNumber,
+                'client_order_id'   => $clientOrderId,
+                'status'            => $orderStatus,
+                'date'              => $shiftDate,
+                'menu_id'           => $menu->id,
+                'qty'               => $qty,
+                'recipe_version'    => $recipe?->version ?? null,
+                'total_price'       => $totalItemPrice,
+                'amount_paid'       => $orderStatus === 'HOLD' ? 0 : ($data['amount_paid'] ?? null),
+                'change_amount'     => $orderStatus === 'HOLD' ? 0 : ($data['change_amount'] ?? null),
+                'customer_name'     => $data['customer_name'] ?? null,
+                'customer_id'       => $data['customer_id'] ?? null,
+                'order_type'        => $data['order_type'] ?? 'DINE_IN',
+                'table_number'      => $data['table_number'] ?? null,
+                'payment_method'    => $data['payment_method'] ?? 'CASH',
+                'dp_payment_method' => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_payment_method'] ?? 'CASH') : null,
+                'dp_reference_no'   => (in_array(strtoupper($data['payment_method'] ?? ''), ['KASBON', 'PIUTANG']) && floatval($data['amount_paid'] ?? 0) > 0) ? ($data['dp_reference_no'] ?? null) : null,
+                'is_urgent_note'    => $isUrgentOrder,
+                'urgent_status'     => $isUrgentOrder ? 'PENDING' : 'NONE',
+                'notes'             => $data['notes'] ?? null,
+                'user_id'           => $request->user()->id,
+                'created_by'        => $request->user()->id,
+                'shift_id'          => $shiftId,
+                'outlet_id'         => $outletId,
             ]);
 
             // Save selected modifiers & deduct modifier stock
@@ -1186,7 +1193,7 @@ class TransactionController extends Controller
                     'total_price'        => (float)($opt->price * $qty),
                 ]);
 
-                if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient) {
+                if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient && !$isUnlimited) {
                     $requiredModQty = (float)($opt->qty * $qty);
                     $this->processIngredientStockDeduction(
                         $businessId,
@@ -1221,7 +1228,7 @@ class TransactionController extends Controller
             }
 
             // Deduct recipe ingredients with Urgent Note support
-            if ($recipe) {
+            if ($recipe && !$isUnlimited) {
                 foreach ($recipe->items as $item) {
                     if ($item->ingredient) {
                         $requiredIngQty = (float)($item->qty * $qty);
@@ -1829,8 +1836,10 @@ class TransactionController extends Controller
         $existingPaymentMethod = $existing->payment_method ?: 'CASH';
 
         $businessId = (int)($request->user()->business_id ?: ($existing->business_id ?: ($existing->outlet?->business_id ?: 1)));
+        $businessObj = \App\Models\Business::find($businessId);
+        $isUnlimited = (bool)($businessObj && $businessObj->is_unlimited);
         $addedTransactions = DB::transaction(function () use (
-            $data, $orderNumber, $date, $shiftId, $outletId, $businessId, $tableNumber, $customerName, $orderType, $existingPaymentMethod, $request
+            $data, $orderNumber, $date, $shiftId, $outletId, $businessId, $tableNumber, $customerName, $orderType, $existingPaymentMethod, $request, $isUnlimited
         ) {
             $created = [];
             foreach ($data['items'] as $it) {
@@ -1843,26 +1852,27 @@ class TransactionController extends Controller
                 $price = (float)$menu->price + $modifierUnitPrice;
 
                 $trx = Transaction::create([
-                    'business_id'    => $businessId,
-                    'order_number'   => $orderNumber,
-                    'status'         => 'HOLD',
-                    'date'           => $date,
-                    'menu_id'        => $menu->id,
-                    'qty'            => $qty,
-                    'recipe_version' => $recipe?->version ?? null,
-                    'total_price'    => $price * $qty,
-                    'customer_name'  => $customerName,
-                    'order_type'     => $orderType,
-                    'table_number'   => $tableNumber,
-                    'is_open_bill'   => true,
-                    'payment_method' => $existingPaymentMethod,
-                    'amount_paid'    => 0,
-                    'change_amount'  => 0,
-                    'notes'          => $it['notes'] ?? null,
-                    'user_id'        => $request->user()->id,
-                    'created_by'     => $request->user()->id,
-                    'shift_id'       => $shiftId,
-                    'outlet_id'      => $outletId,
+                    'business_id'       => $businessId,
+                    'is_unlimited_mode' => $isUnlimited,
+                    'order_number'      => $orderNumber,
+                    'status'            => 'HOLD',
+                    'date'              => $date,
+                    'menu_id'           => $menu->id,
+                    'qty'               => $qty,
+                    'recipe_version'    => $recipe?->version ?? null,
+                    'total_price'       => $price * $qty,
+                    'customer_name'     => $customerName,
+                    'order_type'        => $orderType,
+                    'table_number'      => $tableNumber,
+                    'is_open_bill'      => true,
+                    'payment_method'    => $existingPaymentMethod,
+                    'amount_paid'       => 0,
+                    'change_amount'     => 0,
+                    'notes'             => $it['notes'] ?? null,
+                    'user_id'           => $request->user()->id,
+                    'created_by'        => $request->user()->id,
+                    'shift_id'          => $shiftId,
+                    'outlet_id'         => $outletId,
                 ]);
 
                 // Save selected modifiers & deduct modifier ingredients
@@ -1879,7 +1889,7 @@ class TransactionController extends Controller
                         'total_price'        => (float)($opt->price * $qty),
                     ]);
 
-                    if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient) {
+                    if ($opt->ingredient_id && $opt->qty > 0 && $opt->ingredient && !$isUnlimited) {
                         $requiredModQty = (float)($opt->qty * $qty);
                         $this->processIngredientStockDeduction(
                             $businessId,
@@ -1914,7 +1924,7 @@ class TransactionController extends Controller
                 }
 
                 // Deduct recipe ingredients
-                if ($recipe) {
+                if ($recipe && !$isUnlimited) {
                     foreach ($recipe->items as $item) {
                         if ($item->ingredient) {
                             $requiredIngQty = (float)($item->qty * $qty);
@@ -2121,7 +2131,7 @@ class TransactionController extends Controller
                             $realCost = round((float)$menu->calculateHpp() * $itemQty, 2);
                         } catch (\Throwable $e) {}
                     }
-                    if ($realCost <= 0 && $menu) {
+                    if ($realCost <= 0 && $menu && $menu->item_type === 'DIRECT') {
                         $realCost = round((float)($menu->cost_price ?: ($menu->price * 0.4)) * $itemQty, 2);
                     }
 
@@ -2370,7 +2380,7 @@ class TransactionController extends Controller
                         $realCost = round($hppPerUnit * $voidQty, 2);
                     } catch (\Throwable $e) {}
                 }
-                if ($realCost <= 0 && $menu && (float)$menu->cost_price > 0) {
+                if ($realCost <= 0 && $menu && $menu->item_type === 'DIRECT' && (float)$menu->cost_price > 0) {
                     $realCost = round((float)$menu->cost_price * $voidQty, 2);
                 }
 
@@ -2717,7 +2727,7 @@ class TransactionController extends Controller
                         } catch (\Throwable $e) {}
                     }
 
-                    if ($realCost <= 0 && $menu && (float)$menu->cost_price > 0) {
+                    if ($realCost <= 0 && $menu && $menu->item_type === 'DIRECT' && (float)$menu->cost_price > 0) {
                         $realCost = round((float)$menu->cost_price * (float)$t->qty, 2);
                     }
 
@@ -3263,7 +3273,7 @@ class TransactionController extends Controller
                     if (!isset($ingredientsMap[$key])) {
                         $ingredientsMap[$key] = [
                             'ingredient_id' => null,
-                            'name'          => $t->menu->name . ' (Produk Jadi/Retail)',
+                            'name'          => $t->menu->name . ' (Produk Jadi/Konsinyasi)',
                             'unit'          => 'pcs',
                             'qty'           => 0.0,
                             'type'          => 'DIRECT_PRODUCT',
@@ -3633,6 +3643,7 @@ class TransactionController extends Controller
                         'status'              => 'PAID',
                         'is_open_bill'        => true,
                         'business_id'         => $orig->business_id,
+                        'is_unlimited_mode'   => (bool)($orig->is_unlimited_mode ?? $orig->business?->is_unlimited),
                         'date'                => $date,
                         'menu_id'             => $orig->menu_id,
                         'qty'                 => $reqQty,
@@ -3855,6 +3866,7 @@ class TransactionController extends Controller
                 'status'              => 'PAID',
                 'is_open_bill'        => true,
                 'business_id'         => $first->business_id,
+                'is_unlimited_mode'   => (bool)($first->is_unlimited_mode ?? $first->business?->is_unlimited),
                 'date'                => $date,
                 'menu_id'             => $first->menu_id,
                 'qty'                 => 1,

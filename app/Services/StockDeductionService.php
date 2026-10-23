@@ -189,7 +189,7 @@ class StockDeductionService
                 'pending_qty'    => $pendingQty,
                 'unit'           => $menu->unit ?: 'pcs',
                 'status'         => 'PENDING',
-                'notes'          => "Nota Urgent POS Retail #{$orderNumber} – {$menu->name} (Defisit {$pendingQty} " . ($menu->unit ?: 'pcs') . ")",
+                'notes'          => "Nota Urgent POS Konsinyasi #{$orderNumber} – {$menu->name} (Defisit {$pendingQty} " . ($menu->unit ?: 'pcs') . ")",
                 'created_by'     => $userId,
             ]);
 

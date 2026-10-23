@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Business;
 use App\Models\CoinTransaction;
+use App\Models\Transaction;
 use App\Services\CoinService;
 use Illuminate\Http\Request;
 
@@ -104,36 +105,34 @@ class CoinPlatformController extends Controller
             'business_id'           => 'nullable', // null or 'ALL' or specific id
             'coins_per_transaction' => 'nullable|numeric|min:0',
             'is_unlimited_coins'    => 'nullable|boolean',
-            'package_type'          => 'nullable|string|in:unlimited,premium,demo',
+            'package_type'          => 'nullable|string|in:unlimited,premium',
             'expires_at'            => 'nullable|date',
         ]);
 
         $pkg = $data['package_type'] ?? null;
-        $isDemo = $pkg === 'demo';
-        $isUnlimited = isset($data['is_unlimited_coins']) ? (bool)$data['is_unlimited_coins'] : null;
+        $isUnlimited = isset($data['is_unlimited_coins']) ? (bool)$data['is_unlimited_coins'] : ($pkg === 'unlimited');
         $rate = isset($data['coins_per_transaction']) ? (float)$data['coins_per_transaction'] : ($isUnlimited ? 0.0 : 1.0);
 
-        if ($isDemo) {
+        if ($isUnlimited === true || $rate == 0.0 || $pkg === 'unlimited') {
             $isUnlimited = true;
             $rate = 0.0;
-        } elseif ($isUnlimited === true || $rate == 0.0) {
-            $isUnlimited = true;
-            $rate = 0.0;
+            $pkg = 'unlimited';
+        } else {
+            $isUnlimited = false;
+            $pkg = 'premium';
         }
 
         if (!empty($data['business_id']) && $data['business_id'] !== 'ALL') {
             if ($isUnlimited && empty($data['expires_at'])) {
                 return response()->json([
-                    'message' => 'Untuk mode Unlimited / Demo Koin, tanggal berakhir masa aktif (expired) wajib diinputkan.',
+                    'message' => 'Untuk mode Unlimited, tanggal berakhir masa aktif (expired) wajib diinputkan.',
                 ], 422);
             }
 
             $expiresAt = !empty($data['expires_at']) ? $data['expires_at'] : null;
             CoinService::updateRate((int)$data['business_id'], $rate, $isUnlimited, $request->user()->id, $expiresAt, $pkg);
             $business = Business::find($data['business_id']);
-            $statusText = $business->is_demo
-                ? 'Demo (Full Premium + Bebas Koin)'
-                : ($business->is_unlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota");
+            $statusText = $business->is_unlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota";
             if ($business->expires_at) {
                 $statusText .= " s/d " . $business->expires_at->format('d/m/Y');
             }
@@ -166,14 +165,15 @@ class CoinPlatformController extends Controller
     {
         $this->authorizeSuperadmin($request);
 
-        $query = CoinTransaction::with(['business:id,name', 'outlet:id,name', 'creator:id,name'])
+        $query = CoinTransaction::with(['business:id,name,package_type,coin_balance', 'outlet:id,name', 'creator:id,name'])
+            ->orderByDesc('created_at')
             ->orderByDesc('id');
 
         if ($request->filled('business_id')) {
             $query->where('business_id', (int)$request->business_id);
         }
 
-        if ($request->filled('type')) {
+        if ($request->filled('type') && $request->type !== 'ALL') {
             $query->where('type', $request->type);
         }
 
@@ -185,6 +185,79 @@ class CoinPlatformController extends Controller
             $query->whereDate('created_at', '<=', $request->date_to);
         }
 
-        return response()->json($query->paginate(50));
+        if ($request->filled('search')) {
+            $s = trim($request->search);
+            $query->where(function ($q) use ($s) {
+                $q->where('order_number', 'like', "%{$s}%")
+                    ->orWhere('payment_reference', 'like', "%{$s}%")
+                    ->orWhere('notes', 'like', "%{$s}%")
+                    ->orWhereHas('business', fn($b) => $b->where('name', 'like', "%{$s}%"))
+                    ->orWhereHas('outlet', fn($o) => $o->where('name', 'like', "%{$s}%"));
+            });
+        }
+
+        $perPage = $request->boolean('all') ? 2000 : min((int)$request->input('per_page', 500), 2000);
+        $paginated = $query->paginate($perPage);
+
+        // Fetch transaction sales totals for USAGE order_numbers to track actual POS sales
+        $orderNumbers = collect($paginated->items())
+            ->filter(fn($tx) => !empty($tx->order_number))
+            ->pluck('order_number')
+            ->unique()
+            ->values();
+
+        $orderSalesMap = [];
+        if ($orderNumbers->isNotEmpty()) {
+            $orderSalesMap = Transaction::whereIn('order_number', $orderNumbers)
+                ->selectRaw('order_number, SUM(total_price) as total_sales, COUNT(id) as item_count')
+                ->groupBy('order_number')
+                ->pluck('total_sales', 'order_number')
+                ->toArray();
+        }
+
+        $totalSalesRupiah = 0;
+        foreach ($paginated->items() as $item) {
+            if (!empty($item->order_number) && isset($orderSalesMap[$item->order_number])) {
+                $val = (float)$orderSalesMap[$item->order_number];
+                $item->order_sales_amount = $val;
+                $totalSalesRupiah += $val;
+            } else {
+                $item->order_sales_amount = null;
+            }
+        }
+
+        // Summary metrics for tracking
+        $statsBase = CoinTransaction::query();
+        if ($request->filled('business_id')) {
+            $statsBase->where('business_id', (int)$request->business_id);
+        }
+        if ($request->filled('date_from')) {
+            $statsBase->whereDate('created_at', '>=', $request->date_from);
+        }
+        if ($request->filled('date_to')) {
+            $statsBase->whereDate('created_at', '<=', $request->date_to);
+        }
+
+        $salesNotesCount = (clone $statsBase)->where('type', 'USAGE')->count();
+        $coinsDeducted = abs((float)(clone $statsBase)->where('type', 'USAGE')->sum('amount'));
+        $topupCoins = (float)(clone $statsBase)->where('type', 'TOPUP')->sum('amount');
+        $topupRupiah = (float)(clone $statsBase)->where('type', 'TOPUP')->sum('payment_amount');
+        $activeBusinessesCount = (clone $statsBase)->distinct('business_id')->count('business_id');
+
+        return response()->json([
+            'data'         => $paginated->items(),
+            'current_page' => $paginated->currentPage(),
+            'last_page'    => $paginated->lastPage(),
+            'total'        => $paginated->total(),
+            'per_page'     => $paginated->perPage(),
+            'summary'      => [
+                'total_sales_notes'       => $salesNotesCount,
+                'total_sales_rupiah'      => $totalSalesRupiah,
+                'total_coins_deducted'    => $coinsDeducted,
+                'total_topup_coins'       => $topupCoins,
+                'total_topup_rupiah'      => $topupRupiah,
+                'active_businesses_count' => $activeBusinessesCount,
+            ],
+        ]);
     }
 }

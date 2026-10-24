@@ -1355,13 +1355,18 @@ class MovementController extends Controller
                         $currentCostPerPakai = $runningNominal / $runningStock;
                     }
                 } else {
-                    $unitCost = $currentCostPerPakai;
-                    $outVal = ($m->type === 'TRANSFER_OUT' && $m->total_price > 0) ? (float)$m->total_price : round($qty * $unitCost, 2);
+                    if ($m->total_price !== null && (float)$m->total_price == 0 && (str_contains($m->note ?? '', 'Defisit') || str_contains($m->note ?? '', 'Nota Urgent'))) {
+                        $outVal = 0.0;
+                    } elseif ((float)$m->total_price > 0) {
+                        $outVal = (float)$m->total_price;
+                    } else {
+                        $outVal = round($qty * $unitCost, 2);
+                    }
                     $outVal = round($outVal, 2);
                     $runningStock -= $qty;
                     $runningNominal = round($runningNominal - $outVal, 2);
                     if ($runningStock > 0) {
-                        $currentCostPerPakai = $runningNominal / $runningStock;
+                        $currentCostPerPakai = max(0, $runningNominal / $runningStock);
                     }
                 }
             }
@@ -1408,8 +1413,13 @@ class MovementController extends Controller
                         $totalPenjualan += $qtyOut;
                     }
 
-                    $unitCost = $currentCostPerPakai;
-                    $outVal = ($m->type === 'TRANSFER_OUT' && $m->total_price > 0) ? (float)$m->total_price : round($qtyOut * $unitCost, 2);
+                    if ($m->total_price !== null && (float)$m->total_price == 0 && (str_contains($m->note ?? '', 'Defisit') || str_contains($m->note ?? '', 'Nota Urgent'))) {
+                        $outVal = 0.0;
+                    } elseif ((float)$m->total_price > 0) {
+                        $outVal = (float)$m->total_price;
+                    } else {
+                        $outVal = round($qtyOut * $unitCost, 2);
+                    }
                     $outVal = round($outVal, 2);
                     if ($m->type === 'WASTE') {
                         $totalWaste += $qtyOut;
@@ -1450,7 +1460,7 @@ class MovementController extends Controller
                     $inVal = round($inVal, 2);
                     $runningNominal = round($runningNominal + $inVal, 2);
                     $nominalMasuk = round($nominalMasuk + $inVal, 2);
-                    $costAfterRow = $running > 0 ? ($runningNominal / $running) : $currentCostPerPakai;
+                    $costAfterRow = max(0, $running > 0 ? ($runningNominal / $running) : $currentCostPerPakai);
                     $currentCostPerPakai = $costAfterRow;
 
                     if ($m->type === 'PURCHASE') {

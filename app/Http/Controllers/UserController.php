@@ -15,32 +15,15 @@ class UserController extends Controller
     {
         $currentUser = $request->user();
 
-        if ($currentUser->isPegawai()) {
-            return response()->json(['message' => 'Anda tidak memiliki hak akses manajemen pengguna.'], 403);
+        if ($currentUser->isPegawai() || $currentUser->isOwnerOutlet()) {
+            return response()->json(['message' => 'Anda tidak memiliki hak akses manajemen pengguna. Hanya Owner Bisnis yang berwenang membuat dan mengelola akun staf/pengguna.'], 403);
         }
 
         $query = User::with(['approver', 'outlet'])
             ->orderByRaw("CASE WHEN status = 'pending' THEN 0 ELSE 1 END")
             ->orderByDesc('id');
 
-        // Scoping for Owner Outlet: can ONLY view and manage employees in their own outlet
-        if ($currentUser->isOwnerOutlet()) {
-            $outletId = $currentUser->outlet_id;
-            $query->where('business_id', $currentUser->business_id)
-                  ->where('outlet_id', $outletId)
-                  ->whereIn('role', ['pegawai', 'kasir', 'manager']);
-
-            $baseCount = User::where('business_id', $currentUser->business_id)
-                ->where('outlet_id', $outletId)
-                ->whereIn('role', ['pegawai', 'kasir', 'manager']);
-            $counts = [
-                'total'     => (clone $baseCount)->count(),
-                'pending'   => (clone $baseCount)->where('status', 'pending')->count(),
-                'active'    => (clone $baseCount)->where('status', 'active')->count(),
-                'rejected'  => (clone $baseCount)->where('status', 'rejected')->count(),
-                'suspended' => (clone $baseCount)->where('status', 'suspended')->count(),
-            ];
-        } elseif ($currentUser->isOwnerBisnis() && !$currentUser->isPlatformAdmin()) {
+        if ($currentUser->isOwnerBisnis() && !$currentUser->isPlatformAdmin()) {
             // Owner Bisnis: can view branch owners and staff in their own business (excludes owner_bisnis, owner_website, superadmin_platform)
             $excludedRoles = ['owner_bisnis', 'owner_website', 'superadmin_platform', 'superadmin', 'owner', 'admin'];
             $query->where('business_id', $currentUser->business_id)
@@ -173,8 +156,8 @@ class UserController extends Controller
     {
         $currentUser = $request->user();
 
-        if ($currentUser->isPegawai()) {
-            return response()->json(['message' => 'Anda tidak memiliki hak akses menambah pengguna.'], 403);
+        if ($currentUser->isPegawai() || $currentUser->isOwnerOutlet()) {
+            return response()->json(['message' => 'Anda tidak memiliki hak akses menambah pengguna. Hanya Owner Bisnis yang berwenang membuat akun pengguna.'], 403);
         }
 
         if ($request->filled('role_id')) {

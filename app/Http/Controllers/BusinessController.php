@@ -37,7 +37,13 @@ class BusinessController extends Controller
 
         $query = Business::query()
             ->withCount(['outlets', 'users', 'menus', 'ingredients'])
-            ->with(['referredBy.business', 'referralCode']);
+            ->with([
+                'outlets' => fn($q) => $q->orderByDesc('is_main')->orderBy('name'),
+                'outlets.users' => fn($q) => $q->orderBy('name'),
+                'users' => fn($q) => $q->orderBy('name'),
+                'referredBy.business',
+                'referralCode',
+            ]);
 
         if ($request->filled('search')) {
             $s = $request->search;

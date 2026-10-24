@@ -44,4 +44,9 @@ class Outlet extends Model
     {
         return $this->hasMany(Transfer::class, 'destination_outlet_id');
     }
+
+    public function users()
+    {
+        return $this->hasMany(User::class);
+    }
 }

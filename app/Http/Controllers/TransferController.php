@@ -317,7 +317,7 @@ class TransferController extends Controller
         $initialStatus = $validated['status'] ?? 'IN_TRANSIT';
 
         $transfer = DB::transaction(function () use ($request, $validated, $sourceOutlet, $destOutlet, $businessIdToAssign, $initialStatus) {
-            $date = $validated['date'];
+            $date = !empty($validated['date']) ? $validated['date'] : now()->toDateString();
             $dateClean = str_replace('-', '', $date);
             $countQuery = Transfer::whereDate('date', $date);
             if ($businessIdToAssign) {
@@ -579,10 +579,15 @@ class TransferController extends Controller
                             }
                             $destKonversi = max((float)$ingredient->konversi, 1);
                             if ($deficitCostPerPakai <= 0) {
-                                $deficitCostPerPakai = (float)$ingredient->hargaForOutlet($destOutlet->id) / $destKonversi;
+                                $deficitCostPerPakai = (float)$ingredient->costPerPakaiForOutlet($destOutlet->id);
                             }
-                            $lockedPricePerPakai = $deficitCostPerPakai;
+                            // Pastikan deficitCostPerPakai adalah harga per gram/ml (unit_pakai), BUKAN harga per kg/liter (unit_beli)
+                            if ($destKonversi > 1 && $deficitCostPerPakai > 500 && $deficitCostPerPakai >= (float)$ingredient->hargaForOutlet($destOutlet->id) * 0.5) {
+                                $deficitCostPerPakai = $deficitCostPerPakai / $destKonversi;
+                            }
+                            $lockedPricePerPakai = min($deficitCostPerPakai, (float)$ingredient->costPerPakaiForOutlet($destOutlet->id));
                             $lockedPricePerBeli = round($lockedPricePerPakai * $destKonversi, 4);
+
 
                             $adjMvt = StockMovement::create([
                                 'business_id'   => $transfer->business_id,
@@ -849,28 +854,46 @@ class TransferController extends Controller
             $itemsMap = !empty($validated['items']) ? collect($validated['items'])->keyBy('id') : null;
 
             foreach ($transfer->items as $item) {
-                $originalInputQty = (float)($item->input_qty ?? $item->qty);
-                $totalOriginal += $originalInputQty;
+                $baseQty = (float)$item->qty;
+                $inputQty = (float)($item->input_qty ?: $item->qty);
+                $ratio = ($inputQty > 0) ? ($baseQty / $inputQty) : 1.0;
+                $totalOriginal += $inputQty;
 
                 if ($itemsMap && $itemsMap->has($item->id)) {
                     $itemInput = $itemsMap->get($item->id);
-                    $receivedInputQty = (float)($itemInput['received_qty'] ?? $originalInputQty);
-                    if ($receivedInputQty > $originalInputQty) {
-                        throw new \InvalidArgumentException("Jumlah diterima untuk item {$item->item_name} ({$receivedInputQty}) tidak boleh melebihi jumlah kirim ({$originalInputQty}).");
+                    $rawReceivedQty = (float)($itemInput['received_qty'] ?? $inputQty);
+
+                    // Deteksi skala input: apakah user menginputkan dalam Base Unit (misal Gram: 1000) atau Input Unit (misal Kg: 1)
+                    $isBaseUnitScale = ($ratio > 1.0001 && $rawReceivedQty > ($inputQty + 0.0001));
+
+                    if ($isBaseUnitScale) {
+                        if ($rawReceivedQty > ($baseQty + 0.0001)) {
+                            $displayUnit = $item->unit ?: 'unit';
+                            throw new \InvalidArgumentException("Jumlah diterima untuk item {$item->item_name} ({$rawReceivedQty} {$displayUnit}) tidak boleh melebihi jumlah kirim ({$baseQty} {$displayUnit}).");
+                        }
+                        $receivedBaseQty = $rawReceivedQty;
+                        $receivedInputQty = round($receivedBaseQty / $ratio, 4);
+                        $returnedInputQty = max(0.0, $inputQty - $receivedInputQty);
+                    } else {
+                        if ($rawReceivedQty > ($inputQty + 0.0001)) {
+                            $displayUnit = $item->input_unit ?: ($item->unit ?: 'unit');
+                            throw new \InvalidArgumentException("Jumlah diterima untuk item {$item->item_name} ({$rawReceivedQty} {$displayUnit}) tidak boleh melebihi jumlah kirim ({$inputQty} {$displayUnit}).");
+                        }
+                        $receivedInputQty = $rawReceivedQty;
+                        $receivedBaseQty = round($receivedInputQty * $ratio, 4);
+                        $returnedInputQty = max(0.0, $inputQty - $receivedInputQty);
                     }
+
                     $itemReason = !empty($itemInput['reason']) ? trim($itemInput['reason']) : $defaultReturnReason;
                 } else {
-                    $receivedInputQty = $originalInputQty;
+                    $receivedInputQty = $inputQty;
+                    $receivedBaseQty = $baseQty;
+                    $returnedInputQty = 0.0;
                     $itemReason = $defaultReturnReason;
                 }
 
-                $returnedInputQty = max(0, $originalInputQty - $receivedInputQty);
                 $totalReceived += $receivedInputQty;
                 $totalReturned += $returnedInputQty;
-
-                // Hitung rasio konversi jika satuan input (misal Kg) berbeda dari base satuan pakai (misal Gram)
-                $ratio = ($originalInputQty > 0) ? ($item->qty / $originalInputQty) : 1;
-                $receivedBaseQty = round($receivedInputQty * $ratio, 4);
 
                 // Update data item transfer
                 $item->update([
@@ -1416,17 +1439,31 @@ class TransferController extends Controller
                 $itemInput = $itemsMap->get($item->id);
                 if (!$itemInput) continue;
 
-                $returnedQty = (float)($itemInput['returned_qty'] ?? 0);
-                $originalQty = (float)($item->input_qty ?? $item->qty);
-                $totalOriginal += $originalQty;
-                $totalReturned += $returnedQty;
+                $baseQty = (float)$item->qty;
+                $inputQty = (float)($item->input_qty ?: $item->qty);
+                $ratio = ($inputQty > 0) ? ($baseQty / $inputQty) : 1.0;
+                $totalOriginal += $inputQty;
 
-                if ($returnedQty > $originalQty) {
-                    throw new \InvalidArgumentException("Jumlah retur untuk item {$item->item_name} ({$returnedQty}) tidak boleh melebihi jumlah kirim ({$originalQty}).");
+                $rawReturnedQty = (float)($itemInput['returned_qty'] ?? 0);
+                $isBaseUnitScale = ($ratio > 1.0001 && $rawReturnedQty > ($inputQty + 0.0001));
+
+                if ($isBaseUnitScale) {
+                    if ($rawReturnedQty > ($baseQty + 0.0001)) {
+                        $displayUnit = $item->unit ?: 'unit';
+                        throw new \InvalidArgumentException("Jumlah retur untuk item {$item->item_name} ({$rawReturnedQty} {$displayUnit}) tidak boleh melebihi jumlah kirim ({$baseQty} {$displayUnit}).");
+                    }
+                    $returnedQty = round($rawReturnedQty / $ratio, 4);
+                } else {
+                    if ($rawReturnedQty > ($inputQty + 0.0001)) {
+                        $displayUnit = $item->input_unit ?: ($item->unit ?: 'unit');
+                        throw new \InvalidArgumentException("Jumlah retur untuk item {$item->item_name} ({$rawReturnedQty} {$displayUnit}) tidak boleh melebihi jumlah kirim ({$inputQty} {$displayUnit}).");
+                    }
+                    $returnedQty = $rawReturnedQty;
                 }
 
+                $totalReturned += $returnedQty;
                 $itemReason = !empty($itemInput['reason']) ? trim($itemInput['reason']) : $returnReason;
-                $receivedQty = max(0, $originalQty - $returnedQty);
+                $receivedQty = max(0.0, $inputQty - $returnedQty);
 
                 // Update item transfer record
                 $item->update([

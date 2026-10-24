@@ -238,4 +238,125 @@ Artisan::command('stock:heal-void-urgent-journals {--business_id=}', function ()
     $this->info("Pemulihan selesai! Total jurnal tersinkronisasi: " . ($stats['total_journal_entries'] ?? 0));
 })->purpose('Heal corrupted urgent notes, negative stock desyncs, and reconcile all journals');
 
+Artisan::command('data:fix-retroactive-dates {--target-date=2026-10-24} {--old-date=2026-10-23}', function () {
+    $targetDate = $this->option('target-date') ?: '2026-10-24';
+    $oldDate    = $this->option('old-date') ?: '2026-10-23';
+
+    $this->info("=== MEMULAI PERBAIKAN TANGGAL RETROAKTIF DARI {$oldDate} KE {$targetDate} ===");
+
+    // 1. PERBAIKI TRANSFER STOK (Contoh: TRF-20261023-0001 yang dibuat di tanggal 24 subuh)
+    $transfersToFix = \App\Models\Transfer::where(function ($q) use ($oldDate, $targetDate) {
+        $q->where('date', $oldDate)->whereDate('created_at', $targetDate);
+    })->orWhere(function ($q) use ($oldDate, $targetDate) {
+        $q->where('transfer_no', 'like', 'TRF-' . str_replace('-', '', $oldDate) . '-%')
+          ->whereDate('created_at', $targetDate);
+    })->get();
+
+    $this->info("Menemukan {$transfersToFix->count()} transfer yang perlu diperbaiki.");
+
+    foreach ($transfersToFix as $trf) {
+        $oldNo = $trf->transfer_no;
+        $bizId = $trf->business_id ?: 1;
+
+        $dateClean = str_replace('-', '', $targetDate);
+        $countToday = \App\Models\Transfer::where('business_id', $bizId)
+            ->where('date', $targetDate)
+            ->count() + 1;
+        $newNo = 'TRF-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
+
+        while (\App\Models\Transfer::where('business_id', $bizId)->where('transfer_no', $newNo)->exists()) {
+            $countToday++;
+            $newNo = 'TRF-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
+        }
+
+        $trf->date = $targetDate;
+        $trf->transfer_no = $newNo;
+        $trf->saveQuietly();
+
+        \App\Models\StockMovement::where('transfer_id', $trf->id)->update([
+            'date' => $targetDate,
+        ]);
+        \Illuminate\Support\Facades\DB::table('stock_movements')
+            ->where('transfer_id', $trf->id)
+            ->update([
+                'note' => \Illuminate\Support\Facades\DB::raw("REPLACE(note, '{$oldNo}', '{$newNo}')")
+            ]);
+
+        $jes = \App\Models\JournalEntry::where('reference_type', 'TRANSFER')
+            ->where('reference_id', $trf->id)
+            ->get();
+        foreach ($jes as $je) {
+            $je->entry_date = $targetDate;
+            $je->description = str_replace($oldNo, $newNo, $je->description);
+            $je->saveQuietly();
+        }
+
+        \App\Services\AccountingService::postTransfer($trf);
+        $this->info("  [TRANSFER DIPERBAIKI] {$oldNo} -> {$newNo} (Tanggal: {$targetDate})");
+    }
+
+    // 2. PERBAIKI TRANSAKSI PENJUALAN POS (Contoh: TRX-20261023-0006 yang dibuat di tanggal 24 subuh)
+    $ordersToFix = \App\Models\Transaction::where(function ($q) use ($oldDate, $targetDate) {
+        $q->where('date', $oldDate)->whereDate('created_at', $targetDate);
+    })->orWhere(function ($q) use ($oldDate, $targetDate) {
+        $q->where('order_number', 'like', 'TRX-' . str_replace('-', '', $oldDate) . '-%')
+          ->whereDate('created_at', $targetDate);
+    })->pluck('order_number')->unique()->filter();
+
+    $this->info("Menemukan {$ordersToFix->count()} nomor nota order POS yang perlu diperbaiki.");
+
+    foreach ($ordersToFix as $oldOrderNo) {
+        $trxItems = \App\Models\Transaction::where('order_number', $oldOrderNo)->get();
+        if ($trxItems->isEmpty()) continue;
+
+        $first = $trxItems->first();
+        $bizId = $first->business_id ?: 1;
+
+        $newOrderNo = \App\Services\OrderNumberService::generateNextOrderNumber($bizId, $targetDate);
+
+        foreach ($trxItems as $trx) {
+            $trx->date = $targetDate;
+            $trx->order_number = $newOrderNo;
+            $trx->saveQuietly();
+
+            \App\Models\StockMovement::where('transaction_id', $trx->id)->update([
+                'date' => $targetDate,
+            ]);
+            \Illuminate\Support\Facades\DB::table('stock_movements')
+                ->where('transaction_id', $trx->id)
+                ->update([
+                    'note' => \Illuminate\Support\Facades\DB::raw("REPLACE(note, '{$oldOrderNo}', '{$newOrderNo}')")
+                ]);
+
+            $jes = \App\Models\JournalEntry::where('reference_type', 'TRANSACTION')
+                ->where('reference_id', $trx->id)
+                ->get();
+            foreach ($jes as $je) {
+                $je->entry_date = $targetDate;
+                $je->description = str_replace($oldOrderNo, $newOrderNo, $je->description);
+                $je->saveQuietly();
+            }
+
+            \App\Services\AccountingService::recordPosTransaction($trx);
+        }
+
+        \App\Models\UrgentNote::where('order_number', $oldOrderNo)->update([
+            'order_number' => $newOrderNo,
+        ]);
+
+        $rec = \App\Models\Receivable::where('order_number', $oldOrderNo)->first();
+        if ($rec) {
+            $rec->order_number = $newOrderNo;
+            $rec->issue_date = $targetDate;
+            $rec->due_date = $targetDate;
+            $rec->saveQuietly();
+        }
+
+        $this->info("  [POS ORDER DIPERBAIKI] {$oldOrderNo} -> {$newOrderNo} (Tanggal: {$targetDate})");
+    }
+
+    $this->info("Semua data berhasil diperbarui ke tanggal {$targetDate}!");
+})->purpose('Perbaiki tanggal transaksi dan transfer stok yang tercatat pada tanggal sebelumnya akibat shift malam');
+
+
 

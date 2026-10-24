@@ -17,9 +17,9 @@ class AuthController extends Controller
 {
     public function register(Request $request)
     {
-        $regType = $request->input('registration_type', 'staff');
+        $regType = $request->input('registration_type', 'business');
 
-        // Skenario A: Pendaftaran Bisnis Baru (Penyewa / Owner Bisnis)
+        // Skenario: Pendaftaran Bisnis Baru (Penyewa / Owner Bisnis)
         if ($regType === 'business' || $request->filled('business_name')) {
             $data = $request->validate([
                 'name'              => 'required|string|max:255',
@@ -171,44 +171,10 @@ class AuthController extends Controller
             ], 201);
         }
 
-        // Skenario B: Pendaftaran Pegawai / Manager di Bisnis yang Sudah Ada
-        $data = $request->validate([
-            'name'        => 'required|string|max:255',
-            'email'       => 'required|email|unique:users,email',
-            'password'    => 'required|string|min:8|confirmed',
-            'role'        => 'required|in:pegawai,owner_outlet,kasir,manager',
-            'business_id' => 'required|exists:businesses,id',
-            'outlet_id'   => 'required|exists:outlets,id',
-        ], [
-            'business_id.required' => 'Pilih usaha tempat Anda bertugas.',
-            'outlet_id.required'   => 'Pilih cabang outlet tempat Anda bertugas.',
-        ]);
-
-        $role = $data['role'];
-        if ($role === 'kasir' || $role === 'manager') {
-            $role = 'pegawai';
-        }
-
-        $user = User::create([
-            'business_id' => $data['business_id'],
-            'outlet_id'   => $data['outlet_id'],
-            'name'        => $data['name'],
-            'email'       => $data['email'],
-            'password'    => Hash::make($data['password']),
-            'role'        => $role,
-            'status'      => 'active', // Langsung Aktif tanpa pending
-            'approved_at' => now(),
-        ]);
-
-        $token = $user->createToken('pos_auth_token')->plainTextToken;
-
+        // Pegawai dan Manager tidak bisa membuat akun sendiri secara publik; akun harus dibuatkan oleh Owner Bisnis
         return response()->json([
-            'message' => "Pendaftaran berhasil! Akun Anda langsung aktif dan dapat langsung digunakan.",
-            'status'  => 'active',
-            'token'   => $token,
-            'user'    => $user->load(['outlet', 'business']),
-            'outlet'  => $user->outlet,
-        ], 201);
+            'message' => 'Pendaftaran mandiri untuk akun pegawai dan manajer tidak diizinkan. Akun staf harus dibuatkan langsung oleh Owner Bisnis melalui menu Kelola Pengguna di dalam aplikasi.',
+        ], 403);
     }
 
     public function login(Request $request)
@@ -277,11 +243,10 @@ class AuthController extends Controller
                 ]);
             }
 
-            // Mode Unlimited Gratis tidak memiliki masa kedaluwarsa
-            $isUnlimitedBiz = (bool)($user->business->is_unlimited || $user->business->is_unlimited_coins || strtolower((string)$user->business->package_type) === 'unlimited');
-            if (!$isUnlimitedBiz && ($user->business->status === 'expired' || ($user->business->expires_at && $user->business->expires_at->isPast()))) {
+            // Cek masa aktif bisnis / paket langganan (Termasuk Mode Unlimited yang masa aktifnya telah habis)
+            if ($user->business->status === 'expired' || ($user->business->expires_at && $user->business->expires_at->isPast())) {
                 throw ValidationException::withMessages([
-                    'email' => ['Masa aktif langganan bisnis Anda telah berakhir. Silakan hubungi pengelola untuk perpanjangan sewa.'],
+                    'email' => ['Masa aktif langganan bisnis Anda telah berakhir. Silakan hubungi pengelola platform untuk perpanjangan sewa.'],
                 ]);
             }
         }

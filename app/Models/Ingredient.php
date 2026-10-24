@@ -573,23 +573,49 @@ class Ingredient extends Model
                         $closeDeficitVal = $deficitNominal;
                         // 2. Bagian sisa positif mengambil avg berdasarkan apa yang diinputkan
                         $surplusQty = $projectedStock;
-                        $inputPricePerBeli = (float)($m->unit_price > 0 ? $m->unit_price : ($m->total_price > 0 && $qty > 0 ? $m->total_price / ($qty / $konversi) : $runningCostPerPakai * $konversi));
-                        $inputPricePerPakai = $inputPricePerBeli / $konversi;
-                        $surplusVal = $surplusQty * $inputPricePerPakai;
 
+                        $uPrice = (float)$m->unit_price;
+                        $benchmarkCost = $runningCostPerPakai > 0 ? $runningCostPerPakai : ($initialCostPerPakai > 0 ? $initialCostPerPakai : ((float)$this->harga / $konversi));
+
+                        if ($konversi > 1 && $uPrice > 0 && $benchmarkCost > 0 && $uPrice <= ($benchmarkCost * 2.5)) {
+                            $inputPricePerPakai = $uPrice;
+                            $inputPricePerBeli  = $uPrice * $konversi;
+                        } elseif ($uPrice > 0) {
+                            $inputPricePerBeli  = $uPrice;
+                            $inputPricePerPakai = $inputPricePerBeli / $konversi;
+                        } elseif ($m->total_price > 0 && $qty > 0) {
+                            $inputPricePerPakai = (float)$m->total_price / $qty;
+                            $inputPricePerBeli  = $inputPricePerPakai * $konversi;
+                        } else {
+                            $inputPricePerPakai = $benchmarkCost;
+                            $inputPricePerBeli  = $benchmarkCost * $konversi;
+                        }
+
+                        $surplusVal = $surplusQty * $inputPricePerPakai;
                         $inVal = $closeDeficitVal + $surplusVal;
                         $incomingPricePerPakai = $surplusVal / $surplusQty;
                         $incomingPricePerBeli  = $inputPricePerBeli;
                     }
                 } else {
                     // Stok normal (positif atau nol): gunakan unit_price tersimpan atau runningCostPerPakai
-                    if ($m->unit_price > 0) {
-                        $incomingPricePerBeli = (float)$m->unit_price;
+                    $uPrice = (float)$m->unit_price;
+                    $benchmarkCost = $runningCostPerPakai > 0 ? $runningCostPerPakai : ($initialCostPerPakai > 0 ? $initialCostPerPakai : ((float)$this->harga / $konversi));
+
+                    if ($konversi > 1 && $uPrice > 0 && $benchmarkCost > 0 && $uPrice <= ($benchmarkCost * 2.5)) {
+                        $incomingPricePerPakai = $uPrice;
+                        $incomingPricePerBeli  = $uPrice * $konversi;
+                        $inVal = $qty * $incomingPricePerPakai;
+                    } elseif ($uPrice > 0) {
+                        $incomingPricePerBeli  = $uPrice;
                         $incomingPricePerPakai = $incomingPricePerBeli / $konversi;
                         $inVal = $qty * $incomingPricePerPakai;
+                    } elseif ($m->total_price > 0 && $qty > 0) {
+                        $inVal = (float)$m->total_price;
+                        $incomingPricePerPakai = $inVal / $qty;
+                        $incomingPricePerBeli  = $incomingPricePerPakai * $konversi;
                     } else {
                         $inVal = $qty * $runningCostPerPakai;
-                        $incomingPricePerBeli = $runningCostPerPakai * $konversi;
+                        $incomingPricePerBeli  = $runningCostPerPakai * $konversi;
                         $incomingPricePerPakai = $runningCostPerPakai;
                     }
                 }

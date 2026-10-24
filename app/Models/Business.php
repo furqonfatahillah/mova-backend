@@ -25,6 +25,7 @@ class Business extends Model
         'coin_balance',
         'coins_per_transaction',
         'is_unlimited_coins',
+        'coin_conversion_rate',
         'low_coin_threshold',
         'expires_at',
         'created_by',
@@ -37,6 +38,7 @@ class Business extends Model
         'coin_balance'           => 'float',
         'coins_per_transaction'  => 'float',
         'is_unlimited_coins'     => 'boolean',
+        'coin_conversion_rate'   => 'float',
         'low_coin_threshold'     => 'integer',
     ];
 
@@ -64,9 +66,6 @@ class Business extends Model
 
     public function getIsExpiredAttribute(): bool
     {
-        if ($this->is_unlimited || $this->is_unlimited_coins) {
-            return false;
-        }
         if ($this->status === 'expired') return true;
         if ($this->expires_at && $this->expires_at->isPast()) return true;
         return false;

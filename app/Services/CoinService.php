@@ -171,8 +171,15 @@ class CoinService
     /**
      * Update the cost (coins per transaction) or toggle unlimited status for a business.
      */
-    public static function updateRate(int $businessId, float $coinsPerTx, ?bool $isUnlimited = null, ?int $adminId = null, ?string $expiresAt = null, ?string $packageType = null): void
-    {
+    public static function updateRate(
+        int $businessId,
+        float $coinsPerTx,
+        ?bool $isUnlimited = null,
+        ?int $adminId = null,
+        ?string $expiresAt = null,
+        ?string $packageType = null,
+        $coinConversionRate = 'NO_CHANGE'
+    ): void {
         if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coins_per_transaction')) {
             throw new \Exception("Tabel koin belum dibuat di database server produksi. Silakan jalankan 'php artisan migrate --force' di terminal VPS server produksi Anda.");
         }
@@ -183,6 +190,12 @@ class CoinService
 
         $business = Business::findOrFail($businessId);
         $business->coins_per_transaction = $coinsPerTx;
+
+        if ($coinConversionRate !== 'NO_CHANGE') {
+            $business->coin_conversion_rate = (!empty($coinConversionRate) && (float)$coinConversionRate > 0)
+                ? (float)$coinConversionRate
+                : null;
+        }
 
         if ($packageType) {
             $business->package_type = $packageType;

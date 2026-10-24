@@ -23,6 +23,7 @@ use App\Models\Shift;
 use App\Models\StockMovement;
 use App\Models\Transaction;
 use App\Models\Transfer;
+use App\Models\TransferItem;
 use App\Models\UrgentNote;
 use App\Models\WasteLog;
 use Illuminate\Support\Facades\DB;
@@ -189,11 +190,15 @@ class AccountingService
         }
 
         $entryDate = $data['entry_date'] ?? now()->toDateString();
+        if (is_string($entryDate) && strlen($entryDate) > 10) {
+            $entryDate = substr($entryDate, 0, 10);
+        }
+        $createdTimestamp = !empty($data['created_at']) ? $data['created_at'] : now();
         $entryNo = $data['entry_no'] ?? ($existingEntryNo ?: JournalEntry::generateEntryNo($bizId, $entryDate));
 
         $accountsMap = Account::where('business_id', $bizId)->get()->keyBy('code');
 
-        return DB::transaction(function () use ($bizId, $data, $defaultOutletId, $cleanLines, $entryDate, $entryNo, $totalDebit, $totalCredit, $isBalanced, $accountsMap) {
+        return DB::transaction(function () use ($bizId, $data, $defaultOutletId, $cleanLines, $entryDate, $entryNo, $totalDebit, $totalCredit, $isBalanced, $accountsMap, $createdTimestamp) {
             $entry = JournalEntry::create([
                 'business_id'    => $bizId,
                 'outlet_id'      => $data['outlet_id'] ?? $defaultOutletId,
@@ -207,6 +212,8 @@ class AccountingService
                 'total_credit'   => $totalCredit,
                 'is_balanced'    => $isBalanced,
                 'created_by'     => $data['created_by'] ?? null,
+                'created_at'     => $createdTimestamp,
+                'updated_at'     => $createdTimestamp,
             ]);
 
             foreach ($cleanLines as $l) {
@@ -220,6 +227,8 @@ class AccountingService
                     'debit'            => $l['debit'],
                     'credit'           => $l['credit'],
                     'memo'             => $l['memo'] ?? null,
+                    'created_at'       => $createdTimestamp,
+                    'updated_at'       => $createdTimestamp,
                 ]);
             }
 
@@ -712,45 +721,39 @@ class AccountingService
                 ->where('note', 'not like', '%Pelunasan Nota Urgent%')
                 ->get();
 
-            $urgentNotes = $t->relationLoaded('urgentNotes')
-                ? $t->urgentNotes
-                : $t->urgentNotes()->get();
+            $urgentNotesMap = ($t->relationLoaded('urgentNotes') ? $t->urgentNotes : $t->urgentNotes()->get())
+                ->keyBy('ingredient_id');
 
             if ($txMovements->isNotEmpty()) {
                 foreach ($txMovements as $sm) {
                     $smIng = $sm->ingredient;
                     $isPlk = self::isPerlengkapan($smIng);
-                    $totalQty = (float)$sm->qty;
-
-                    $unitCost = 0.0;
-                    if ((float)$sm->total_price > 0 && $totalQty > 0) {
-                        $unitCost = (float)$sm->total_price / $totalQty;
-                    } elseif ((float)$sm->cost_after > 0) {
-                        $unitCost = (float)$sm->cost_after;
-                    } elseif ((float)$sm->cost_before > 0) {
-                        $unitCost = (float)$sm->cost_before;
-                    } elseif ($smIng) {
-                        $unitCost = (float)$smIng->costPerPakaiForOutlet($outletId);
+                    $actualCost = (float)$sm->total_price;
+                    if ($actualCost <= 0 && (float)$sm->qty > 0) {
+                        $unitCost = (float)$sm->unit_price > 0 ? (float)$sm->unit_price : ($smIng ? (float)$smIng->costPerPakaiForOutlet($outletId) : 0);
+                        $actualCost = round((float)$sm->qty * $unitCost, 2);
                     }
 
-                    // Check if this movement has a deficit / urgent note
-                    $un = $urgentNotes->firstWhere('ingredient_id', $sm->ingredient_id);
-                    $deficitQty = 0.0;
+                    // Pisahkan porsi defisit (Nota Urgent) vs porsi normal (stok ada)
+                    $un = $sm->ingredient_id ? $urgentNotesMap->get($sm->ingredient_id) : null;
+                    $deficitCost = 0.0;
+                    $normalCost = $actualCost;
+
                     if ($un && (float)$un->pending_qty > 0) {
-                        $deficitQty = min($totalQty, (float)$un->pending_qty);
-                    } elseif (preg_match('/Defisit\s+([0-9.]+)/i', (string)$sm->note, $matches)) {
-                        $deficitQty = min($totalQty, (float)$matches[1]);
+                        $pendingPortion = min((float)$sm->qty, (float)$un->pending_qty);
+                        $unitRate = (float)$sm->qty > 0 ? ($actualCost / (float)$sm->qty) : 0.0;
+                        $deficitCost = round($pendingPortion * $unitRate, 2);
+                        $normalCost = max(0.0, round($actualCost - $deficitCost, 2));
+                    } elseif (str_contains($sm->note ?? '', 'Defisit')) {
+                        $deficitCost = $actualCost;
+                        $normalCost = 0.0;
                     }
-
-                    $actualQty = max(0.0, $totalQty - $deficitQty);
-                    $actualCost = round($actualQty * $unitCost, 2);
-                    $deficitCost = round($deficitQty * $unitCost, 2);
 
                     if ($isPlk) {
-                        $cogsPlk += $actualCost;
+                        $cogsPlk += $normalCost;
                         $cogsTeoritisPlk += $deficitCost;
                     } else {
-                        $cogsBahan += $actualCost;
+                        $cogsBahan += $normalCost;
                         $cogsTeoritisBahan += $deficitCost;
                     }
                 }
@@ -759,17 +762,19 @@ class AccountingService
                 $menu = $t->menu;
                 if ($menu) {
                     if ($menu->item_type === 'DIRECT') {
-                        $un = $urgentNotes->firstWhere('menu_id', $menu->id);
-                        $reqQty = (int)$t->qty;
-                        $qtyToUse = $un ? min($reqQty, (float)$un->deducted_qty) : $reqQty;
-                        $shortfallQty = max(0, $reqQty - $qtyToUse);
                         $costPrice = (float)($menu->costPriceForOutlet($outletId) ?: $menu->cost_price);
-
-                        $cogsBahan += $costPrice * $qtyToUse;
-                        $cogsTeoritisBahan += $costPrice * $shortfallQty;
+                        $itemCost = $costPrice * (int)$t->qty;
+                        $un = $urgentNotesMap->firstWhere('menu_id', $menu->id);
+                        if ($un && (float)$un->pending_qty > 0) {
+                            $pendingPortion = min((float)$t->qty, (float)$un->pending_qty);
+                            $defCost = round($pendingPortion * $costPrice, 2);
+                            $cogsTeoritisBahan += $defCost;
+                            $cogsBahan += max(0.0, round($itemCost - $defCost, 2));
+                        } else {
+                            $cogsBahan += $itemCost;
+                        }
                     } elseif ($menu->item_type === 'RECIPE' || $menu->is_recipe) {
                         // Untuk menu olahan resep (RECIPE): hanya hitung HPP jika resep & gramasi diinputkan.
-                        // Jika tidak diinputkan resep / gramasi (baik di mode premium maupun unlimited), HPP adalah 0.
                         $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?: $menu->recipes->first();
                         if ($recipe && $recipe->items && $recipe->items->isNotEmpty()) {
                             foreach ($recipe->items as $it) {
@@ -777,25 +782,27 @@ class AccountingService
                                 if (!$ing) continue;
                                 $isPlk = self::isPerlengkapan($ing);
                                 $unitCost = $ing->costPerPakaiForOutlet($outletId);
+                                $totalReq = (float)$it->qty * (int)$t->qty;
+                                $itemCost = $totalReq * $unitCost;
 
-                                $un = $urgentNotes->firstWhere('ingredient_id', $ing->id);
-                                $reqQty = (float)$it->qty * (int)$t->qty;
-                                $qtyToUse = $un ? min($reqQty, (float)$un->deducted_qty) : $reqQty;
-                                $shortfallQty = max(0.0, $reqQty - $qtyToUse);
-
-                                $itemCost = $qtyToUse * $unitCost;
-                                $shortfallCost = $shortfallQty * $unitCost;
+                                $un = $urgentNotesMap->get($ing->id);
+                                $defCost = 0.0;
+                                $normCost = $itemCost;
+                                if ($un && (float)$un->pending_qty > 0) {
+                                    $pendingPortion = min($totalReq, (float)$un->pending_qty);
+                                    $defCost = round($pendingPortion * $unitCost, 2);
+                                    $normCost = max(0.0, round($itemCost - $defCost, 2));
+                                }
 
                                 if ($isPlk) {
-                                    $cogsPlk += $itemCost;
-                                    $cogsTeoritisPlk += $shortfallCost;
+                                    $cogsPlk += $normCost;
+                                    $cogsTeoritisPlk += $defCost;
                                 } else {
-                                    $cogsBahan += $itemCost;
-                                    $cogsTeoritisBahan += $shortfallCost;
+                                    $cogsBahan += $normCost;
+                                    $cogsTeoritisBahan += $defCost;
                                 }
                             }
                         }
-                        // Tanpa resep atau gramasi, $cogsBahan & $cogsPlk tetap 0.0 (TIDAK mengambil estimasi HPP 8.000)
                     }
                 }
 
@@ -807,20 +814,24 @@ class AccountingService
                         if (!$modIng) continue;
                         $isPlk = self::isPerlengkapan($modIng);
                         $unitCost = $modIng->costPerPakaiForOutlet($outletId);
-                        $un = $urgentNotes->firstWhere('ingredient_id', $modIng->id);
-                        $reqQty = (float)($mod->qty_consumed ?: 1);
-                        $qtyToUse = $un ? min($reqQty, (float)$un->deducted_qty) : $reqQty;
-                        $shortfallQty = max(0.0, $reqQty - $qtyToUse);
+                        $totalReq = (float)($mod->qty_consumed ?: 1);
+                        $itemCost = $totalReq * $unitCost;
 
-                        $itemCost = $qtyToUse * $unitCost;
-                        $shortfallCost = $shortfallQty * $unitCost;
+                        $un = $urgentNotesMap->get($modIng->id);
+                        $defCost = 0.0;
+                        $normCost = $itemCost;
+                        if ($un && (float)$un->pending_qty > 0) {
+                            $pendingPortion = min($totalReq, (float)$un->pending_qty);
+                            $defCost = round($pendingPortion * $unitCost, 2);
+                            $normCost = max(0.0, round($itemCost - $defCost, 2));
+                        }
 
                         if ($isPlk) {
-                            $cogsPlk += $itemCost;
-                            $cogsTeoritisPlk += $shortfallCost;
+                            $cogsPlk += $normCost;
+                            $cogsTeoritisPlk += $defCost;
                         } else {
-                            $cogsBahan += $itemCost;
-                            $cogsTeoritisBahan += $shortfallCost;
+                            $cogsBahan += $normCost;
+                            $cogsTeoritisBahan += $defCost;
                         }
                     }
                 }
@@ -831,7 +842,6 @@ class AccountingService
         $cogsPlk = round($cogsPlk, 2);
         $cogsTeoritisBahan = round($cogsTeoritisBahan, 2);
         $cogsTeoritisPlk = round($cogsTeoritisPlk, 2);
-        $cogsTeoritis = round($cogsTeoritisBahan + $cogsTeoritisPlk, 2);
 
         if ($cogsBahan > 0) {
             $lines[] = ['account_code' => '5-51001', 'outlet_id' => $outletId, 'debit' => $cogsBahan, 'credit' => 0, 'memo' => 'Beban Bahan Baku (HPP)'];
@@ -842,12 +852,12 @@ class AccountingService
             $lines[] = ['account_code' => '1-13002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsPlk, 'memo' => 'Pengurangan Persediaan Perlengkapan'];
         }
         if ($cogsTeoritisBahan > 0) {
-            $lines[] = ['account_code' => '5-51007', 'outlet_id' => $outletId, 'debit' => $cogsTeoritisBahan, 'credit' => 0, 'memo' => 'Beban Selisih HPP Teoritis Bahan (Stok Minus)'];
-            $lines[] = ['account_code' => '1-13001', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsTeoritisBahan, 'memo' => 'Pengurangan Persediaan Bahan (Selisih Teoritis)'];
+            $lines[] = ['account_code' => '5-51007', 'outlet_id' => $outletId, 'debit' => $cogsTeoritisBahan, 'credit' => 0, 'memo' => 'Beban Selisih HPP Teoritis Bahan (Stok Minus Nota Urgent)'];
+            $lines[] = ['account_code' => '1-13001', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsTeoritisBahan, 'memo' => 'Pengurangan Persediaan Bahan (Defisit Stok)'];
         }
         if ($cogsTeoritisPlk > 0) {
-            $lines[] = ['account_code' => '5-51008', 'outlet_id' => $outletId, 'debit' => $cogsTeoritisPlk, 'credit' => 0, 'memo' => 'Beban Selisih HPP Teoritis Perlengkapan (Stok Minus)'];
-            $lines[] = ['account_code' => '1-13002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsTeoritisPlk, 'memo' => 'Pengurangan Persediaan Perlengkapan (Selisih Teoritis)'];
+            $lines[] = ['account_code' => '5-51008', 'outlet_id' => $outletId, 'debit' => $cogsTeoritisPlk, 'credit' => 0, 'memo' => 'Beban Selisih HPP Teoritis Perlengkapan (Stok Minus Nota Urgent)'];
+            $lines[] = ['account_code' => '1-13002', 'outlet_id' => $outletId, 'debit' => 0, 'credit' => $cogsTeoritisPlk, 'memo' => 'Pengurangan Persediaan Perlengkapan (Defisit Stok)'];
         }
 
         return self::recordEntry([
@@ -857,6 +867,7 @@ class AccountingService
             'entry_type'     => 'SALES',
             'reference_type' => 'TRANSACTION',
             'reference_id'   => $t->id,
+            'created_at'     => $t->created_at ?: now(),
             'description'    => ($isOpenBillTrx || $isUnpaidOpenBill)
                 ? "Penjualan POS Open Bill #{$t->order_number} (Piutang Meja)"
                 : "Penjualan POS #{$t->order_number} ({$pm})",
@@ -910,10 +921,11 @@ class AccountingService
         return self::recordEntry([
             'business_id'    => $bizId,
             'outlet_id'      => $outletId,
-            'entry_date'     => $t->date ?: now()->toDateString(),
+            'entry_date'     => now()->toDateString(),
             'entry_type'     => 'RECEIVABLE_PAYMENT',
             'reference_type' => 'OPEN_BILL_SETTLEMENT',
             'reference_id'   => $t->id,
+            'created_at'     => $t->updated_at ?: ($t->created_at ?: now()),
             'description'    => "Pelunasan Tagihan Open Bill #{$t->order_number} ({$pm})",
         ], $lines, $bizId);
     }
@@ -2102,11 +2114,37 @@ class AccountingService
     {
         $bizId = $op->business_id ?? 1;
         $outletId = $op->outlet_id;
-        $diffVal = (float)$op->variance_value;
+
+        // Ambil nilai penyesuaian riil langsung dari Kartu Stok (stock_movements) milik opname ini
+        $opSm = StockMovement::where('outlet_id', $outletId)
+            ->where('ingredient_id', $op->ingredient_id)
+            ->where(function($q) use ($op) {
+                $q->where('note', 'like', "%{$op->opname_no}%");
+            })
+            ->first();
+
+        if ($opSm && (float)$opSm->total_price > 0) {
+            $diffVal = ($opSm->type === 'ADJUSTMENT_OUT' ? -1 : 1) * (float)$opSm->total_price;
+        } else {
+            $diffVal = (float)$op->variance_value;
+            $ing = $op->ingredient ?: Ingredient::find($op->ingredient_id);
+            $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
+            $costPerPakai = $ing ? (float)$ing->costPerPakaiForOutlet($outletId) : 0;
+
+            // Proteksi jika variance_value di tabel opname terkalikan harga beli tanpa dibagi konversi
+            if ($konversi > 1 && $costPerPakai > 0 && abs((float)$op->variance_qty) > 0) {
+                $expectedDiffVal = round((float)$op->variance_qty * $costPerPakai, 2);
+                if (abs($diffVal) > abs($expectedDiffVal) * 20) {
+                    $diffVal = $expectedDiffVal;
+                }
+            }
+        }
+
         if (abs($diffVal) <= 0.01) return;
 
         $date = $op->opname_date ?: now()->toDateString();
-        $ing = $op->ingredient;
+        $ing = $op->ingredient ?: Ingredient::find($op->ingredient_id);
+
         $isPlk = $ing ? self::isPerlengkapan($ing) : false;
         $invAcc = $isPlk ? '1-13002' : '1-13001';
         $deficitAcc = $isPlk ? '5-51005' : '5-51004'; // 5-51005 Biaya Selisih Perlengkapan, 5-51004 Biaya Selisih Persediaan Bahan Baku
@@ -2200,13 +2238,22 @@ class AccountingService
         $ing = $sm->ingredient ?: Ingredient::find($sm->ingredient_id);
         $konversi = $ing ? max((float)$ing->konversi, 1) : 1;
 
+        $costPerPakai = $ing ? (float)$ing->costPerPakaiForOutlet($outletId) : 0;
         $amount = (float)$sm->total_price;
         if ($amount <= 0 && $ing) {
-            $amount = round((float)$sm->qty * (float)($sm->unit_price > 0 ? ($sm->unit_price > 1000 && $konversi > 1 ? $sm->unit_price / $konversi : $sm->unit_price) : $ing->costPerPakaiForOutlet($outletId)), 2);
+            $amount = round((float)$sm->qty * (float)($sm->unit_price > 0 ? ($sm->unit_price > 1000 && $konversi > 1 ? $sm->unit_price / $konversi : $sm->unit_price) : $costPerPakai), 2);
+        }
+        // Proteksi jika total_price di mutasi meledak puluhan juta akibat bug konversi ganda
+        if ($konversi > 1 && $costPerPakai > 0 && (float)$sm->qty > 0) {
+            $expectedAmount = round((float)$sm->qty * $costPerPakai, 2);
+            if ($amount > $expectedAmount * 20) {
+                $amount = $expectedAmount;
+            }
         }
         if ($amount <= 0) {
             return;
         }
+
 
         $date = $sm->date ?: now()->toDateString();
         $isPlk = self::isPerlengkapan($ing);
@@ -2563,6 +2610,175 @@ class AccountingService
                     }
                 }
             }
+
+            // E. Normalisasi record opnames yang nilainya meledak (karena gram terkalikan harga beli kg tanpa dibagi konversi)
+            $corruptedOps = Opname::where('business_id', $biz->id)
+                ->with('ingredient')
+                ->get();
+            foreach ($corruptedOps as $op) {
+                $ing = $op->ingredient;
+                if (!$ing) continue;
+                $konversi = max((float)$ing->konversi, 1);
+                $varQty = (float)$op->variance_qty;
+                $varVal = (float)$op->variance_value;
+                $costUnit = (float)$op->cost_per_unit;
+
+                // Jika harga per unit di atas Rp 500 padahal konversi 1000 (harga per kg), dan variance_value meledak ratusan ribu/jutaan
+                if ($konversi > 1 && $costUnit > 500 && abs($varVal) > 100000) {
+                    $costPerPakai = round($costUnit / $konversi, 4);
+                    $correctVarVal = round($varQty * $costPerPakai, 2);
+                    if (abs($varVal) > abs($correctVarVal) * 20) {
+                        $op->update([
+                            'cost_per_unit'  => $costPerPakai,
+                            'variance_value' => $correctVarVal,
+                            'nilai_teoritis' => round((float)$op->stok_akhir_teoritis * $costPerPakai, 2),
+                            'nilai_aktual'   => $op->actual_qty !== null ? round((float)$op->actual_qty * $costPerPakai, 2) : null,
+                        ]);
+                    }
+                }
+            }
+
+            // F. Normalisasi record stock_movements (ADJUSTMENT_IN) yang harganya meledak puluhan juta akibat bug konversi ganda
+            $corruptedSms = StockMovement::where('business_id', $biz->id)
+                ->whereIn('type', ['ADJUSTMENT_IN', 'ADJUSTMENT_PLUS'])
+                ->with('ingredient')
+                ->get();
+            foreach ($corruptedSms as $sm) {
+                $ing = $sm->ingredient;
+                if (!$ing) continue;
+                $konversi = max((float)$ing->konversi, 1);
+                $uPrice = (float)$sm->unit_price;
+                $qty = (float)$sm->qty;
+
+                if ($konversi > 1 && $uPrice > 500000) {
+                    $init = IngredientInitialBalance::where('ingredient_id', $ing->id)->where('outlet_id', $sm->outlet_id)->first()
+                        ?: IngredientInitialBalance::where('ingredient_id', $ing->id)->first();
+                    $baseBeli = $init && (float)$init->stok_awal > 0 && (float)$init->saldo_awal_nominal > 0
+                        ? round(((float)$init->saldo_awal_nominal / (float)$init->stok_awal) * $konversi, 2)
+                        : (float)StockMovement::where('ingredient_id', $ing->id)->where('type', 'PURCHASE')->where('unit_price', '>', 0)->where('unit_price', '<', 500000)->latest('date')->value('unit_price');
+                    if ($baseBeli <= 0 || $baseBeli > 500000) {
+                        $baseBeli = (float)($ing->harga > 0 && $ing->harga < 500000 ? $ing->harga : 0);
+                    }
+                    $saneUnitPrice = $baseBeli;
+                    $saneTotalPrice = round(($qty / $konversi) * $saneUnitPrice, 2);
+                    $saneCost = round($saneUnitPrice / $konversi, 4);
+
+                    $sm->update([
+                        'unit_price'  => $saneUnitPrice,
+                        'total_price' => $saneTotalPrice,
+                        'cost_before' => $saneCost,
+                        'cost_after'  => $saneCost,
+                    ]);
+                }
+            }
+
+            // G. Pulihkan harga master di outlet_ingredients & ingredients jika terinfeksi nilai jutaan
+            $corruptedOis = OutletIngredient::whereHas('outlet', fn($q) => $q->where('business_id', $biz->id))
+                ->with('ingredient')
+                ->get();
+            foreach ($corruptedOis as $oi) {
+                $ing = $oi->ingredient;
+                if (!$ing) continue;
+                $konversi = max((float)$ing->konversi, 1);
+                if ($konversi > 1 && (float)$oi->harga > 500000) {
+                    $init = IngredientInitialBalance::where('ingredient_id', $ing->id)->where('outlet_id', $oi->outlet_id)->first()
+                        ?: IngredientInitialBalance::where('ingredient_id', $ing->id)->first();
+                    $baseBeli = $init && (float)$init->stok_awal > 0 && (float)$init->saldo_awal_nominal > 0
+                        ? round(((float)$init->saldo_awal_nominal / (float)$init->stok_awal) * $konversi, 2)
+                        : (float)StockMovement::where('ingredient_id', $ing->id)->where('type', 'PURCHASE')->where('unit_price', '>', 0)->where('unit_price', '<', 500000)->latest('date')->value('unit_price');
+                    if ($baseBeli <= 0 || $baseBeli > 500000) {
+                        $baseBeli = (float)($ing->harga > 0 && $ing->harga < 500000 ? $ing->harga : 0);
+                    }
+                    $oi->update([
+                        'harga' => $baseBeli,
+                        'last_purchase_price' => $baseBeli,
+                    ]);
+                    if ((float)$ing->harga > 500000) {
+                        $ing->update(['harga' => $baseBeli]);
+                    }
+                }
+            }
+
+            // H. Pulihkan TransferItem & StockMovement transfer historis yang harganya meledak
+            $corruptedTrfItems = TransferItem::whereHas('transfer', fn($q) => $q->where('business_id', $biz->id))
+                ->with('ingredient')
+                ->get();
+            foreach ($corruptedTrfItems as $ti) {
+                $ing = $ti->ingredient;
+                if (!$ing) continue;
+                $konversi = max((float)$ing->konversi, 1);
+                if ($konversi > 1 && ((float)$ti->unit_cost > 500000 || (float)$ti->total_price > 500000 * max(1, (float)$ti->qty / $konversi))) {
+                    $init = IngredientInitialBalance::where('ingredient_id', $ing->id)->where('outlet_id', $ti->transfer?->source_outlet_id)->first()
+                        ?: IngredientInitialBalance::where('ingredient_id', $ing->id)->first();
+                    $baseBeli = $init && (float)$init->stok_awal > 0 && (float)$init->saldo_awal_nominal > 0
+                        ? round(((float)$init->saldo_awal_nominal / (float)$init->stok_awal) * $konversi, 2)
+                        : (float)StockMovement::where('ingredient_id', $ing->id)->where('type', 'PURCHASE')->where('unit_price', '>', 0)->where('unit_price', '<', 500000)->latest('date')->value('unit_price');
+                    if ($baseBeli <= 0 || $baseBeli > 500000) {
+                        $baseBeli = (float)($ing->harga > 0 && $ing->harga < 500000 ? $ing->harga : 0);
+                    }
+                    $saneCostPerPakai = round($baseBeli / $konversi, 4);
+                    $saneTotalPrice = round((float)$ti->qty * $saneCostPerPakai, 2);
+                    $ti->update([
+                        'unit_cost'   => $saneCostPerPakai,
+                        'total_price' => $saneTotalPrice,
+                    ]);
+                }
+            }
+
+            // I. Pulihkan harga master di outlet_ingredients & ingredients serta stock_movements jika ter-crush dibagi konversi ganda
+            $allBizIngs = Ingredient::where('business_id', $biz->id)->get();
+            foreach ($allBizIngs as $ing) {
+                $konversi = max((float)$ing->konversi, 1);
+                if ($konversi >= 100) {
+                    $init = IngredientInitialBalance::where('ingredient_id', $ing->id)->first();
+                    $expectedBeli = $init && (float)$init->stok_awal > 0 && (float)$init->saldo_awal_nominal > 0
+                        ? round(((float)$init->saldo_awal_nominal / (float)$init->stok_awal) * $konversi, 2)
+                        : 0.0;
+                    
+                    if ($expectedBeli >= 5000 && (float)$ing->harga < 1000) {
+                        $ing->update(['harga' => $expectedBeli]);
+                        OutletIngredient::where('ingredient_id', $ing->id)
+                            ->where('harga', '<', 1000)
+                            ->update([
+                                'harga' => $expectedBeli,
+                                'last_purchase_price' => $expectedBeli,
+                            ]);
+                    }
+                }
+            }
+
+            // Pulihkan juga StockMovement opname yang unit_price / total_price ter-crush
+            $opnameSms = StockMovement::where('business_id', $biz->id)
+                ->where('note', 'like', '%OPN-%')
+                ->with('ingredient')
+                ->get();
+            foreach ($opnameSms as $sm) {
+                $ing = $sm->ingredient;
+                if (!$ing) continue;
+                $konversi = max((float)$ing->konversi, 1);
+                $uPrice = (float)$sm->unit_price;
+                $totPrice = (float)$sm->total_price;
+
+                if ($konversi >= 100) {
+                    $init = IngredientInitialBalance::where('ingredient_id', $ing->id)->where('outlet_id', $sm->outlet_id)->first();
+                    $expectedBeli = $init && (float)$init->stok_awal > 0 && (float)$init->saldo_awal_nominal > 0
+                        ? round(((float)$init->saldo_awal_nominal / (float)$init->stok_awal) * $konversi, 2)
+                        : (float)$ing->harga;
+                    
+                    if ($expectedBeli >= 5000 && ($uPrice < 1000 || ($totPrice < 100 && (float)$sm->qty >= 10))) {
+                        $saneBeli = $expectedBeli;
+                        $saneCost = round($saneBeli / $konversi, 4);
+                        $saneTot = round((float)$sm->qty * $saneCost, 2);
+                        $sm->update([
+                            'unit_price'  => $saneBeli,
+                            'total_price' => $saneTot,
+                            'cost_before' => $saneCost,
+                            'cost_after'  => $saneCost,
+                        ]);
+                    }
+                }
+            }
         }
     }
+
 }

@@ -107,6 +107,7 @@ class CoinPlatformController extends Controller
             'is_unlimited_coins'    => 'nullable|boolean',
             'package_type'          => 'nullable|string|in:unlimited,premium',
             'expires_at'            => 'nullable|date',
+            'coin_conversion_rate'  => 'nullable|numeric|min:1',
         ]);
 
         $pkg = $data['package_type'] ?? null;
@@ -130,11 +131,25 @@ class CoinPlatformController extends Controller
             }
 
             $expiresAt = !empty($data['expires_at']) ? $data['expires_at'] : null;
-            CoinService::updateRate((int)$data['business_id'], $rate, $isUnlimited, $request->user()->id, $expiresAt, $pkg);
+            $conversionRateParam = $request->has('coin_conversion_rate') ? $request->input('coin_conversion_rate') : 'NO_CHANGE';
+
+            CoinService::updateRate(
+                (int)$data['business_id'],
+                $rate,
+                $isUnlimited,
+                $request->user()->id,
+                $expiresAt,
+                $pkg,
+                $conversionRateParam
+            );
+
             $business = Business::find($data['business_id']);
             $statusText = $business->is_unlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota";
             if ($business->expires_at) {
                 $statusText .= " s/d " . $business->expires_at->format('d/m/Y');
+            }
+            if ($business->coin_conversion_rate) {
+                $statusText .= " (Kurs Top Up Khusus: /{$business->coin_conversion_rate})";
             }
             return response()->json([
                 'message' => "Pengaturan koin untuk {$business->name} berhasil diubah menjadi {$statusText}.",

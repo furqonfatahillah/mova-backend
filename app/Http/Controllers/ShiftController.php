@@ -1268,46 +1268,11 @@ class ShiftController extends Controller
             }
         }
 
-        // VALIDASI PERSETUJUAN MANAGER ATAU OWNER JIKA MENGAMBIL DARI KAS BESAR
-        $approverUser = null;
-        if ($initialCashSource === 'KAS_BESAR' && ($kasBesarAmount > 0 || $initialCash > 0)) {
-            $isCallerOwnerOrManager = $user->isOwnerOrManager();
-
-            if ($isCallerOwnerOrManager) {
-                // User yang membuka shift adalah Owner atau Manager sendiri
-                $approverUser = $user;
-            } else {
-                // User adalah Pegawai / Kasir -> WAJIB otorisasi Supervisor (Manager atau Owner)
-                if (empty($data['supervisor_id']) || (empty($data['supervisor_password']) && empty($data['supervisor_pin']))) {
-                    return response()->json([
-                        'message' => 'Pengambilan uang dari Kas Besar harus disetujui oleh Manajer atau Owner. Silakan pilih akun Manajer/Owner dan masukkan Password/PIN otorisasi.'
-                    ], 422);
-                }
-
-                $supervisor = \App\Models\User::where('business_id', $businessId)->find((int)$data['supervisor_id']);
-                if (!$supervisor || !$supervisor->isOwnerOrManager()) {
-                    return response()->json([
-                        'message' => 'Akun Manajer / Owner yang dipilih tidak valid atau tidak memiliki wewenang otorisasi Kas Besar.'
-                    ], 422);
-                }
-
-                $pass = $data['supervisor_password'] ?? $data['supervisor_pin'];
-                $passValid = \Illuminate\Support\Facades\Hash::check($pass, $supervisor->password) || (isset($supervisor->pin) && $supervisor->pin === $pass);
-
-                if (!$passValid) {
-                    return response()->json([
-                        'message' => "Otorisasi gagal: Password atau PIN untuk Manajer/Owner '{$supervisor->name}' salah."
-                    ], 422);
-                }
-
-                $approverUser = $supervisor;
-            }
-        }
-
+        // Pengambilan dari Kas Besar untuk modal awal shift: langsung dicatat atas nama user yang membuka shift
         $shiftNotes = $data['notes'] ?? null;
-        if ($initialCashSource === 'KAS_BESAR' && $kasBesarAmount > 0 && $approverUser) {
+        if ($initialCashSource === 'KAS_BESAR' && $kasBesarAmount > 0) {
             $prevDrawerText = ($expectedDrawerCash ?? 0) > 0 ? " (Sisa laci lalu: Rp " . number_format($expectedDrawerCash, 0, ',', '.') . " + Kas Besar: Rp " . number_format($kasBesarAmount, 0, ',', '.') . " = Total Rp " . number_format($initialCash, 0, ',', '.') . ")" : "";
-            $kbNote = "Modal awal Rp " . number_format($initialCash, 0, ',', '.') . "{$prevDrawerText} [Tarik Kas Besar Rp " . number_format($kasBesarAmount, 0, ',', '.') . " Disetujui: {$approverUser->name} - {$approverUser->role_label}].";
+            $kbNote = "Modal awal Rp " . number_format($initialCash, 0, ',', '.') . "{$prevDrawerText} [Tarik Kas Besar Rp " . number_format($kasBesarAmount, 0, ',', '.') . " oleh: {$user->name} ({$user->role_label})].";
             $shiftNotes = $shiftNotes ? ($shiftNotes . " | " . $kbNote) : $kbNote;
         } elseif ($initialCashSource === 'DRAWER' && $expectedDrawerCash !== null && abs($handoverDiff) >= 0.01) {
             $diffFormatted = $handoverDiff > 0
@@ -1363,8 +1328,8 @@ class ShiftController extends Controller
             } catch (\Throwable $e) {
                 \Log::error("Failed to post journal for SALDO_AWAL shift #{$shift->id}: " . $e->getMessage());
             }
-        } elseif ($initialCashSource === 'KAS_BESAR' && ($kasBesarAmount > 0 || $initialCash > 0) && $approverUser) {
-            // 2. Shift selanjutnya: Jika memilih ambil uang dari Kas Besar, buat transaksi kas & jurnal disetujui Manager/Owner
+        } elseif ($initialCashSource === 'KAS_BESAR' && ($kasBesarAmount > 0 || $initialCash > 0)) {
+            // 2. Shift selanjutnya: Jika memilih ambil uang dari Kas Besar, buat transaksi kas & jurnal otomatis atas nama kasir/pegawai
             try {
                 $actualKbAmount = $kasBesarAmount > 0 ? $kasBesarAmount : $initialCash;
                 $ct = \App\Models\CashTransaction::create([
@@ -1381,10 +1346,10 @@ class ShiftController extends Controller
                     'amount'         => $actualKbAmount,
                     'date'           => now()->toDateString(),
                     'status'         => 'APPROVED',
-                    'notes'          => "Pengambilan modal awal kasir dari Kas Besar untuk {$shift->shift_name} sebesar Rp " . number_format($actualKbAmount, 0, ',', '.') . " (Total modal di laci kasir: Rp " . number_format($initialCash, 0, ',', '.') . "). Disetujui oleh: {$approverUser->name} ({$approverUser->role_label})",
+                    'notes'          => "Pengambilan modal awal kasir dari Kas Besar untuk {$shift->shift_name} sebesar Rp " . number_format($actualKbAmount, 0, ',', '.') . " (Total modal di laci kasir: Rp " . number_format($initialCash, 0, ',', '.') . "). Ditarik langsung oleh: {$user->name} ({$user->role_label})",
                     'user_id'        => $user->id,
                     'created_by'     => $user->id,
-                    'approved_by'    => $approverUser->id,
+                    'approved_by'    => $user->id,
                     'approved_at'    => now(),
                 ]);
 
@@ -1680,10 +1645,20 @@ class ShiftController extends Controller
                     'total_items'     => 0,
                     'payment_method'  => $t->payment_method ?? 'CASH',
                     'customer_name'   => $t->customer_name ?? null,
+                    'items'           => [],
                 ];
             }
             $ordersGrouped[$ordNum]['total_price'] += (float)$t->total_price;
             $ordersGrouped[$ordNum]['total_items'] += (int)$t->qty;
+
+            $ordersGrouped[$ordNum]['items'][] = [
+                'menu_id'     => $t->menu_id,
+                'menu_name'   => $t->menu?->name ?? ($t->menu_name ?: ('Menu #' . $t->menu_id)),
+                'qty'         => (int)$t->qty,
+                'price'       => (float)($t->unit_price ?: ($t->total_price / max(1, (int)$t->qty))),
+                'total_price' => (float)$t->total_price,
+                'notes'       => $t->notes,
+            ];
         }
 
         foreach ($shiftRecPayments as $rp) {
@@ -1696,6 +1671,16 @@ class ShiftController extends Controller
                 'total_items'     => 1,
                 'payment_method'  => strtoupper($rp->payment_method ?: 'CASH'),
                 'customer_name'   => 'Pelunasan: ' . ($rec?->customer_name ?: 'Pelanggan'),
+                'items'           => [
+                    [
+                        'menu_id'     => null,
+                        'menu_name'   => 'Pelunasan Kasbon - ' . ($rec?->customer_name ?: 'Pelanggan'),
+                        'qty'         => 1,
+                        'price'       => (float)$rp->amount,
+                        'total_price' => (float)$rp->amount,
+                        'notes'       => $rp->notes,
+                    ]
+                ],
             ];
         }
 
@@ -1810,6 +1795,7 @@ class ShiftController extends Controller
             'non_cash_expenses'  => $expData['non_cash_expenses'],
             'expected_cash'      => $expectedCash,
             'menus_sold'         => array_values($menuSummary),
+            'items_sold'         => array_values($menuSummary),
             'ingredient_usages'  => $ingredientUsages,
             'orders'             => $ordersList,
             'order_numbers'      => $orderNumbers,
@@ -1926,7 +1912,7 @@ class ShiftController extends Controller
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             }
 
-            $ord = $t->order_number;
+            $ord = $t->order_number ?: ('TRX-' . $t->id);
             if (!isset($ordersGrouped[$ord])) {
                 $ordersGrouped[$ord] = [
                     'order_number'    => $ord,
@@ -1935,10 +1921,20 @@ class ShiftController extends Controller
                     'total_items'     => 0,
                     'payment_method'  => $method,
                     'customer_name'   => $t->customer_name ?: ($t->customer?->name ?? null),
+                    'items'           => [],
                 ];
             }
             $ordersGrouped[$ord]['total_price'] += $price;
             $ordersGrouped[$ord]['total_items'] += (int)$t->qty;
+
+            $ordersGrouped[$ord]['items'][] = [
+                'menu_id'     => $t->menu_id,
+                'menu_name'   => $t->menu?->name ?? ($t->menu_name ?: ('Menu #' . $t->menu_id)),
+                'qty'         => (int)$t->qty,
+                'price'       => (float)($t->unit_price ?: ($t->total_price / max(1, (int)$t->qty))),
+                'total_price' => (float)$t->total_price,
+                'notes'       => $t->notes,
+            ];
         }
 
         // Add collections from kasbon payments received during this shift
@@ -1972,6 +1968,16 @@ class ShiftController extends Controller
                 'total_items'     => 1,
                 'payment_method'  => $rpMethod,
                 'customer_name'   => 'Pelunasan: ' . ($rec?->customer_name ?: 'Pelanggan'),
+                'items'           => [
+                    [
+                        'menu_id'     => null,
+                        'menu_name'   => 'Pelunasan Kasbon - ' . ($rec?->customer_name ?: 'Pelanggan'),
+                        'qty'         => 1,
+                        'price'       => (float)$rp->amount,
+                        'total_price' => (float)$rp->amount,
+                        'notes'       => $rp->notes,
+                    ]
+                ],
             ];
         }
 
@@ -2084,6 +2090,7 @@ class ShiftController extends Controller
             'non_cash_details'   => $nonCashDetails,
             'orders'             => $ordersList,
             'items_sold'         => array_values($menuSummary),
+            'menus_sold'         => array_values($menuSummary),
             'expenses'           => $expData['expenses'],
         ]);
     }

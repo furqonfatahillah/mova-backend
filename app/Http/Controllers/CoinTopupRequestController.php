@@ -172,7 +172,10 @@ class CoinTopupRequestController extends Controller
             return response()->json(['message' => 'Akun Anda tidak terhubung ke unit bisnis manapun.'], 422);
         }
 
-        $rate = self::getCurrentConversionRate();
+        $business = Business::findOrFail($user->business_id);
+        $rate = ($business->coin_conversion_rate && (float)$business->coin_conversion_rate > 0)
+            ? (float)$business->coin_conversion_rate
+            : self::getCurrentConversionRate();
 
         $data = $request->validate([
             'amount_rupiah'  => 'required|numeric|min:10000',
@@ -194,7 +197,6 @@ class CoinTopupRequestController extends Controller
             $proofPath = $request->file('transfer_proof')->store('transfer_proofs', 'public');
         }
 
-        $business = Business::findOrFail($user->business_id);
         $requestNo = 'TOPUP-' . date('YmdHis') . '-' . rand(100, 999);
 
         $topupReq = CoinTopupRequest::create([
@@ -376,14 +378,26 @@ class CoinTopupRequestController extends Controller
     /**
      * Public/Tenant: Get current conversion rate and bank account info
      */
-    public function getBankAndRateInfo()
+    public function getBankAndRateInfo(Request $request)
     {
+        $rate = self::getCurrentConversionRate();
+        $isCustom = false;
+        $user = $request->user() ?: auth('sanctum')->user();
+        if ($user && $user->business_id) {
+            $biz = Business::find($user->business_id);
+            if ($biz && $biz->coin_conversion_rate && (float)$biz->coin_conversion_rate > 0) {
+                $rate = (float)$biz->coin_conversion_rate;
+                $isCustom = true;
+            }
+        }
+
         return response()->json([
-            'rate_per_coin'       => self::getCurrentConversionRate(),
-            'bank_name'           => self::BANK_NAME,
-            'bank_account_name'   => self::BANK_ACCOUNT_NAME,
-            'bank_account_number' => self::BANK_ACCOUNT_NUMBER,
-            'admin_wa'            => self::ADMIN_WA_NUMBER,
+            'rate_per_coin'          => $rate,
+            'is_custom_business_rate'=> $isCustom,
+            'bank_name'              => self::BANK_NAME,
+            'bank_account_name'      => self::BANK_ACCOUNT_NAME,
+            'bank_account_number'    => self::BANK_ACCOUNT_NUMBER,
+            'admin_wa'               => self::ADMIN_WA_NUMBER,
         ]);
     }
 

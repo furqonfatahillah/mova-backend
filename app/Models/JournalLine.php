@@ -16,6 +16,8 @@ class JournalLine extends Model
         'debit',
         'credit',
         'memo',
+        'created_at',
+        'updated_at',
     ];
 
     protected $casts = [

@@ -318,6 +318,9 @@ class JournalController extends Controller
 
         $lines = $linesQuery->orderBy('entry_date', 'asc')->orderBy('id', 'asc')->get();
 
+        $trxIds = $lines->pluck('journalEntry.reference_id')->filter()->unique();
+        $transactionsMap = !empty($trxIds) ? \App\Models\Transaction::whereIn('id', $trxIds)->get()->keyBy('id') : collect();
+
         $runningBalance = $saldoAwal;
         $totalDebitPeriod = 0.0;
         $totalCreditPeriod = 0.0;
@@ -338,12 +341,23 @@ class JournalController extends Controller
             }
 
             $dateStr = is_string($l->entry_date) ? substr($l->entry_date, 0, 10) : ($l->entry_date ? $l->entry_date->format('Y-m-d') : '-');
+            $createdAt = $je?->created_at ?: $l->created_at;
+            if ($je && in_array($je->reference_type, ['TRANSACTION', 'OPEN_BILL_SETTLEMENT', 'VOID_TRANSACTION']) && !empty($je->reference_id)) {
+                $origTrx = $transactionsMap->get($je->reference_id);
+                if ($origTrx && $origTrx->created_at) {
+                    $createdAt = $origTrx->created_at;
+                }
+            }
+            $createdAtStr = $createdAt ? $createdAt->toDateTimeString() : null;
+            $timeStr = $createdAt ? $createdAt->format('H:i') : null;
 
             $items[] = [
                 'id'               => $l->id,
                 'journal_entry_id' => $l->journal_entry_id,
                 'entry_no'         => $je?->entry_no ?: "JE-{$l->journal_entry_id}",
                 'date'             => $dateStr,
+                'time'             => $timeStr,
+                'created_at'       => $createdAtStr,
                 'entry_type'       => $je?->entry_type ?: 'GENERAL',
                 'account_code'     => $l->account_code,
                 'account_name'     => $l->account?->name ?: "Akun {$l->account_code}",
@@ -476,10 +490,20 @@ class JournalController extends Controller
             ];
         });
 
+        $actualCreatedAt = $entry->created_at;
+        if (in_array($entry->reference_type, ['TRANSACTION', 'OPEN_BILL_SETTLEMENT', 'VOID_TRANSACTION']) && !empty($entry->reference_id)) {
+            $origTrx = \App\Models\Transaction::find($entry->reference_id);
+            if ($origTrx && $origTrx->created_at) {
+                $actualCreatedAt = $origTrx->created_at;
+            }
+        }
+        $rawDate = $entry->entry_date;
+        $dateOnly = $rawDate ? (is_string($rawDate) ? substr($rawDate, 0, 10) : $rawDate->format('Y-m-d')) : date('Y-m-d');
+
         return response()->json([
             'id'             => $entry->id,
             'entry_no'       => $entry->entry_no,
-            'entry_date'     => (string)$entry->entry_date,
+            'entry_date'     => $dateOnly,
             'entry_type'     => $entry->entry_type,
             'reference_type' => $entry->reference_type,
             'reference_id'   => $entry->reference_id,
@@ -490,7 +514,8 @@ class JournalController extends Controller
             'is_balanced'    => (bool)$entry->is_balanced,
             'outlet_name'    => $entry->outlet?->name ?: 'Maroa – Cabang Utama (Pusat)',
             'creator_name'   => $entry->creator?->name ?: 'Sistem Akuntansi',
-            'created_at'     => $entry->created_at?->toDateTimeString(),
+            'created_at'     => $actualCreatedAt?->toDateTimeString(),
+            'time'           => $actualCreatedAt ? $actualCreatedAt->format('H:i') : null,
             'lines'          => $lines,
         ]);
     }
@@ -553,17 +578,29 @@ class JournalController extends Controller
 
         $limit = (int)$request->input('limit', 300);
         $direction = strtolower((string)$request->input('direction', $request->input('sort_order', 'desc'))) === 'asc' ? 'asc' : 'desc';
-        $entries = $query->orderBy('entry_date', $direction)
-            ->orderBy('created_at', $direction)
+        $entries = $query->orderBy('entry_no', $direction)
             ->orderBy('id', $direction)
             ->limit($limit)
             ->get();
 
-        $items = $entries->map(function ($entry) {
+        $trxIds = $entries->whereIn('reference_type', ['TRANSACTION', 'OPEN_BILL_SETTLEMENT', 'VOID_TRANSACTION'])->pluck('reference_id')->filter()->unique();
+        $transactionsMap = !empty($trxIds) ? \App\Models\Transaction::whereIn('id', $trxIds)->get()->keyBy('id') : collect();
+
+        $items = $entries->map(function ($entry) use ($transactionsMap) {
+            $actualCreatedAt = $entry->created_at;
+            if (in_array($entry->reference_type, ['TRANSACTION', 'OPEN_BILL_SETTLEMENT', 'VOID_TRANSACTION']) && !empty($entry->reference_id)) {
+                $origTrx = $transactionsMap->get($entry->reference_id);
+                if ($origTrx && $origTrx->created_at) {
+                    $actualCreatedAt = $origTrx->created_at;
+                }
+            }
+            $rawDate = $entry->entry_date;
+            $dateOnly = $rawDate ? (is_string($rawDate) ? substr($rawDate, 0, 10) : $rawDate->format('Y-m-d')) : date('Y-m-d');
+
             return [
                 'id'             => $entry->id,
                 'entry_no'       => $entry->entry_no,
-                'entry_date'     => (string)$entry->entry_date,
+                'entry_date'     => $dateOnly,
                 'entry_type'     => $entry->entry_type,
                 'reference_type' => $entry->reference_type,
                 'reference_id'   => $entry->reference_id,
@@ -575,7 +612,8 @@ class JournalController extends Controller
                 'outlet_id'      => $entry->outlet_id,
                 'outlet_name'    => $entry->outlet?->name ?: 'Maroa – Cabang Utama (Pusat)',
                 'creator_name'   => $entry->creator?->name ?: 'Sistem Akuntansi',
-                'created_at'     => $entry->created_at?->toDateTimeString(),
+                'created_at'     => $actualCreatedAt?->toDateTimeString(),
+                'time'           => $actualCreatedAt ? $actualCreatedAt->format('H:i') : null,
                 'lines'          => $entry->lines->map(fn($l) => [
                     'id'           => $l->id,
                     'account_code' => $l->account_code,

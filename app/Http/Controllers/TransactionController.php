@@ -461,10 +461,8 @@ class TransactionController extends Controller
                 ], 422);
             }
 
-            // Enforce Shift Operational Date: The recognition date follows the shift opening date (e.g. shift opened on date 2, transaction on date 3 -> recognized on date 2)
-            $shiftDate = ($activeShift && !empty($activeShift->opened_at))
-                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
-                : ($data['date'] ?? now()->toDateString());
+            // Gunakan tanggal real saat transaksi terjadi (real calendar date)
+            $shiftDate = (!empty($clientOrderId) && !empty($data['date'])) ? $data['date'] : now()->toDateString();
 
             // Pre-validate recipes & resolve modifiers for all items
             $preparedItems = [];
@@ -1131,10 +1129,8 @@ class TransactionController extends Controller
             ], 422);
         }
 
-        // Enforce Shift Operational Date: The recognition date follows the shift opening date
-        $shiftDate = ($activeShift && !empty($activeShift->opened_at))
-            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
-            : ($data['date'] ?? now()->toDateString());
+        // Gunakan tanggal real saat transaksi terjadi (real calendar date)
+        $shiftDate = (!empty($clientOrderId) && !empty($data['date'])) ? $data['date'] : now()->toDateString();
 
         // Pre-resolve recipe and pricing
         $recipe = $menu->activeRecipe($shiftDate);
@@ -1474,10 +1470,8 @@ class TransactionController extends Controller
             ], 422);
         }
 
-        // Enforce Shift Operational Date: All transactions settled under this shift belong to the shift opening date
-        $date = ($activeShift && !empty($activeShift->opened_at))
-            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
-            : ($first->date ?: now()->toDateString());
+        // Gunakan tanggal real saat transaksi diselesaikan
+        $date = now()->toDateString();
 
         $customerId = !empty($data['customer_id']) ? (int)$data['customer_id'] : ($first->customer_id ?? null);
         $grossSubtotal = (float)$transactions->sum(fn($t) => (float)($t->subtotal ?: $t->total_price));
@@ -1827,9 +1821,7 @@ class TransactionController extends Controller
             $activeShift = \App\Models\Shift::find($existing->shift_id);
         }
         $shiftId = $activeShift ? $activeShift->id : $existing->shift_id;
-        $date = $activeShift && !empty($activeShift->opened_at)
-            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
-            : ($existing->date ?: now()->toDateString());
+        $date = now()->toDateString();
         $tableNumber = $existing->table_number;
         $customerName = $existing->customer_name;
         $orderType = $existing->order_type;
@@ -3004,7 +2996,7 @@ class TransactionController extends Controller
     public function approveVoidTransaction(Request $request, $orderNumber)
     {
         $user = $request->user();
-        if (!$user->isOwnerOrManager()) {
+        if (!$user->isOwnerOrManager() && !$user->hasPermission('pos_void_approve')) {
             return response()->json([
                 'message' => 'Akses Ditolak: Hanya Manajer atau Owner yang berhak menyetujui pembatalan (void) nota transaksi.'
             ], 403);
@@ -3060,7 +3052,7 @@ class TransactionController extends Controller
     public function rejectVoidTransaction(Request $request, $orderNumber)
     {
         $user = $request->user();
-        if (!$user->isOwnerOrManager()) {
+        if (!$user->isOwnerOrManager() && !$user->hasPermission('pos_void_approve')) {
             return response()->json([
                 'message' => 'Akses Ditolak: Hanya Manajer atau Owner yang berhak menolak permohonan void nota transaksi.'
             ], 403);
@@ -3118,9 +3110,9 @@ class TransactionController extends Controller
     public function voidRequests(Request $request)
     {
         $user = $request->user();
-        if (!$user->isOwnerOrManager()) {
+        if (!$user->isOwnerOrManager() && !$user->isPegawai() && !$user->hasPermission('pos_void_request') && !$user->hasPermission('pos_void_approve')) {
             return response()->json([
-                'message' => 'Akses Ditolak: Hanya Manajer atau Owner yang berhak mengakses halaman persetujuan void.'
+                'message' => 'Akses Ditolak: Anda tidak memiliki akses ke data permohonan void.'
             ], 403);
         }
 
@@ -3570,9 +3562,7 @@ class TransactionController extends Controller
             ], 422);
         }
 
-        $date = ($activeShift && !empty($activeShift->opened_at))
-            ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
-            : ($first->date ?: now()->toDateString());
+        $date = now()->toDateString();
         $tableNumber = $first->table_number;
         $customerName = !empty($data['customer_name']) ? trim($data['customer_name']) : ($first->customer_name ? "{$first->customer_name} (Bagian {$splitIndex})" : "Tamu {$splitIndex}");
         $businessId = (int)($request->user()->business_id ?: ($first->business_id ?: ($first->outlet?->business_id ?: 1)));
@@ -3852,9 +3842,7 @@ class TransactionController extends Controller
                 throw new \Exception('Shift kasir belum dibuka untuk cabang ini. Silakan buka shift kasir terlebih dahulu sebelum memproses pembayaran.');
             }
 
-            $date = ($activeShift && !empty($activeShift->opened_at))
-                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d'))
-                : ($first->date ?: now()->toDateString());
+            $date = now()->toDateString();
 
             // Create a payment record for this equal split installment
             $splitTrx = Transaction::create([

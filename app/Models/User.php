@@ -316,9 +316,9 @@ class User extends Authenticatable
                 && !in_array($target->role, ['owner_bisnis', 'owner', 'admin']);
         }
 
-        // Manager outlet / Owner outlet hanya bisa mengelola pegawai di outletnya
+        // Manager outlet / Owner outlet tidak bisa mengelola user (hanya Owner Bisnis yang berwenang)
         if ($this->isOwnerOutlet()) {
-            return (int)$this->outlet_id === (int)$target->outlet_id && $target->isPegawai();
+            return false;
         }
 
         return false;

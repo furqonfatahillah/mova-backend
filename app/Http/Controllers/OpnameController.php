@@ -662,7 +662,9 @@ class OpnameController extends Controller
             if (!$ingredient) continue;
 
             $targetOid = ($outletId && $outletId !== 'ALL' && $outletId !== 'all') ? (int)$outletId : null;
+            $konversi = max((float)$ingredient->konversi, 1);
             $hargaPerPakai = (float) $ingredient->costPerPakaiForOutlet($targetOid);
+            $hargaPerBeli = round($hargaPerPakai * $konversi, 2);
 
             if ($diff > 0) {
                 // Surplus: ADJUSTMENT_IN (+)
@@ -673,8 +675,10 @@ class OpnameController extends Controller
                     'outlet_id'     => $outletId,
                     'type'          => 'ADJUSTMENT_IN',
                     'qty'           => abs($diff),
-                    'unit_price'    => round($hargaPerPakai, 2),
+                    'unit_price'    => $hargaPerBeli,
                     'total_price'   => round(abs($diff) * $hargaPerPakai, 2),
+                    'cost_before'   => round($hargaPerPakai, 4),
+                    'cost_after'    => round($hargaPerPakai, 4),
                     'note'          => "Penyesuaian Opname Fisik {$opnameNo} (Surplus +)",
                     'user_id'       => $user->id,
                     'created_by'    => $user->id,
@@ -688,8 +692,10 @@ class OpnameController extends Controller
                     'outlet_id'     => $outletId,
                     'type'          => 'ADJUSTMENT_OUT',
                     'qty'           => abs($diff),
-                    'unit_price'    => round($hargaPerPakai, 2),
+                    'unit_price'    => $hargaPerBeli,
                     'total_price'   => round(abs($diff) * $hargaPerPakai, 2),
+                    'cost_before'   => round($hargaPerPakai, 4),
+                    'cost_after'    => round($hargaPerPakai, 4),
                     'note'          => "Penyesuaian Opname Fisik {$opnameNo} (Selisih Kurang -)",
                     'user_id'       => $user->id,
                     'created_by'    => $user->id,

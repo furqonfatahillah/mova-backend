@@ -156,10 +156,13 @@ class Transaction extends Model
 
     public function getIsUnlimitedModeAttribute(): bool
     {
-        if (array_key_exists('is_unlimited_mode', $this->attributes) && $this->attributes['is_unlimited_mode'] !== null) {
-            return (bool)$this->attributes['is_unlimited_mode'];
+        if (!empty($this->attributes['is_unlimited_mode'])) {
+            return true;
         }
-        return (bool)($this->business?->is_unlimited ?? false);
+        if ($this->business && (bool)$this->business->is_unlimited) {
+            return true;
+        }
+        return false;
     }
 
     public function isOpenBill(): bool

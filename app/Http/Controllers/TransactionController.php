@@ -1529,8 +1529,9 @@ class TransactionController extends Controller
                 $t->save();
 
                 // Only deduct stock if not already deducted at open bill creation (prevents double stock deduction)
+                // Di Mode Unlimited: stok tidak dipotong
                 $alreadyDeducted = StockMovement::where('transaction_id', $t->id)->exists();
-                if (!$alreadyDeducted) {
+                if (!$alreadyDeducted && !$t->is_unlimited_mode) {
                     // Deduct stock for DIRECT retail items
                     $menu = $t->menu;
                     if ($menu) {

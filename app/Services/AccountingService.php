@@ -697,12 +697,7 @@ class AccountingService
 
         // B. COGS & Inventory Usage Side (HPP & Pengurangan Persediaan)
         // Check if this transaction was performed under Mode Unlimited
-        $isUnlimitedTx = false;
-        if (array_key_exists('is_unlimited_mode', $t->getAttributes()) && $t->getAttributes()['is_unlimited_mode'] !== null) {
-            $isUnlimitedTx = (bool)$t->is_unlimited_mode;
-        } else {
-            $isUnlimitedTx = (bool)($t->business?->is_unlimited ?? false);
-        }
+        $isUnlimitedTx = (bool)($t->is_unlimited_mode || ($t->business && $t->business->is_unlimited));
 
         $cogsBahan = 0.0;
         $cogsPlk = 0.0;
@@ -774,8 +769,9 @@ class AccountingService
                             $cogsBahan += $itemCost;
                         }
                     } elseif ($menu->item_type === 'RECIPE' || $menu->is_recipe) {
-                        // Untuk menu olahan resep (RECIPE): hanya hitung HPP jika resep & gramasi diinputkan.
-                        $recipe = $menu->recipes->firstWhere('version', $t->recipe_version) ?: $menu->recipes->first();
+                        // Untuk menu olahan resep (RECIPE): hanya hitung HPP jika transaksi memang memiliki recipe_version saat transaksi dibuat.
+                        // JANGAN fallback ke $menu->recipes->first() jika transaksi dibuat tanpa resep (recipe_version null)!
+                        $recipe = $t->recipe_version ? $menu->recipes->firstWhere('version', $t->recipe_version) : null;
                         if ($recipe && $recipe->items && $recipe->items->isNotEmpty()) {
                             foreach ($recipe->items as $it) {
                                 $ing = $it->ingredient;
@@ -1476,13 +1472,12 @@ class AccountingService
             }
         }
 
-        // Add collections from kasbon payments received in cash
+        // Pelunasan kasbon/piutang tidak dihitung ke penjualan tunai shift kasir
         $cashRec = 0.0;
         foreach ($shiftRecPayments as $rp) {
             $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
             $rpPrice = (float)$rp->amount;
             if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
-                $cashSales += $rpPrice;
                 $cashRec += $rpPrice;
             }
         }
@@ -1491,8 +1486,8 @@ class AccountingService
         $expData = self::calculateShiftExpenses($shift);
         $cashExpenses = (float)$expData['cash_expenses'];
 
-        // Real expected cash in drawer based on cash in vs cash out (can be negative if expenses were partially paid/covered by cashier)
-        $expectedCash = round($initialCash + $cashSales - $cashExpenses, 2);
+        // Real expected cash in drawer based on cash in vs cash out (includes cash from pelunasan kasbon/piutang)
+        $expectedCash = round($initialCash + $cashSales + $cashRec - $cashExpenses, 2);
         $closingCash = $shift->closing_cash !== null ? (float)$shift->closing_cash : null;
         $diff = $closingCash !== null ? round($closingCash - $expectedCash, 2) : 0.0;
 

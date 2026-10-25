@@ -109,20 +109,12 @@ class SalesReportController extends Controller
         $transactions = $query->get();
 
         // Group by menu_id (or fallback key)
+        // Group by menu_id (or fallback key)
         $grouped = [];
         foreach ($transactions as $t) {
             $menuId = $t->menu_id ?: ('CUSTOM_' . ($t->notes ?: 'Lain-lain'));
             if (!isset($grouped[$menuId])) {
                 $menu = $t->menu;
-                $isUnlimitedTrx = (bool)($t->is_unlimited_mode ?? $t->business?->is_unlimited);
-                $calculatedHpp = 0.0;
-                if (!$isUnlimitedTrx) {
-                    $calculatedHpp = $menu ? (float)$menu->calculateHpp($t->date, $outletId ?: $t->outlet_id) : 0.0;
-                    if ($calculatedHpp <= 0 && $menu && $menu->item_type === 'DIRECT') {
-                        $calculatedHpp = (float)($menu->cost_price ?: 0);
-                    }
-                }
-
                 $grouped[$menuId] = [
                     'menu_id'            => $t->menu_id,
                     'code'               => $menu?->code ?: ($t->menu_id ? (string)$t->menu_id : '-'),
@@ -130,23 +122,40 @@ class SalesReportController extends Controller
                     'qty_sold'           => 0,
                     'qty_refund'         => 0,
                     'unit'               => $menu?->unit ?: 'Cup',
-                    'cost_price'         => $calculatedHpp,
+                    'cost_price'         => 0.0,
                     'price'              => (float)($menu?->price ?: ($t->total_price / max(1, $t->qty))),
                     'discount_amount'    => 0.0,
                     'total_sales'        => 0.0,
                     'total_refund'       => 0.0,
+                    'total_cogs'         => 0.0,
                 ];
             }
 
             if ($t->status === 'PAID') {
+                $menu = $t->menu;
+                $isUnlimitedTrx = (bool)($t->is_unlimited_mode || ($t->business && $t->business->is_unlimited));
+                $trxHpp = 0.0;
+                // Hanya hitung HPP jika bukan mode unlimited dan menu memiliki resep/gramasi saat transaksi dibuat
+                if (!$isUnlimitedTrx && ($t->recipe_version || ($menu && $menu->item_type === 'DIRECT'))) {
+                    $trxHpp = $menu ? (float)$menu->calculateHpp($t->date, $outletId ?: $t->outlet_id) : 0.0;
+                    if ($trxHpp <= 0 && $menu && $menu->item_type === 'DIRECT') {
+                        $trxHpp = (float)($menu->cost_price ?: 0);
+                    }
+                }
                 $grouped[$menuId]['qty_sold'] += (int)$t->qty;
                 $grouped[$menuId]['discount_amount'] += (float)$t->discount_amount;
                 $grouped[$menuId]['total_sales'] += (float)$t->subtotal;
+                $grouped[$menuId]['total_cogs'] += ($trxHpp * (int)$t->qty);
             } elseif ($t->status === 'CANCELLED') {
                 $grouped[$menuId]['qty_refund'] += (int)$t->qty;
                 $grouped[$menuId]['total_refund'] += (float)$t->subtotal;
             }
         }
+
+        foreach ($grouped as &$g) {
+            $g['cost_price'] = $g['qty_sold'] > 0 ? round($g['total_cogs'] / $g['qty_sold'], 2) : 0.0;
+        }
+        unset($g);
 
         // Comparison Period Data
         $comparePeriod = $this->resolveComparePeriod($request, $request->from, $request->to);
@@ -207,7 +216,7 @@ class SalesReportController extends Controller
         $summary = [
             'total_qty_sold'    => array_sum(array_column($items, 'qty_sold')),
             'total_qty_refund'  => array_sum(array_column($items, 'qty_refund')),
-            'total_modal'       => array_reduce($items, fn($carry, $it) => $carry + ($it['cost_price'] * $it['qty_sold']), 0.0),
+            'total_modal'       => array_sum(array_column($items, 'total_cogs')),
             'total_discount'    => array_sum(array_column($items, 'discount_amount')),
             'total_sales'       => array_sum(array_column($items, 'total_sales')),
             'total_refund'      => array_sum(array_column($items, 'total_refund')),
@@ -676,9 +685,9 @@ class SalesReportController extends Controller
             }
 
             $qty = (int)$t->qty;
-            $isUnlimitedTrx = (bool)($t->is_unlimited_mode ?? $t->business?->is_unlimited);
+            $isUnlimitedTrx = (bool)($t->is_unlimited_mode || ($t->business && $t->business->is_unlimited));
             $hpp = 0.0;
-            if (!$isUnlimitedTrx) {
+            if (!$isUnlimitedTrx && ($t->recipe_version || ($menu && $menu->item_type === 'DIRECT'))) {
                 $hpp = $menu ? (float)$menu->calculateHpp($t->date, $t->outlet_id) : 0.0;
                 if ($hpp <= 0 && $menu && $menu->item_type === 'DIRECT') {
                     $hpp = (float)($menu->cost_price ?: 0);

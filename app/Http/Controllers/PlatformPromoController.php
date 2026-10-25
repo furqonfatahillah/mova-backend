@@ -727,13 +727,14 @@ class PlatformPromoController extends Controller
 
         $promoBiz = PlatformPromoBusiness::where('id', $id)
             ->where('business_id', $businessId)
+            ->with('platformPromo')
             ->firstOrFail();
 
         if ($promoBiz->status === 'REVOKED') {
             return response()->json(['message' => 'Promo ini telah dicabut oleh Platform Admin.'], 422);
         }
 
-        DB::transaction(function () use ($promoBiz, $user) {
+        DB::transaction(function () use ($promoBiz, $user, $businessId) {
             $promoBiz->update([
                 'approval_status'  => 'ACCEPTED',
                 'approved_at'      => now(),
@@ -744,14 +745,55 @@ class PlatformPromoController extends Controller
                 'status'           => 'ACTIVE',
             ]);
 
-            // Activate discount in POS
+            $platformPromo = $promoBiz->platformPromo;
+            $discount = null;
+
             if ($promoBiz->discount_id) {
-                Discount::withoutGlobalScopes()
-                    ->where('id', $promoBiz->discount_id)
-                    ->update([
-                        'active' => true,
-                        'notes'  => "Promo Platform Superadmin (Disetujui oleh Owner: {$user->name})",
-                    ]);
+                $discount = Discount::withoutGlobalScopes()->find($promoBiz->discount_id);
+            }
+            if (!$discount && $platformPromo) {
+                $discount = Discount::withoutGlobalScopes()
+                    ->where('business_id', $businessId)
+                    ->where('platform_promo_id', $platformPromo->id)
+                    ->first();
+            }
+
+            $today = now()->toDateString();
+            $startDate = $promoBiz->start_date ? min($promoBiz->start_date, $today) : $today;
+            $endDate = $promoBiz->end_date ?? ($platformPromo ? $platformPromo->end_date?->format('Y-m-d') : null) ?? now()->addMonths(1)->toDateString();
+
+            if (!$discount && $platformPromo) {
+                $discount = Discount::withoutGlobalScopes()->create([
+                    'business_id'         => $businessId,
+                    'platform_promo_id'   => $platformPromo->id,
+                    'is_platform_promo'   => true,
+                    'name'                => $platformPromo->title,
+                    'code'                => $platformPromo->code,
+                    'type'                => $platformPromo->type,
+                    'value'               => $platformPromo->value,
+                    'min_order_amount'    => $platformPromo->min_order_amount,
+                    'max_discount_amount' => $platformPromo->max_discount_amount,
+                    'start_date'          => $startDate,
+                    'end_date'            => $endDate,
+                    'usage_limit'         => $promoBiz->usage_limit ?? $platformPromo->default_usage_limit ?? 50,
+                    'used_count'          => $promoBiz->used_count ?? 0,
+                    'is_auto_apply'       => false,
+                    'active'              => true,
+                    'notes'               => "Promo Platform Superadmin (Disetujui oleh Owner: {$user->name})",
+                    'created_by'          => $user->id,
+                    'updated_by'          => $user->id,
+                ]);
+            } elseif ($discount) {
+                $discount->update([
+                    'active'     => true,
+                    'start_date' => $discount->start_date && $discount->start_date <= $today ? $discount->start_date : $today,
+                    'end_date'   => $endDate,
+                    'notes'      => "Promo Platform Superadmin (Disetujui oleh Owner: {$user->name})",
+                ]);
+            }
+
+            if ($discount && $promoBiz->discount_id !== $discount->id) {
+                $promoBiz->update(['discount_id' => $discount->id]);
             }
         });
 

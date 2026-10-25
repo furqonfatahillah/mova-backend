@@ -158,14 +158,21 @@ class CoinPlatformController extends Controller
         }
 
         // Apply to all businesses
-        $updateData = ['coins_per_transaction' => $rate, 'updated_by' => $request->user()->id];
-        if ($isUnlimited !== null) {
-            $updateData['is_unlimited_coins'] = $isUnlimited;
+        $expiresAt = !empty($data['expires_at']) ? $data['expires_at'] : null;
+        $conversionRateParam = $request->has('coin_conversion_rate') ? $request->input('coin_conversion_rate') : 'NO_CHANGE';
+
+        $allBusinesses = Business::all();
+        foreach ($allBusinesses as $b) {
+            CoinService::updateRate(
+                (int)$b->id,
+                $rate,
+                $isUnlimited,
+                $request->user()->id,
+                $expiresAt,
+                $pkg,
+                $conversionRateParam
+            );
         }
-        if (!empty($data['expires_at'])) {
-            $updateData['expires_at'] = \Carbon\Carbon::parse($data['expires_at'])->endOfDay();
-        }
-        Business::query()->update($updateData);
 
         $statusText = $isUnlimited ? 'Unlimited (Bebas Koin)' : "{$rate} koin/nota";
         return response()->json([

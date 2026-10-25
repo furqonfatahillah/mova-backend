@@ -12,6 +12,28 @@ use Illuminate\Support\Facades\Log;
 class PaymentConfigurationController extends Controller
 {
     // ==========================================
+    // ==========================================
+    // HELPER: RESOLVE BUSINESS ID
+    // ==========================================
+    private function resolveBusinessId(Request $request): ?int
+    {
+        $user = $request->user();
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || (bool)($user->is_superadmin_platform ?? false);
+
+        $headerId = $request->header('X-Business-Id');
+        $queryId  = $request->query('business_id');
+        $inputId  = $request->input('business_id');
+
+        $bId = $headerId ?? $queryId ?? $inputId ?? $user->business_id;
+
+        if ($bId && $bId !== 'ALL' && $bId !== 'all') {
+            return (int)$bId;
+        }
+
+        return $user->business_id ? (int)$user->business_id : null;
+    }
+
+    // ==========================================
     // 1. REKENING BANK & QRIS TOKO
     // ==========================================
 
@@ -24,27 +46,41 @@ class PaymentConfigurationController extends Controller
             ->orderBy('is_primary', 'desc')
             ->orderBy('created_at', 'desc');
 
-        if ($isPlatformAdmin && ($request->boolean('all_tenants') || $request->filled('business_id'))) {
-            if ($request->filled('business_id') && $request->business_id !== 'ALL' && $request->business_id !== 'all') {
-                $query->where('business_id', $request->business_id);
-            }
-        } else {
+        $businessId = $this->resolveBusinessId($request);
+
+        if ($businessId) {
+            $query->where('business_id', $businessId);
+        } elseif (!$isPlatformAdmin) {
             $query->where('business_id', $user->business_id);
         }
 
-        if ($request->filled('outlet_id') && $request->outlet_id !== 'ALL' && $request->outlet_id !== 'all') {
-            if ($request->outlet_id === 'GLOBAL' || $request->outlet_id === 'global') {
+        // Outlet filtering
+        $outletId = $request->input('outlet_id');
+        if (!$request->filled('outlet_id') && $user && $user->outlet_id && !$isPlatformAdmin && !$user->isOwnerBisnis()) {
+            $outletId = $user->outlet_id;
+        }
+
+        // If explicitly requested all_outlets (e.g. from Multi QRIS Settings page), do not restrict by outlet
+        if ($request->boolean('all_outlets')) {
+            $outletId = null;
+        }
+
+        if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
+            if ($outletId === 'GLOBAL' || $outletId === 'global') {
                 $query->whereNull('outlet_id');
             } elseif ($request->boolean('exact_outlet')) {
-                $query->where('outlet_id', $request->outlet_id);
+                $query->where('outlet_id', $outletId);
             } else {
                 // POS & General query mode: Return outlet-specific QRIS + global QRIS
-                $query->where(function ($q) use ($request) {
-                    $q->where('outlet_id', $request->outlet_id)
+                $query->where(function ($q) use ($outletId) {
+                    $q->where('outlet_id', $outletId)
                       ->orWhereNull('outlet_id');
                 });
-                // Prioritize this outlet's specific QRIS first, then global
-                $query->orderByRaw('CASE WHEN outlet_id = ? THEN 0 ELSE 1 END', [$request->outlet_id]);
+                // Prioritize this outlet's specific QRIS first, then primary, then global
+                $query->reorder()
+                      ->orderByRaw('CASE WHEN outlet_id = ? THEN 0 ELSE 1 END', [$outletId])
+                      ->orderBy('is_primary', 'desc')
+                      ->orderBy('created_at', 'desc');
             }
         }
 
@@ -85,9 +121,7 @@ class PaymentConfigurationController extends Controller
         $validated['account_number'] = !empty($validated['account_number']) ? $validated['account_number'] : 'QRIS';
         $validated['account_holder'] = !empty($validated['account_holder']) ? $validated['account_holder'] : 'QRIS Toko';
 
-        $targetBusinessId = ($isPlatformAdmin && !empty($validated['business_id']))
-            ? $validated['business_id']
-            : $user->business_id;
+        $targetBusinessId = $this->resolveBusinessId($request);
 
         // Normalize outlet_id input ('', 'null', 'GLOBAL', 'ALL' => null)
         $rawOutletId = $request->input('outlet_id');
@@ -97,17 +131,34 @@ class PaymentConfigurationController extends Controller
             $validated['outlet_id'] = $rawOutletId ? (int)$rawOutletId : null;
         }
 
-        // Validate outlet belongs to business
+        // Validate outlet belongs to business or reconcile targetBusinessId from outlet
         if ($validated['outlet_id']) {
-            $outlet = \App\Models\Outlet::where('business_id', $targetBusinessId)
-                ->where('id', $validated['outlet_id'])
-                ->first();
+            $outlet = null;
+            if ($targetBusinessId) {
+                $outlet = \App\Models\Outlet::where('business_id', $targetBusinessId)
+                    ->where('id', $validated['outlet_id'])
+                    ->first();
+            }
+            if (!$outlet) {
+                $outletAny = \App\Models\Outlet::find($validated['outlet_id']);
+                if ($outletAny) {
+                    $outlet = $outletAny;
+                    $targetBusinessId = $outletAny->business_id;
+                }
+            }
             if (!$outlet) {
                 return response()->json([
                     'status' => 'error',
                     'message' => 'Cabang outlet yang dipilih tidak valid atau tidak terdaftar pada bisnis ini.',
                 ], 422);
             }
+        }
+
+        if (!$targetBusinessId) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Bisnis tidak terdeteksi. Silakan pilih bisnis aktif terlebih dahulu.',
+            ], 422);
         }
 
         if ($request->hasFile('qr_image')) {
@@ -175,7 +226,10 @@ class PaymentConfigurationController extends Controller
 
         $query = BankAccount::query();
         if (!$isPlatformAdmin) {
-            $query->where('business_id', $user->business_id);
+            $businessId = $this->resolveBusinessId($request);
+            if ($businessId) {
+                $query->where('business_id', $businessId);
+            }
         }
         $account = $query->findOrFail($id);
 
@@ -263,10 +317,20 @@ class PaymentConfigurationController extends Controller
 
     public function destroyBankAccount(Request $request, $id)
     {
-        $businessId = $request->user()->business_id;
-        $account = BankAccount::where('business_id', $businessId)->findOrFail($id);
+        $user = $request->user();
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || (bool)($user->is_superadmin_platform ?? false);
+
+        $query = BankAccount::query();
+        if (!$isPlatformAdmin) {
+            $businessId = $this->resolveBusinessId($request);
+            if ($businessId) {
+                $query->where('business_id', $businessId);
+            }
+        }
+        $account = $query->findOrFail($id);
         $wasPrimary = $account->is_primary;
         $scopeOutletId = $account->outlet_id;
+        $businessId = $account->business_id;
 
         $account->delete();
 
@@ -292,8 +356,18 @@ class PaymentConfigurationController extends Controller
 
     public function setPrimaryBankAccount(Request $request, $id)
     {
-        $businessId = $request->user()->business_id;
-        $account = BankAccount::where('business_id', $businessId)->findOrFail($id);
+        $user = $request->user();
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || (bool)($user->is_superadmin_platform ?? false);
+
+        $query = BankAccount::query();
+        if (!$isPlatformAdmin) {
+            $businessId = $this->resolveBusinessId($request);
+            if ($businessId) {
+                $query->where('business_id', $businessId);
+            }
+        }
+        $account = $query->findOrFail($id);
+        $businessId = $account->business_id;
 
         if ($account->outlet_id) {
             BankAccount::where('business_id', $businessId)
@@ -320,8 +394,17 @@ class PaymentConfigurationController extends Controller
 
     public function toggleActiveBankAccount(Request $request, $id)
     {
-        $businessId = $request->user()->business_id;
-        $account = BankAccount::where('business_id', $businessId)->findOrFail($id);
+        $user = $request->user();
+        $isPlatformAdmin = in_array($user->role, ['superadmin_platform', 'superadmin', 'owner_website']) || (bool)($user->is_superadmin_platform ?? false);
+
+        $query = BankAccount::query();
+        if (!$isPlatformAdmin) {
+            $businessId = $this->resolveBusinessId($request);
+            if ($businessId) {
+                $query->where('business_id', $businessId);
+            }
+        }
+        $account = $query->findOrFail($id);
         $account->update(['is_active' => !$account->is_active]);
 
         return response()->json([
@@ -337,7 +420,7 @@ class PaymentConfigurationController extends Controller
 
     public function getGatewayConfig(Request $request)
     {
-        $businessId = $request->user()->business_id;
+        $businessId = $this->resolveBusinessId($request);
         $config = PaymentGatewaySetting::where('business_id', $businessId)->first();
 
         if (!$config) {
@@ -367,7 +450,7 @@ class PaymentConfigurationController extends Controller
 
     public function saveGatewayConfig(Request $request)
     {
-        $businessId = $request->user()->business_id;
+        $businessId = $this->resolveBusinessId($request);
 
         $validated = $request->validate([
             'active_gateway'        => 'required|string|in:none,midtrans,xendit',

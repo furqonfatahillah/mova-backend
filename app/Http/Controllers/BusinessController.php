@@ -204,8 +204,22 @@ class BusinessController extends Controller
             'is_unlimited_coins' => 'nullable|boolean',
         ]);
 
+        $wasUnlimited = (bool)$business->is_unlimited;
         $data['updated_by'] = $user->id;
         $business->update($data);
+
+        // Jika beralih dari unlimited ke premium, kunci seluruh transaksi masa lalu dan pastikan koin awal 0
+        if ($wasUnlimited && !$business->fresh()->is_unlimited) {
+            \App\Models\Transaction::where('business_id', $business->id)
+                ->where('is_unlimited_mode', false)
+                ->update(['is_unlimited_mode' => true]);
+
+            // Koin awal harus 0 jika belum pernah ada riwayat top-up
+            if (!\App\Services\CoinService::hasTopupHistory($business->id)) {
+                $business->coin_balance = 0.00;
+                $business->save();
+            }
+        }
 
         // Jika bisnis diaktifkan, otomatis aktifkan user owner_bisnis yang pending
         if (isset($data['status']) && $data['status'] === 'active') {

@@ -97,7 +97,7 @@ class AuthController extends Controller
                     'status'                => 'active', // Langsung Aktif tanpa perlu approval
                     'is_unlimited_coins'    => true,     // Mode Unlimited Gratis
                     'coins_per_transaction' => 0,        // Bebas potong koin
-                    'coin_balance'          => 10000,
+                    'coin_balance'          => 0.00,
                     'expires_at'            => null,     // Gratis permanen tanpa batas waktu
                 ]);
 

@@ -146,7 +146,9 @@ class CoinService
         return DB::transaction(function () use ($businessId, $coins, $paymentAmount, $paymentReference, $notes, $adminId) {
             $business = Business::where('id', $businessId)->lockForUpdate()->firstOrFail();
 
-            $before = (float)($business->coin_balance ?: 0.00);
+            // Jika belum pernah ada riwayat top-up sebelumnya, saldo awal sebelum top-up ini harus 0 (bukan nilai dummy registrasi)
+            $hasPreviousTopup = self::hasTopupHistory($businessId);
+            $before = $hasPreviousTopup ? (float)($business->coin_balance ?: 0.00) : 0.00;
             $after = $before + $coins;
 
             $business->coin_balance = $after;
@@ -197,6 +199,8 @@ class CoinService
                 : null;
         }
 
+        $wasUnlimited = (bool)$business->is_unlimited;
+
         if ($packageType) {
             $business->package_type = $packageType;
             $business->is_unlimited_coins = ($packageType === 'unlimited') ? true : (bool)$isUnlimited;
@@ -228,5 +232,32 @@ class CoinService
 
         $business->updated_by = $adminId;
         $business->save();
+
+        // Jika beralih dari unlimited ke premium / penggunaan koin:
+        if ($wasUnlimited && !$business->is_unlimited) {
+            // 1. Kunci seluruh transaksi sebelumnya agar HPP tetap 0 selamanya
+            \App\Models\Transaction::where('business_id', $business->id)
+                ->where('is_unlimited_mode', false)
+                ->update(['is_unlimited_mode' => true]);
+
+            // 2. Koin awal harus 0 jika belum pernah ada riwayat top-up (kecuali ada sisa dari riwayat top-up)
+            if (!self::hasTopupHistory($business->id)) {
+                $business->coin_balance = 0.00;
+                $business->save();
+            }
+        }
+    }
+
+    /**
+     * Cek apakah bisnis pernah memiliki riwayat top-up koin yang sah
+     */
+    public static function hasTopupHistory(int $businessId): bool
+    {
+        return CoinTransaction::where('business_id', $businessId)
+            ->where('type', 'TOPUP')
+            ->exists()
+            || \App\Models\CoinTopupRequest::where('business_id', $businessId)
+                ->where('status', 'APPROVED')
+                ->exists();
     }
 }

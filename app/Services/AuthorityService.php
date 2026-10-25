@@ -303,6 +303,7 @@ class AuthorityService
                 'color'       => '#10b981',
                 'permissions' => [
                     'pos_checkout',
+                    'pos_promo',
                     'pos_open_bill',
                     'pos_split_bill',
                     'pos_shift_recap',

@@ -116,45 +116,8 @@ class ShiftController extends Controller
             ->select('shift_id', 'payment_method', 'dp_payment_method', 'total_price', 'amount_paid')
             ->get();
 
-        // Fetch receivable payments collected during these shifts (supporting both shift_id and time-window fallback)
-        $receivablePayments = ReceivablePayment::with('receivable')
-            ->where(function ($query) use ($shiftIds, $shifts) {
-                $query->whereIn('shift_id', $shiftIds);
-                foreach ($shifts as $s) {
-                    $query->orWhere(function ($sub) use ($s) {
-                        $sub->whereNull('shift_id')
-                            ->where('outlet_id', $s->outlet_id);
-                        if ($s->opened_at && $s->closed_at) {
-                            $sub->whereBetween('created_at', [$s->opened_at, $s->closed_at]);
-                        } elseif ($s->opened_at) {
-                            $sub->where('created_at', '>=', $s->opened_at);
-                        }
-                    });
-                }
-            })
-            ->get();
-
+        // Receivable payments are handled by management authority and not tracked inside cashier shifts
         $recPaymentsByShift = [];
-        foreach ($receivablePayments as $rp) {
-            $sId = $rp->shift_id;
-            if (!$sId) {
-                foreach ($shifts as $s) {
-                    if ($s->outlet_id == $rp->outlet_id) {
-                        if ($s->opened_at && $s->closed_at && $rp->created_at >= $s->opened_at && $rp->created_at <= $s->closed_at) {
-                            $sId = $s->id;
-                            break;
-                        } elseif ($s->opened_at && !$s->closed_at && $rp->created_at >= $s->opened_at) {
-                            $sId = $s->id;
-                            break;
-                        }
-                    }
-                }
-            }
-            if ($sId) {
-                if (!isset($recPaymentsByShift[$sId])) $recPaymentsByShift[$sId] = collect();
-                $recPaymentsByShift[$sId]->push($rp);
-            }
-        }
 
         // Fetch Kasbon records originated by these shifts to know their settlement status
         $kasbonReceivables = \App\Models\Receivable::whereIn('shift_id', $shiftIds)
@@ -234,37 +197,7 @@ class ShiftController extends Controller
             }
         }
 
-        // Add collections from kasbon payments received during each shift into their respective payment method
-        foreach ($recPaymentsByShift as $sId => $rpList) {
-            if (!isset($breakdownByShift[$sId])) continue;
-            foreach ($rpList as $rp) {
-                $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
-                $rpAmt = (float)$rp->amount;
 
-                if (!isset($breakdownByShift[$sId]['details'][$rpMethod])) {
-                    $breakdownByShift[$sId]['details'][$rpMethod] = 0.0;
-                }
-                $breakdownByShift[$sId]['details'][$rpMethod] += $rpAmt;
-
-                if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
-                    $breakdownByShift[$sId]['cash'] += $rpAmt;
-                } elseif (str_contains($rpMethod, 'QRIS')) {
-                    $breakdownByShift[$sId]['qris'] += $rpAmt;
-                } elseif (str_contains($rpMethod, 'GOFOOD') || str_contains($rpMethod, 'GOJEK')) {
-                    $breakdownByShift[$sId]['gofood'] = ($breakdownByShift[$sId]['gofood'] ?? 0.0) + $rpAmt;
-                } elseif (str_contains($rpMethod, 'SHOPEE')) {
-                    $breakdownByShift[$sId]['shopee'] = ($breakdownByShift[$sId]['shopee'] ?? 0.0) + $rpAmt;
-                } elseif (str_contains($rpMethod, 'GRAB')) {
-                    $breakdownByShift[$sId]['grab'] = ($breakdownByShift[$sId]['grab'] ?? 0.0) + $rpAmt;
-                } elseif (str_contains($rpMethod, 'TRANSFER')) {
-                    $breakdownByShift[$sId]['transfer'] += $rpAmt;
-                } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
-                    $breakdownByShift[$sId]['debit'] += $rpAmt;
-                } else {
-                    $breakdownByShift[$sId]['other'] += $rpAmt;
-                }
-            }
-        }
 
         // Fetch relevant closed shifts for the outlets in $shifts to calculate selisih modal awal vs kas fisik akhir shift sebelumnya
         $outletIds = $shifts->pluck('outlet_id')->unique()->filter()->values();
@@ -345,26 +278,6 @@ class ShiftController extends Controller
                 }
             }
 
-            // Collections received during this shift (money entering via cash/qris/transfer to settle kasbon)
-            $shiftRpList = $recPaymentsByShift[$s->id] ?? collect();
-            $rpCollections = [
-                'total'    => (float)$shiftRpList->sum('amount'),
-                'cash'     => 0.0,
-                'qris'     => 0.0,
-                'transfer' => 0.0,
-                'debit'    => 0.0,
-                'other'    => 0.0,
-            ];
-            foreach ($shiftRpList as $rp) {
-                $amt = (float)$rp->amount;
-                $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
-                if ($m === 'CASH' || $m === 'TUNAI') $rpCollections['cash'] += $amt;
-                elseif (str_contains($m, 'QRIS')) $rpCollections['qris'] += $amt;
-                elseif (str_contains($m, 'TRANSFER')) $rpCollections['transfer'] += $amt;
-                elseif (str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'CREDIT')) $rpCollections['debit'] += $amt;
-                else $rpCollections['other'] += $amt;
-            }
-
             $s->kasbon_sales = (float)($bd['kasbon'] ?? 0.0);
             if ($s->kasbon_sales == 0 && $kbTotal > 0) {
                 $s->kasbon_sales = $kbTotal;
@@ -372,7 +285,7 @@ class ShiftController extends Controller
             $s->kasbon_settled = $kbPaid;
             $s->kasbon_remaining = $kbRemaining;
             $s->kasbon_settlement_methods = $kbSettlementMethods;
-            $s->receivable_collections = $rpCollections;
+            $s->receivable_collections = null;
 
             $s->other_sales = $bd['other'];
             $s->payment_breakdown = $bd['details'];
@@ -683,7 +596,7 @@ class ShiftController extends Controller
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
             } elseif (in_array($method, ['KASBON', 'PIUTANG']) || str_contains($method, 'KASBON') || str_contains($method, 'PIUTANG')) {
                 $kasbonSales += $price;
-                $nonCashSales += $price;
+                // Kasbon is unpaid debt, do NOT add to nonCashSales
                 $paymentBreakdown[$method] = ($paymentBreakdown[$method] ?? 0.0) + $price;
                 if (!$hasShiftRecPayments) {
                     $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
@@ -705,28 +618,7 @@ class ShiftController extends Controller
             }
         }
 
-        // Add collections from kasbon payments received during this shift
-        foreach ($shiftRecPayments as $rp) {
-            $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
-            $rpPrice = (float)$rp->amount;
-            $paymentBreakdown[$rpMethod] = ($paymentBreakdown[$rpMethod] ?? 0.0) + $rpPrice;
-
-            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
-                $cashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'QRIS')) {
-                $qrisSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'TRANSFER')) {
-                $transferSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
-                $debitSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } else {
-                $otherSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            }
-        }
+        // Pelunasan kasbon dikelola terpisah di modul piutang, tidak dihitung ke penjualan shift kasir
 
         $totalPaymentsReceived = $cashSales + $nonCashSales;
         if ($totalSales < $totalPaymentsReceived) {
@@ -848,6 +740,23 @@ class ShiftController extends Controller
             else $rpCollections['other'] += $amt;
         }
 
+        $receivablePaymentsList = [];
+        foreach ($shiftRecPayments as $rp) {
+            $rec = $rp->receivable;
+            $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $receivablePaymentsList[] = [
+                'id'             => $rp->id,
+                'payment_no'     => $rp->payment_no ?: ('PAY-' . $rp->id),
+                'receivable_no'  => $rec?->receivable_no ?: ($rec?->order_number ?: '-'),
+                'customer_name'  => $rec?->customer_name ?: 'Pelanggan',
+                'amount'         => (float)$rp->amount,
+                'payment_method' => $m,
+                'notes'          => $rp->notes,
+                'payment_date'   => $rp->payment_date ? (is_string($rp->payment_date) ? $rp->payment_date : $rp->payment_date->format('Y-m-d')) : null,
+                'time'           => $rp->created_at ? $rp->created_at->format('H:i') : null,
+            ];
+        }
+
         if ($kasbonSales == 0 && $kbTotal > 0) {
             $kasbonSales = $kbTotal;
         }
@@ -869,6 +778,8 @@ class ShiftController extends Controller
             'kasbon_remaining'   => $kbRemaining,
             'kasbon_settlement_methods' => $kbSettlementMethods,
             'receivable_collections'    => $rpCollections,
+            'receivable_payments'       => $receivablePaymentsList,
+            'total_pelunasan'           => (float)$shiftRecPayments->sum('amount'),
             'non_cash_sales'     => $nonCashSales,
             'payment_breakdown'  => $paymentBreakdown,
             'expenses'           => $expData['expenses'],
@@ -1299,6 +1210,16 @@ class ShiftController extends Controller
             'notes'             => $shiftNotes,
         ]);
 
+        // Adopsi seluruh pelunasan piutang / kasbon di outlet ini yang dibayar di luar shift (saat shift tertutup)
+        ReceivablePayment::where('outlet_id', $outletId)
+            ->whereNull('shift_id')
+            ->update(['shift_id' => $shift->id]);
+
+        // Adopsi juga piutang baru yang dibuat di luar shift (jika ada)
+        \App\Models\Receivable::where('outlet_id', $outletId)
+            ->whereNull('shift_id')
+            ->update(['shift_id' => $shift->id]);
+
         // 1. Jika shift pertama sekali di outlet ini (belum ada shift sebelumnya), catat sebagai Saldo Awal Kasir (Modal Pemilik)
         $isFirstShiftEver = !Shift::where('outlet_id', $outletId)->where('id', '!=', $shift->id)->exists();
         if ($isFirstShiftEver && $initialCash > 0) {
@@ -1408,20 +1329,8 @@ class ShiftController extends Controller
     protected function getShiftReceivablePayments(Shift $shift)
     {
         return ReceivablePayment::with(['receivable.customer', 'receiver'])
-            ->where(function ($query) use ($shift) {
-                $query->where('shift_id', $shift->id)
-                      ->orWhere(function ($q) use ($shift) {
-                          $q->whereNull('shift_id')
-                            ->where('outlet_id', $shift->outlet_id);
-                          if ($shift->opened_at && $shift->closed_at) {
-                              $q->whereBetween('created_at', [$shift->opened_at, $shift->closed_at]);
-                          } elseif ($shift->opened_at) {
-                              $q->where('created_at', '>=', $shift->opened_at);
-                          } else {
-                              $q->whereDate('payment_date', now()->toDateString());
-                          }
-                      });
-            })
+            ->where('shift_id', $shift->id)
+            ->orderBy('id', 'asc')
             ->get();
     }
 
@@ -1536,26 +1445,13 @@ class ShiftController extends Controller
             }
         }
 
-        // Add collections from kasbon payments received during this shift
+        // Collections from Kasbon / Receivable Payments during shift
+        $cashRec = 0.0;
         foreach ($shiftRecPayments as $rp) {
-            $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
-            $rpPrice = (float)$rp->amount;
-            $paymentBreakdown[$rpMethod] = ($paymentBreakdown[$rpMethod] ?? 0.0) + $rpPrice;
-
-            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
-                $cashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'QRIS')) {
-                $qrisSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'TRANSFER')) {
-                $transferSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
-                $debitSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } else {
-                $otherSales += $rpPrice;
-                $nonCashSales += $rpPrice;
+            $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $rpAmt = (float)$rp->amount;
+            if ($m === 'CASH' || $m === 'TUNAI') {
+                $cashRec += $rpAmt;
             }
         }
 
@@ -1565,7 +1461,7 @@ class ShiftController extends Controller
         }
 
         $expData = $this->getShiftExpenses($shift);
-        $expectedCash = round((float)$shift->initial_cash + $cashSales - $expData['cash_expenses'], 2);
+        $expectedCash = round((float)$shift->initial_cash + $cashSales + $cashRec - $expData['cash_expenses'], 2);
 
         // Group actual menus sold (exclude dummy equal split installment rows, include SPLIT_CLOSED actual items)
         $actualMenuTransactions = $shift->transactions()
@@ -1661,28 +1557,7 @@ class ShiftController extends Controller
             ];
         }
 
-        foreach ($shiftRecPayments as $rp) {
-            $rec = $rp->receivable;
-            $payNo = $rp->payment_no ?: ('PAY-' . $rp->id);
-            $ordersGrouped[$payNo] = [
-                'order_number'    => $payNo . ' (' . ($rec?->order_number ?: $rec?->receivable_no ?: 'Kasbon') . ')',
-                'time'            => $rp->created_at ? $rp->created_at->format('H:i') : '-',
-                'total_price'     => (float)$rp->amount,
-                'total_items'     => 1,
-                'payment_method'  => strtoupper($rp->payment_method ?: 'CASH'),
-                'customer_name'   => 'Pelunasan: ' . ($rec?->customer_name ?: 'Pelanggan'),
-                'items'           => [
-                    [
-                        'menu_id'     => null,
-                        'menu_name'   => 'Pelunasan Kasbon - ' . ($rec?->customer_name ?: 'Pelanggan'),
-                        'qty'         => 1,
-                        'price'       => (float)$rp->amount,
-                        'total_price' => (float)$rp->amount,
-                        'notes'       => $rp->notes,
-                    ]
-                ],
-            ];
-        }
+        // Pelunasan kasbon tidak dimasukkan ke daftar order/transaksi shift kasir
 
         $ordersList = array_values($ordersGrouped);
         $orderNumbers = array_keys($ordersGrouped);
@@ -1761,6 +1636,23 @@ class ShiftController extends Controller
             else $rpCollections['other'] += $amt;
         }
 
+        $receivablePaymentsList = [];
+        foreach ($shiftRecPayments as $rp) {
+            $rec = $rp->receivable;
+            $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $receivablePaymentsList[] = [
+                'id'             => $rp->id,
+                'payment_no'     => $rp->payment_no ?: ('PAY-' . $rp->id),
+                'receivable_no'  => $rec?->receivable_no ?: ($rec?->order_number ?: '-'),
+                'customer_name'  => $rec?->customer_name ?: 'Pelanggan',
+                'amount'         => (float)$rp->amount,
+                'payment_method' => $m,
+                'notes'          => $rp->notes,
+                'payment_date'   => $rp->payment_date ? (is_string($rp->payment_date) ? $rp->payment_date : $rp->payment_date->format('Y-m-d')) : null,
+                'time'           => $rp->created_at ? $rp->created_at->format('H:i') : null,
+            ];
+        }
+
         if ($kasbonSales == 0 && $kbTotal > 0) {
             $kasbonSales = $kbTotal;
         }
@@ -1787,6 +1679,8 @@ class ShiftController extends Controller
             'kasbon_remaining'   => $kbRemaining,
             'kasbon_settlement_methods' => $kbSettlementMethods,
             'receivable_collections'    => $rpCollections,
+            'receivable_payments'       => $receivablePaymentsList,
+            'total_pelunasan'           => (float)$shiftRecPayments->sum('amount'),
             'non_cash_sales'     => $nonCashSales,
             'payment_breakdown'  => $paymentBreakdown,
             'expenses'           => $expData['expenses'],
@@ -1937,26 +1831,13 @@ class ShiftController extends Controller
             ];
         }
 
-        // Add collections from kasbon payments received during this shift
+        // Include collections from kasbon payments received during this shift
+        $cashRec = 0.0;
         foreach ($shiftRecPayments as $rp) {
-            $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
-            $rpPrice = (float)$rp->amount;
-            $paymentBreakdown[$rpMethod] = ($paymentBreakdown[$rpMethod] ?? 0.0) + $rpPrice;
-
-            if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
-                $cashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'QRIS')) {
-                $qrisSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'TRANSFER')) {
-                $transferSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } elseif (str_contains($rpMethod, 'DEBIT') || str_contains($rpMethod, 'EDC') || str_contains($rpMethod, 'CREDIT') || str_contains($rpMethod, 'KARTU')) {
-                $debitSales += $rpPrice;
-                $nonCashSales += $rpPrice;
-            } else {
-                $otherSales += $rpPrice;
-                $nonCashSales += $rpPrice;
+            $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            $rpAmt = (float)$rp->amount;
+            if ($m === 'CASH' || $m === 'TUNAI') {
+                $cashRec += $rpAmt;
             }
 
             $rec = $rp->receivable;
@@ -1966,7 +1847,7 @@ class ShiftController extends Controller
                 'time'            => $rp->created_at ? $rp->created_at->format('H:i') : '-',
                 'total_price'     => (float)$rp->amount,
                 'total_items'     => 1,
-                'payment_method'  => $rpMethod,
+                'payment_method'  => strtoupper($rp->payment_method ?: 'CASH'),
                 'customer_name'   => 'Pelunasan: ' . ($rec?->customer_name ?: 'Pelanggan'),
                 'items'           => [
                     [
@@ -1987,7 +1868,7 @@ class ShiftController extends Controller
         }
 
         $expData = $this->getShiftExpenses($shift);
-        $expectedCash = round((float)$shift->initial_cash + $cashSales - $expData['cash_expenses'], 2);
+        $expectedCash = round((float)$shift->initial_cash + $cashSales + $cashRec - $expData['cash_expenses'], 2);
 
         // Group actual menus sold
         $actualMenuTransactions = $shift->transactions()
@@ -2041,6 +1922,38 @@ class ShiftController extends Controller
         if ($kasbonSales > 0) $nonCashDetails['KASBON'] = $kasbonSales;
         if ($otherSales > 0) $nonCashDetails['LAINNYA'] = $otherSales;
 
+        $rpCollections = [
+            'total'    => (float)$shiftRecPayments->sum('amount'),
+            'cash'     => 0.0,
+            'qris'     => 0.0,
+            'transfer' => 0.0,
+            'debit'    => 0.0,
+            'other'    => 0.0,
+        ];
+        $receivablePaymentsList = [];
+        foreach ($shiftRecPayments as $rp) {
+            $amt = (float)$rp->amount;
+            $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+            if ($m === 'CASH' || $m === 'TUNAI') $rpCollections['cash'] += $amt;
+            elseif (str_contains($m, 'QRIS')) $rpCollections['qris'] += $amt;
+            elseif (str_contains($m, 'TRANSFER')) $rpCollections['transfer'] += $amt;
+            elseif (str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'CREDIT')) $rpCollections['debit'] += $amt;
+            else $rpCollections['other'] += $amt;
+
+            $rec = $rp->receivable;
+            $receivablePaymentsList[] = [
+                'id'             => $rp->id,
+                'payment_no'     => $rp->payment_no ?: ('PAY-' . $rp->id),
+                'receivable_no'  => $rec?->receivable_no ?: ($rec?->order_number ?: '-'),
+                'customer_name'  => $rec?->customer_name ?: 'Pelanggan',
+                'amount'         => (float)$rp->amount,
+                'payment_method' => $m,
+                'notes'          => $rp->notes,
+                'payment_date'   => $rp->payment_date ? (is_string($rp->payment_date) ? $rp->payment_date : $rp->payment_date->format('Y-m-d')) : null,
+                'time'           => $rp->created_at ? $rp->created_at->format('H:i') : null,
+            ];
+        }
+
         $closingCash = $shift->closing_cash !== null ? (float)$shift->closing_cash : null;
         $cashDiff = $shift->cash_difference !== null ? (float)$shift->cash_difference : ($closingCash !== null ? ($closingCash - $expectedCash) : 0);
 
@@ -2088,6 +2001,9 @@ class ShiftController extends Controller
             'kasbon_sales'       => $kasbonSales,
             'non_cash_total'     => $nonCashSales,
             'non_cash_details'   => $nonCashDetails,
+            'receivable_payments' => $receivablePaymentsList,
+            'receivable_collections' => $rpCollections,
+            'total_pelunasan'    => (float)$shiftRecPayments->sum('amount'),
             'orders'             => $ordersList,
             'items_sold'         => array_values($menuSummary),
             'menus_sold'         => array_values($menuSummary),
@@ -2166,7 +2082,7 @@ class ShiftController extends Controller
                 $method = strtoupper(trim($t->payment_method ?? 'CASH'));
                 if ($method === 'CASH' || $method === 'TUNAI') {
                     $cashSales += (float)$t->total_price;
-                } elseif (in_array($method, ['KASBON', 'PIUTANG'])) {
+                } elseif (in_array($method, ['KASBON', 'PIUTANG']) || str_contains($method, 'KASBON') || str_contains($method, 'PIUTANG')) {
                     if (!$hasShiftRecPayments) {
                         $dpMethod = strtoupper(trim($t->dp_payment_method ?? 'CASH'));
                         $dpPaid = (float)($t->amount_paid ?? 0);
@@ -2181,15 +2097,7 @@ class ShiftController extends Controller
                 }
             }
 
-            foreach ($shiftRecPayments as $rp) {
-                $rpMethod = strtoupper(trim($rp->payment_method ?? 'CASH'));
-                $rpPrice = (float)$rp->amount;
-                if ($rpMethod === 'CASH' || $rpMethod === 'TUNAI') {
-                    $cashSales += $rpPrice;
-                } else {
-                    $nonCashSales += $rpPrice;
-                }
-            }
+            // Pelunasan kasbon tidak dihitung ke penjualan shift kasir
 
             $totalPaymentsReceived = $cashSales + $nonCashSales;
             if ($systemSales < $totalPaymentsReceived) {

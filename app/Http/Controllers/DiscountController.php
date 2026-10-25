@@ -219,12 +219,84 @@ class DiscountController extends Controller
     public function availableForPos(Request $request)
     {
         $user = $request->user();
-        if ($user && $user->isPegawai() && !$user->hasPermission('pos_promo') && !$user->hasPermission('master_discount')) {
-            return response()->json([]);
+        if ($user && $user->isPegawai()) {
+            if (!$user->hasPermission('pos_promo') && !$user->hasPermission('pos_checkout') && !$user->hasPermission('master_discount')) {
+                return response()->json([]);
+            }
         }
 
-        $outletId = $request->outlet_id ?? $request->user()->outlet_id;
+        $businessId = $user?->business_id;
+        $outletId = $request->outlet_id ?? $user?->outlet_id;
         $date = $request->date ?? date('Y-m-d');
+
+        // Auto-heal / sync any approved platform promos for this business
+        if ($businessId) {
+            $acceptedPromoBusinesses = \App\Models\PlatformPromoBusiness::where('business_id', $businessId)
+                ->where('approval_status', 'ACCEPTED')
+                ->where('status', 'ACTIVE')
+                ->with('platformPromo')
+                ->get();
+
+            foreach ($acceptedPromoBusinesses as $pb) {
+                if (!$pb->platformPromo || !$pb->platformPromo->is_active) {
+                    continue;
+                }
+
+                $disc = null;
+                if ($pb->discount_id) {
+                    $disc = Discount::withoutGlobalScopes()->find($pb->discount_id);
+                }
+                if (!$disc) {
+                    $disc = Discount::withoutGlobalScopes()
+                        ->where('business_id', $businessId)
+                        ->where('platform_promo_id', $pb->platform_promo_id)
+                        ->first();
+                }
+
+                $today = date('Y-m-d');
+                $endDate = $pb->end_date ?? $pb->platformPromo->end_date?->format('Y-m-d') ?? date('Y-m-d', strtotime('+1 month'));
+
+                if (!$disc) {
+                    $disc = Discount::withoutGlobalScopes()->create([
+                        'business_id'         => $businessId,
+                        'platform_promo_id'   => $pb->platform_promo_id,
+                        'is_platform_promo'   => true,
+                        'name'                => $pb->platformPromo->title,
+                        'code'                => $pb->platformPromo->code,
+                        'type'                => $pb->platformPromo->type,
+                        'value'               => $pb->platformPromo->value,
+                        'min_order_amount'    => $pb->platformPromo->min_order_amount,
+                        'max_discount_amount' => $pb->platformPromo->max_discount_amount,
+                        'start_date'          => $today,
+                        'end_date'            => $endDate,
+                        'usage_limit'         => $pb->usage_limit ?? 50,
+                        'used_count'          => $pb->used_count ?? 0,
+                        'is_auto_apply'       => false,
+                        'active'              => true,
+                        'notes'               => "Promo Platform Superadmin (Auto-sync POS)",
+                    ]);
+                    $pb->update(['discount_id' => $disc->id]);
+                } else {
+                    $needsUpdate = false;
+                    $updateData = [];
+
+                    if (!$disc->active) {
+                        $updateData['active'] = true;
+                        $needsUpdate = true;
+                    }
+                    if ($disc->start_date && $disc->start_date->format('Y-m-d') > $today) {
+                        $updateData['start_date'] = $today;
+                        $needsUpdate = true;
+                    }
+                    if ($needsUpdate) {
+                        $disc->update($updateData);
+                    }
+                    if ($pb->discount_id !== $disc->id) {
+                        $pb->update(['discount_id' => $disc->id]);
+                    }
+                }
+            }
+        }
 
         $discounts = Discount::with('rewardMenu')
             ->validNow($date)
@@ -246,11 +318,13 @@ class DiscountController extends Controller
     public function validateCode(Request $request)
     {
         $user = $request->user();
-        if ($user && $user->isPegawai() && !$user->hasPermission('pos_promo') && !$user->hasPermission('master_discount')) {
-            return response()->json([
-                'valid'   => false,
-                'message' => 'Otoritas akun Anda tidak diizinkan untuk menerapkan promo atau voucher.',
-            ], 403);
+        if ($user && $user->isPegawai()) {
+            if (!$user->hasPermission('pos_promo') && !$user->hasPermission('pos_checkout') && !$user->hasPermission('master_discount')) {
+                return response()->json([
+                    'valid'   => false,
+                    'message' => 'Otoritas akun Anda tidak diizinkan untuk menerapkan promo atau voucher.',
+                ], 403);
+            }
         }
 
         $data = $request->validate([

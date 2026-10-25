@@ -128,6 +128,11 @@ class CoinTopupRequestController extends Controller
                     $targetBiz->coins_per_transaction = 1.0;
                 }
                 $targetBiz->save();
+
+                // Kunci seluruh transaksi historis yang dibuat saat mode unlimited agar HPP-nya tidak ikut berubah selamanya
+                \App\Models\Transaction::where('business_id', $targetBiz->id)
+                    ->where('is_unlimited_mode', false)
+                    ->update(['is_unlimited_mode' => true]);
             }
 
             // 2. Calculate & record referral commission for si A (if business is linked to referral code)

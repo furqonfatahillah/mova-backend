@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Receivable;
 use App\Models\ReceivablePayment;
+use App\Models\Shift;
 use App\Models\Outlet;
 use App\Models\Customer;
 use App\Models\JournalEntry;
@@ -856,6 +857,13 @@ class ReceivableController extends Controller
 
     public function addPayment(Request $request, Receivable $receivable)
     {
+        $user = $request->user();
+        if ($user && ($user->isPegawai() || !$user->isOwnerOrManager())) {
+            return response()->json([
+                'message' => 'Pelunasan piutang/kasbon hanya dapat dilakukan oleh otoritas di atas pegawai (Owner, Manager, atau Admin).'
+            ], 403);
+        }
+
         if ($receivable->ar_type === 'MERCHANT_ECOMMERCE') {
             return response()->json([
                 'message' => 'AR E-Commerce tidak dapat dibayar atau dicairkan secara manual di POS karena pencairannya diproses langsung dari aplikasi e-commerce terkait. Buku piutang e-commerce hanya berfungsi untuk rekonsiliasi / cross-check besaran transaksi.'
@@ -898,15 +906,13 @@ class ReceivableController extends Controller
             $change = 0;
         }
 
-        $user = $request->user();
         $businessId = $receivable->business_id ?? $user?->business_id;
-        $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $receivable->outlet_id)->orderByDesc('opened_at')->first();
-        $shiftId = $data['shift_id'] ?? $activeShift?->id ?? $receivable->shift_id;
-        $paymentDate = !empty($data['payment_date']) 
-            ? $data['payment_date'] 
-            : ($activeShift && !empty($activeShift->opened_at) 
-                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d')) 
-                : now()->toDateString());
+        $activeShift = Shift::where('outlet_id', $receivable->outlet_id)
+            ->where('status', 'OPEN')
+            ->latest('opened_at')
+            ->first();
+        $shiftId = $activeShift ? $activeShift->id : null;
+        $paymentDate = !empty($data['payment_date']) ? $data['payment_date'] : now()->toDateString();
         $paymentNo = ReceivablePayment::generatePaymentNo($businessId, $paymentDate);
 
         $createdPayment = DB::transaction(function () use ($receivable, $data, $user, $businessId, $paymentNo, $amount, $shiftId, $paymentDate) {
@@ -978,6 +984,12 @@ class ReceivableController extends Controller
         ]);
 
         $user = $request->user();
+        if ($user && ($user->isPegawai() || !$user->isOwnerOrManager())) {
+            return response()->json([
+                'message' => 'Pelunasan piutang/kasbon hanya dapat dilakukan oleh otoritas di atas pegawai (Owner, Manager, atau Admin).'
+            ], 403);
+        }
+
         $inputAmount = (float)$data['amount'];
         $cashReceived = isset($data['cash_received']) && (float)$data['cash_received'] > 0
             ? (float)$data['cash_received']
@@ -1029,14 +1041,13 @@ class ReceivableController extends Controller
 
         $remainingPayment = $effectivePayAmount;
         $updatedReceivables = [];
-        $firstRecOutlet = $receivables->first()?->outlet_id;
-        $activeShift = \App\Models\Shift::where('status', 'OPEN')->where('outlet_id', $firstRecOutlet)->orderByDesc('opened_at')->first();
-        $shiftId = $data['shift_id'] ?? $activeShift?->id ?? $receivables->first()?->shift_id;
-        $paymentDate = !empty($data['payment_date']) 
-            ? $data['payment_date'] 
-            : ($activeShift && !empty($activeShift->opened_at) 
-                ? (is_string($activeShift->opened_at) ? substr($activeShift->opened_at, 0, 10) : $activeShift->opened_at->format('Y-m-d')) 
-                : now()->toDateString());
+        $firstOutletId = $receivables->first()?->outlet_id;
+        $activeShift = $firstOutletId ? Shift::where('outlet_id', $firstOutletId)
+            ->where('status', 'OPEN')
+            ->latest('opened_at')
+            ->first() : null;
+        $shiftId = $activeShift ? $activeShift->id : null;
+        $paymentDate = !empty($data['payment_date']) ? $data['payment_date'] : now()->toDateString();
 
         $createdPayments = [];
         DB::transaction(function () use ($receivables, $data, $user, &$remainingPayment, &$updatedReceivables, $shiftId, $paymentDate, &$createdPayments) {

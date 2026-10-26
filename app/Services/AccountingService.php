@@ -1439,18 +1439,22 @@ class AccountingService
 
         // 2. Collections from Kasbon / Receivable Payments collected during shift
         $recQuery = ReceivablePayment::where(function ($query) use ($shift, $openedAt, $closedAt) {
-            $query->where('shift_id', $shift->id)
-                  ->orWhere(function ($q) use ($shift, $openedAt, $closedAt) {
-                      $q->whereNull('shift_id')
-                        ->where('outlet_id', $shift->outlet_id);
-                      if ($openedAt && $closedAt) {
-                          $q->whereBetween('created_at', [$openedAt, $closedAt]);
-                      } elseif ($openedAt) {
-                          $q->where('created_at', '>=', $openedAt);
-                      } else {
-                          $q->whereDate('payment_date', now()->toDateString());
-                      }
-                  });
+            $query->where(function ($sub) use ($shift, $closedAt) {
+                $sub->where('shift_id', $shift->id);
+                if ($closedAt) {
+                    $sub->where('created_at', '<=', $closedAt);
+                }
+            })->orWhere(function ($q) use ($shift, $openedAt, $closedAt) {
+                $q->whereNull('shift_id')
+                  ->where('outlet_id', $shift->outlet_id);
+                if ($openedAt && $closedAt) {
+                    $q->whereBetween('created_at', [$openedAt, $closedAt]);
+                } elseif ($openedAt) {
+                    $q->where('created_at', '>=', $openedAt);
+                } else {
+                    $q->whereDate('payment_date', now()->toDateString());
+                }
+            });
         });
         $shiftRecPayments = $recQuery->get();
         $hasShiftRecPayments = $shiftRecPayments->count() > 0;

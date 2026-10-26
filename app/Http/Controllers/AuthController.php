@@ -2,19 +2,110 @@
 
 namespace App\Http\Controllers;
 
+use App\Mail\RegisterOtpMail;
+use App\Mail\ResetPasswordOtpMail;
 use App\Models\Business;
 use App\Models\Outlet;
 use App\Models\User;
 use App\Models\ReferralCode;
 use App\Models\ReferralUsage;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
 {
+    /**
+     * Kirim kode OTP 6-digit ke email calon pendaftar bisnis
+     */
+    public function sendRegisterOtp(Request $request)
+    {
+        $data = $request->validate([
+            'name'          => 'required|string|max:255',
+            'email'         => 'required|email|unique:users,email',
+            'password'      => 'required|string|min:8|confirmed',
+            'business_name' => 'required|string|max:255',
+            'referral_code' => 'nullable|string|max:50',
+        ], [
+            'name.required'          => 'Nama pemilik wajib diisi.',
+            'email.required'         => 'Alamat email wajib diisi.',
+            'email.email'            => 'Format email tidak valid.',
+            'email.unique'           => 'Alamat email ini sudah terdaftar. Silakan login atau gunakan email lain.',
+            'password.required'      => 'Kata sandi wajib diisi.',
+            'password.min'           => 'Kata sandi minimal 8 karakter.',
+            'password.confirmed'     => 'Konfirmasi kata sandi tidak cocok.',
+            'business_name.required' => 'Nama usaha/bisnis wajib diisi.',
+        ]);
+
+        // Validasi kode referral jika diisi
+        if (!empty($data['referral_code'])) {
+            $cleanReferralCode = strtoupper(trim($data['referral_code']));
+            $refCodeObj = ReferralCode::where('code', $cleanReferralCode)->first();
+            if ($refCodeObj) {
+                if (!$refCodeObj->is_active) {
+                    throw ValidationException::withMessages([
+                        'referral_code' => ["Kode referral '{$cleanReferralCode}' saat ini dinonaktifkan."],
+                    ]);
+                }
+                if ($refCodeObj->expires_at && $refCodeObj->expires_at->isPast()) {
+                    throw ValidationException::withMessages([
+                        'referral_code' => ["Kode referral '{$cleanReferralCode}' telah kedaluwarsa."],
+                    ]);
+                }
+                if ($refCodeObj->max_uses !== null && $refCodeObj->times_used >= $refCodeObj->max_uses) {
+                    throw ValidationException::withMessages([
+                        'referral_code' => ["Kuota penggunaan kode referral '{$cleanReferralCode}' telah habis."],
+                    ]);
+                }
+            } else {
+                $referrerUser = User::where('referral_code', $cleanReferralCode)->first();
+                if (!$referrerUser) {
+                    throw ValidationException::withMessages([
+                        'referral_code' => ["Kode referral '{$cleanReferralCode}' tidak ditemukan atau tidak valid."],
+                    ]);
+                }
+            }
+        }
+
+        $email = strtolower(trim($data['email']));
+        $name = trim($data['name']);
+
+        // Generate 6-digit numeric OTP code
+        $otp = (string) random_int(100000, 999999);
+
+        // Store to email_verification_codes table (update or insert)
+        DB::table('email_verification_codes')->updateOrInsert(
+            ['email' => $email],
+            [
+                'code'       => Hash::make($otp),
+                'created_at' => now(),
+            ]
+        );
+
+        try {
+            Mail::to($email)->send(
+                new RegisterOtpMail($name, $otp, 15)
+            );
+        } catch (\Throwable $e) {
+            Log::error("Failed sending register verification email to {$email}: " . $e->getMessage());
+            DB::table('email_verification_codes')->where('email', $email)->delete();
+            $errSnippet = Str::limit(strip_tags($e->getMessage()), 120);
+            throw ValidationException::withMessages([
+                'email' => ["Gagal mengirimkan email verifikasi ke {$email} ({$errSnippet}). Pastikan konfigurasi SMTP di file .env server sudah sesuai."],
+            ]);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => "Kode verifikasi 6-digit telah dikirim ke {$email}. Silakan periksa kotak masuk atau folder spam email Anda.",
+        ]);
+    }
+
     public function register(Request $request)
     {
         $regType = $request->input('registration_type', 'business');
@@ -30,9 +121,38 @@ class AuthController extends Controller
                 'business_address'  => 'nullable|string|max:500',
                 'first_outlet_name' => 'nullable|string|max:255',
                 'referral_code'     => 'nullable|string|max:50',
+                'verification_code' => 'required|string|size:6',
             ], [
-                'business_name.required' => 'Nama usaha/bisnis wajib diisi.',
+                'email.unique'               => 'Alamat email ini sudah terdaftar. Silakan login atau gunakan email lain.',
+                'business_name.required'     => 'Nama usaha/bisnis wajib diisi.',
+                'verification_code.required' => 'Kode verifikasi email (OTP) wajib diisi.',
+                'verification_code.size'     => 'Kode verifikasi email harus 6 digit angka.',
             ]);
+
+            $email = strtolower(trim($data['email']));
+            $code = trim($data['verification_code']);
+
+            // Verifikasi Kode OTP dari email_verification_codes
+            $otpRecord = DB::table('email_verification_codes')->where('email', $email)->first();
+
+            if (!$otpRecord) {
+                throw ValidationException::withMessages([
+                    'verification_code' => ['Tidak ada permintaan kode verifikasi yang aktif untuk email ini. Silakan klik kirim ulang kode.'],
+                ]);
+            }
+
+            if (Carbon::parse($otpRecord->created_at)->addMinutes(15)->isPast()) {
+                DB::table('email_verification_codes')->where('email', $email)->delete();
+                throw ValidationException::withMessages([
+                    'verification_code' => ['Kode verifikasi email telah kedaluwarsa (lebih dari 15 menit). Silakan minta kode baru.'],
+                ]);
+            }
+
+            if (!Hash::check($code, $otpRecord->code)) {
+                throw ValidationException::withMessages([
+                    'verification_code' => ['Kode verifikasi email yang Anda masukkan salah atau tidak sesuai.'],
+                ]);
+            }
 
             // Validate referral code if provided
             $refCodeObj = null;
@@ -72,7 +192,7 @@ class AuthController extends Controller
 
             $ipAddress = $request->ip();
 
-            $result = DB::transaction(function () use ($data, $refCodeObj, $referrerUser, $cleanReferralCode, $ipAddress) {
+            $result = DB::transaction(function () use ($data, $refCodeObj, $referrerUser, $cleanReferralCode, $ipAddress, $email) {
                 $slug = Str::slug($data['business_name']);
                 $origSlug = $slug;
                 $c = 1;
@@ -98,7 +218,7 @@ class AuthController extends Controller
                     'is_unlimited_coins'    => true,     // Mode Unlimited Gratis
                     'coins_per_transaction' => 0,        // Bebas potong koin
                     'coin_balance'          => 0.00,
-                    'expires_at'            => null,     // Gratis permanen tanpa batas waktu
+                    'expires_at'            => now()->addMonth(), // Default masa aktif 1 bulan dari tanggal pendaftaran
                 ]);
 
                 // 2. Buat Cabang Pertama untuk Bisnis ini
@@ -117,17 +237,18 @@ class AuthController extends Controller
                     'active'      => true,
                 ]);
 
-                // 3. Buat User Owner Bisnis (Langsung Aktif)
+                // 3. Buat User Owner Bisnis (Langsung Aktif & Email Terverifikasi)
                 $user = User::create([
-                    'business_id'    => $business->id,
-                    'outlet_id'      => $outlet->id,
-                    'name'           => $data['name'],
-                    'email'          => $data['email'],
-                    'password'       => Hash::make($data['password']),
-                    'role'           => 'owner_bisnis',
-                    'status'         => 'active', // Langsung Aktif
-                    'referred_by_id' => $refCodeObj?->created_by ?? $referrerUser?->id,
-                    'approved_at'    => now(),
+                    'business_id'       => $business->id,
+                    'outlet_id'         => $outlet->id,
+                    'name'              => $data['name'],
+                    'email'             => $data['email'],
+                    'email_verified_at' => now(),
+                    'password'          => Hash::make($data['password']),
+                    'role'              => 'owner_bisnis',
+                    'status'            => 'active', // Langsung Aktif
+                    'referred_by_id'    => $refCodeObj?->created_by ?? $referrerUser?->id,
+                    'approved_at'       => now(),
                 ]);
 
                 $business->update(['created_by' => $user->id]);
@@ -150,7 +271,10 @@ class AuthController extends Controller
                     ]);
                 }
 
-                // 6. Generate Sanctum Token untuk Langsung Login
+                // 6. Hapus kode verifikasi email yang sudah berhasil digunakan
+                DB::table('email_verification_codes')->where('email', $email)->delete();
+
+                // 7. Generate Sanctum Token untuk Langsung Login
                 $token = $user->createToken('pos_auth_token')->plainTextToken;
 
                 return [
@@ -162,7 +286,7 @@ class AuthController extends Controller
             });
 
             return response()->json([
-                'message'  => "Pendaftaran bisnis '{$result['business']->name}' berhasil! Akun Anda aktif secara otomatis dengan Mode Unlimited Gratis.",
+                'message'  => "Pendaftaran bisnis '{$result['business']->name}' berhasil! Email Anda telah diverifikasi dan akun aktif secara otomatis.",
                 'status'   => 'active',
                 'token'    => $result['token'],
                 'user'     => $result['user'],
@@ -310,21 +434,22 @@ class AuthController extends Controller
             ]
         );
 
-        $mailSent = false;
         try {
-            \Illuminate\Support\Facades\Mail::to($user->email)->send(
-                new \App\Mail\ResetPasswordOtpMail($user->name, $otp, 15)
+            Mail::to($user->email)->send(
+                new ResetPasswordOtpMail($user->name, $otp, 15)
             );
-            $mailSent = true;
         } catch (\Throwable $e) {
-            \Illuminate\Support\Facades\Log::error("Failed sending reset password email to {$email}: " . $e->getMessage());
+            Log::error("Failed sending reset password email to {$email}: " . $e->getMessage());
+            DB::table('password_reset_tokens')->where('email', $email)->delete();
+            $errSnippet = Str::limit(strip_tags($e->getMessage()), 120);
+            throw ValidationException::withMessages([
+                'email' => ["Gagal mengirimkan email reset password ke {$email} ({$errSnippet}). Pastikan konfigurasi SMTP di file .env server sudah sesuai."],
+            ]);
         }
 
         return response()->json([
-            'success'   => true,
-            'message'   => "Kode verifikasi 6-digit telah dikirim ke {$email}. Silakan periksa kotak masuk atau spam email Anda.",
-            'mail_sent' => $mailSent,
-            'debug_otp' => (config('app.debug') && !$mailSent) ? $otp : null,
+            'success' => true,
+            'message' => "Kode verifikasi 6-digit telah dikirim ke {$email}. Silakan periksa kotak masuk atau folder spam email Anda.",
         ]);
     }
 

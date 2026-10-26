@@ -53,9 +53,10 @@ Route::get('/', function () {
 });
 
 // Public auth & utility routes
-Route::post('/register', [AuthController::class, 'register']);
-Route::post('/login',    [AuthController::class, 'login'])->name('login');
-Route::post('/forgot-password',     [AuthController::class, 'forgotPassword']);
+Route::post('/register/send-otp', [AuthController::class, 'sendRegisterOtp']);
+Route::post('/register',          [AuthController::class, 'register']);
+Route::post('/login',             [AuthController::class, 'login'])->name('login');
+Route::post('/forgot-password',   [AuthController::class, 'forgotPassword']);
 Route::post('/verify-reset-code',   [AuthController::class, 'verifyResetCode']);
 Route::post('/reset-password',      [AuthController::class, 'resetPassword']);
 Route::get('/public/businesses', [BusinessController::class, 'publicList']);
@@ -102,6 +103,7 @@ Route::middleware(['auth:sanctum', \App\Http\Middleware\EnforceOutletScope::clas
     // SaaS Platform Coin Top-Up & Rate Management (Website Owner / Superadmin Platform)
     Route::get('/platform/coins/overview', [CoinPlatformController::class, 'overview']);
     Route::post('/platform/coins/topup',   [CoinPlatformController::class, 'topUp']);
+    Route::post('/platform/coins/adjust',  [CoinPlatformController::class, 'adjust']);
     Route::put('/platform/coins/rate',     [CoinPlatformController::class, 'updateRate']);
     Route::get('/platform/coins/history',  [CoinPlatformController::class, 'history']);
     Route::get('/platform/coin-topup-requests',           [CoinTopupRequestController::class, 'index']);

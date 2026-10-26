@@ -171,6 +171,50 @@ class CoinService
     }
 
     /**
+     * Adjust / Koreksi saldo koin jika superadmin salah input atau perlu penyesuaian saldo.
+     */
+    public static function adjust(
+        int $businessId,
+        float $targetBalance,
+        string $reason,
+        ?int $adminId = null
+    ): CoinTransaction {
+        if (!\Illuminate\Support\Facades\Schema::hasColumn('businesses', 'coin_balance')) {
+            throw new \Exception("Tabel koin belum dibuat di database server.");
+        }
+
+        if ($targetBalance < 0) {
+            throw new \InvalidArgumentException('Saldo koin akhir tidak boleh bernilai negatif.');
+        }
+
+        return DB::transaction(function () use ($businessId, $targetBalance, $reason, $adminId) {
+            $business = Business::where('id', $businessId)->lockForUpdate()->firstOrFail();
+
+            $before = (float)($business->coin_balance ?: 0.00);
+            $diff = $targetBalance - $before;
+
+            $business->coin_balance = $targetBalance;
+            $business->save();
+
+            $diffStr = ($diff >= 0 ? "+{$diff}" : "{$diff}") . " koin";
+
+            return CoinTransaction::create([
+                'business_id'       => $business->id,
+                'type'              => 'ADJUSTMENT',
+                'amount'            => $diff, // Positif jika nambah, negatif jika pengurangan
+                'balance_before'    => $before,
+                'balance_after'     => $targetBalance,
+                'payment_amount'    => null,
+                'payment_reference' => 'KOREKSI_ADMIN',
+                'order_number'      => null,
+                'outlet_id'         => null,
+                'notes'             => "Koreksi Saldo oleh Pemilik Website: {$reason} ({$diffStr})",
+                'created_by'        => $adminId,
+            ]);
+        });
+    }
+
+    /**
      * Update the cost (coins per transaction) or toggle unlimited status for a business.
      */
     public static function updateRate(

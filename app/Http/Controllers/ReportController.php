@@ -1708,7 +1708,7 @@ class ReportController extends Controller
     }
 
     /** Internal helper - reuse variance computation (ALIGNED WITH KARTU STOK) */
-    public function buildVarianceArray(string $from, string $to, ?int $outletId = null): array
+    public function buildVarianceArray(string $from, string $to, ?int $outletId = null, ?string $opnameNo = null): array
     {
         // Load all ingredients (including outletIngredients)
         $ingredients = Ingredient::with(['outletIngredients' => function($q) use ($outletId) {
@@ -1720,16 +1720,23 @@ class ReportController extends Controller
         $ingIds = $ingredients->pluck('id')->all();
 
         // Fetch movements
-        // Exclude automatic opname physical adjustments of the CURRENT period so that theoretical baseline represents pure pre-opname stock movements.
+        // Exclude automatic opname physical adjustments of the specified opname session (or all current period adjustments if opnameNo is null)
+        // so that theoretical baseline represents pure pre-opname stock movements.
         // For date < $from (prior movements), previous opname adjustments are included in balanceBefore.
         $movQuery = StockMovement::whereIn('ingredient_id', $ingIds)
             ->where('type', '!=', 'INITIAL')
             ->where(function ($q) use ($from, $to) {
                 $q->where('date', '<', $from)->orWhereBetween('date', [$from, $to]);
-            })->where(function ($q) use ($from) {
+            })->where(function ($q) use ($from, $opnameNo) {
                 $q->where('date', '<', $from)
-                  ->orWhereNull('note')
-                  ->orWhere('note', 'not like', 'Penyesuaian Opname Fisik%');
+                  ->orWhere(function ($sub) use ($opnameNo) {
+                      $sub->whereNull('note');
+                      if ($opnameNo) {
+                          $sub->orWhere('note', 'not like', "%{$opnameNo}%");
+                      } else {
+                          $sub->orWhere('note', 'not like', 'Penyesuaian Opname Fisik%');
+                      }
+                  });
             });
         if ($outletId) {
             $movQuery->where('outlet_id', $outletId);

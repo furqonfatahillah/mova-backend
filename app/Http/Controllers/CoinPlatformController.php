@@ -95,6 +95,40 @@ class CoinPlatformController extends Controller
     }
 
     /**
+     * Adjust / Koreksi saldo koin jika superadmin salah input nominal
+     */
+    public function adjust(Request $request)
+    {
+        $this->authorizeSuperadmin($request);
+
+        $data = $request->validate([
+            'business_id'    => 'required|exists:businesses,id',
+            'target_balance' => 'required|numeric|min:0',
+            'reason'         => 'required|string|max:500',
+        ], [
+            'target_balance.required' => 'Saldo koin baru yang benar wajib diisi.',
+            'target_balance.min'      => 'Saldo koin tidak boleh bernilai negatif.',
+            'reason.required'         => 'Alasan penyesuaian/koreksi saldo wajib dicantumkan.',
+        ]);
+
+        $tx = CoinService::adjust(
+            (int) $data['business_id'],
+            (float) $data['target_balance'],
+            trim($data['reason']),
+            $request->user()->id
+        );
+
+        $business = Business::find($data['business_id']);
+
+        return response()->json([
+            'message'              => "Saldo koin {$business->name} berhasil dikoreksi menjadi " . number_format($business->coin_balance, 0, ',', '.') . " koin.",
+            'transaction'          => $tx,
+            'current_coin_balance' => $business->coin_balance,
+            'remaining_transactions' => $business->remaining_transactions,
+        ]);
+    }
+
+    /**
      * Update rate (cost per nota/transaction) or toggle unlimited mode.
      */
     public function updateRate(Request $request)

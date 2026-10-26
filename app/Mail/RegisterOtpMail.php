@@ -1,0 +1,143 @@
+<?php
+
+namespace App\Mail;
+
+use Illuminate\Bus\Queueable;
+use Illuminate\Mail\Mailable;
+use Illuminate\Mail\Mailables\Content;
+use Illuminate\Mail\Mailables\Envelope;
+use Illuminate\Queue\SerializesModels;
+
+class RegisterOtpMail extends Mailable
+{
+    use Queueable, SerializesModels;
+
+    public string $userName;
+    public string $otpCode;
+    public int $expiryMinutes;
+
+    /**
+     * Create a new message instance.
+     */
+    public function __construct(string $userName, string $otpCode, int $expiryMinutes = 15)
+    {
+        $this->userName = $userName;
+        $this->otpCode = $otpCode;
+        $this->expiryMinutes = $expiryMinutes;
+    }
+
+    /**
+     * Get the message envelope.
+     */
+    public function envelope(): Envelope
+    {
+        return new Envelope(
+            subject: "[MOVA POS] {$this->otpCode} adalah Kode Verifikasi Pendaftaran Akun Anda",
+        );
+    }
+
+    /**
+     * Get the message content definition.
+     */
+    public function content(): Content
+    {
+        if (view()->exists('emails.register_otp')) {
+            return new Content(
+                view: 'emails.register_otp',
+                with: [
+                    'userName'      => $this->userName,
+                    'otpCode'       => $this->otpCode,
+                    'expiryMinutes' => $this->expiryMinutes,
+                ],
+            );
+        }
+
+        return new Content(
+            htmlString: $this->buildHtmlTemplate(),
+        );
+    }
+
+    /**
+     * Fallback template jika file view blade belum ada di server deploy
+     */
+    protected function buildHtmlTemplate(): string
+    {
+        $year = date('Y');
+        $safeName = htmlspecialchars($this->userName);
+        $safeCode = htmlspecialchars($this->otpCode);
+
+        return <<<HTML
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Verifikasi Pendaftaran - MOVA POS</title>
+  <style>
+    body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #0d1117; color: #e6edf3; }
+    .email-wrapper { width: 100%; background-color: #0d1117; padding: 40px 20px; }
+    .email-card { max-width: 520px; margin: 0 auto; background: #161b22; border: 1px solid #30363d; border-radius: 16px; overflow: hidden; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4); }
+    .header { background: linear-gradient(135deg, #064e3b 0%, #0f172a 100%); padding: 30px 30px 24px; text-align: center; border-bottom: 1px solid #30363d; }
+    .logo-badge { display: inline-block; background: linear-gradient(135deg, #10b981, #059669); color: #ffffff; font-weight: 800; font-size: 20px; letter-spacing: 1px; padding: 10px 20px; border-radius: 12px; margin-bottom: 12px; }
+    .header-title { font-size: 20px; font-weight: 700; color: #f0f6fc; margin: 0; }
+    .content { padding: 30px; }
+    .greeting { font-size: 16px; color: #f0f6fc; margin-bottom: 14px; }
+    .message { font-size: 14px; color: #8b949e; line-height: 1.6; margin-bottom: 24px; }
+    .otp-container { background: #0d1117; border: 2px dashed #10b981; border-radius: 12px; padding: 20px; text-align: center; margin: 24px 0; }
+    .otp-label { font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px; color: #34d399; font-weight: 600; margin-bottom: 8px; }
+    .otp-code { font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #34d399; font-family: 'Courier New', Courier, monospace; margin: 0; }
+    .badge-expiry { display: inline-block; background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); color: #fbbf24; font-size: 12px; padding: 4px 10px; border-radius: 20px; margin-top: 10px; }
+    .security-notice { background: rgba(99, 102, 241, 0.1); border-left: 4px solid #6366f1; padding: 12px 14px; border-radius: 6px; font-size: 12px; color: #c7d2fe; line-height: 1.5; margin-top: 20px; }
+    .footer { background: #0d1117; padding: 20px 30px; text-align: center; border-top: 1px solid #21262d; font-size: 12px; color: #6e7681; }
+  </style>
+</head>
+<body>
+  <div class="email-wrapper">
+    <div class="email-card">
+      <div class="header">
+        <div class="logo-badge">MOVA POS</div>
+        <h1 class="header-title">Verifikasi Pendaftaran Akun</h1>
+      </div>
+
+      <div class="content">
+        <div class="greeting">Halo, <strong>{$safeName}</strong>!</div>
+        <p class="message">
+          Selamat datang di MOVA POS! Satu langkah lagi untuk menyelesaikan pendaftaran dan mengaktifkan outlet bisnis Anda. Masukkan kode verifikasi (OTP) 6-digit di bawah ini pada formulir pendaftaran:
+        </p>
+
+        <div class="otp-container">
+          <div class="otp-label">Kode Verifikasi Pendaftaran Anda</div>
+          <div class="otp-code">{$safeCode}</div>
+          <div class="badge-expiry">⏱️ Berlaku selama {$this->expiryMinutes} Menit</div>
+        </div>
+
+        <p class="message" style="margin-bottom: 0;">
+          Masukkan kode tersebut pada layar registrasi untuk mengonfirmasi email dan mengaktifkan akun Anda secara instan.
+        </p>
+
+        <div class="security-notice">
+          <strong>🔒 Informasi Keamanan:</strong> Jangan berikan kode ini kepada siapa pun. Jika Anda tidak merasa mendaftar di MOVA POS, abaikan email ini dengan aman.
+        </div>
+      </div>
+
+      <div class="footer">
+        © {$year} MOVA POS — Move Your Business Forward.<br>
+        Email ini dikirimkan secara otomatis oleh sistem keamanan MOVA POS.
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+HTML;
+    }
+
+    /**
+     * Get the attachments for the message.
+     *
+     * @return array<int, \Illuminate\Mail\Mailables\Attachment>
+     */
+    public function attachments(): array
+    {
+        return [];
+    }
+}

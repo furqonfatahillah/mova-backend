@@ -116,8 +116,11 @@ class ShiftController extends Controller
             ->select('shift_id', 'payment_method', 'dp_payment_method', 'total_price', 'amount_paid')
             ->get();
 
-        // Receivable payments are handled by management authority and not tracked inside cashier shifts
-        $recPaymentsByShift = [];
+        // Fetch receivable payments collected during these shifts
+        $recPaymentsByShift = \App\Models\ReceivablePayment::whereIn('shift_id', $shiftIds)
+            ->with(['receivable.customer', 'receiver'])
+            ->get()
+            ->groupBy('shift_id');
 
         // Fetch Kasbon records originated by these shifts to know their settlement status
         $kasbonReceivables = \App\Models\Receivable::whereIn('shift_id', $shiftIds)
@@ -278,6 +281,25 @@ class ShiftController extends Controller
                 }
             }
 
+            $sRecPayments = $recPaymentsByShift[$s->id] ?? collect();
+            $rpCollections = [
+                'total'    => (float)$sRecPayments->sum('amount'),
+                'cash'     => 0.0,
+                'qris'     => 0.0,
+                'transfer' => 0.0,
+                'debit'    => 0.0,
+                'other'    => 0.0,
+            ];
+            foreach ($sRecPayments as $rp) {
+                $amt = (float)$rp->amount;
+                $m = strtoupper(trim($rp->payment_method ?? 'CASH'));
+                if ($m === 'CASH' || $m === 'TUNAI') $rpCollections['cash'] += $amt;
+                elseif (str_contains($m, 'QRIS')) $rpCollections['qris'] += $amt;
+                elseif (str_contains($m, 'TRANSFER')) $rpCollections['transfer'] += $amt;
+                elseif (str_contains($m, 'DEBIT') || str_contains($m, 'EDC') || str_contains($m, 'CREDIT')) $rpCollections['debit'] += $amt;
+                else $rpCollections['other'] += $amt;
+            }
+
             $s->kasbon_sales = (float)($bd['kasbon'] ?? 0.0);
             if ($s->kasbon_sales == 0 && $kbTotal > 0) {
                 $s->kasbon_sales = $kbTotal;
@@ -285,7 +307,9 @@ class ShiftController extends Controller
             $s->kasbon_settled = $kbPaid;
             $s->kasbon_remaining = $kbRemaining;
             $s->kasbon_settlement_methods = $kbSettlementMethods;
-            $s->receivable_collections = null;
+            $s->receivable_collections = $rpCollections;
+            $s->total_pelunasan = $rpCollections['total'];
+            $s->receivable_payments = $sRecPayments;
 
             $s->other_sales = $bd['other'];
             $s->payment_breakdown = $bd['details'];
@@ -296,6 +320,7 @@ class ShiftController extends Controller
             $s->total_expenses = $expData['total_expenses'];
             $s->cash_expenses = $expData['cash_expenses'];
             $s->non_cash_expenses = $expData['non_cash_expenses'];
+            $s->expected_cash = round((float)$s->initial_cash + (float)$s->cash_sales + ($rpCollections['cash'] ?? 0.0) - (float)$s->cash_expenses, 2);
 
             // Deposit data
             $sDepositTxs = $depositsByShift[$s->id] ?? collect();
@@ -760,6 +785,8 @@ class ShiftController extends Controller
         if ($kasbonSales == 0 && $kbTotal > 0) {
             $kasbonSales = $kbTotal;
         }
+
+        $expectedCash = round($expectedCash + ($rpCollections['cash'] ?? 0), 2);
 
         return response()->json([
             'shift'              => $shift,
@@ -1330,6 +1357,11 @@ class ShiftController extends Controller
     {
         return ReceivablePayment::with(['receivable.customer', 'receiver'])
             ->where('shift_id', $shift->id)
+            ->where(function ($q) use ($shift) {
+                if ($shift->closed_at) {
+                    $q->where('created_at', '<=', $shift->closed_at);
+                }
+            })
             ->orderBy('id', 'asc')
             ->get();
     }
@@ -2776,3 +2808,4 @@ class ShiftController extends Controller
         ]);
     }
 }
+

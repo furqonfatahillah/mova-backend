@@ -22,6 +22,11 @@ class OpnameController extends Controller
             $outletId = (int)$request->outlet_id;
         }
 
+        // Jika client secara eksplisit meminta formulir sesi baru, kembalikan objek kosong
+        if ($request->opname_no === 'NEW' || $request->boolean('new_session')) {
+            return response()->json([]);
+        }
+
         $from = $request->from ?? now()->toDateString();
         $to   = $request->to   ?? now()->toDateString();
 
@@ -31,6 +36,23 @@ class OpnameController extends Controller
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
+        }
+
+        // Jika ada opname_no spesifik yang diminta, filter hanya sesi tersebut
+        if ($request->filled('opname_no')) {
+            $query->where('opname_no', $request->opname_no);
+        } else {
+            // Prioritas 1: Sesi DRAFT (belum ditutup) yang sedang berjalan hari ini di cabang ini
+            $draftSession = (clone $query)->where('is_closed', false)->whereNotNull('opname_no')->latest('id')->first();
+            if ($draftSession) {
+                $query->where('opname_no', $draftSession->opname_no);
+            } else {
+                // Prioritas 2: Sesi terakhir hari ini
+                $latestSession = (clone $query)->whereNotNull('opname_no')->latest('id')->first();
+                if ($latestSession) {
+                    $query->where('opname_no', $latestSession->opname_no);
+                }
+            }
         }
 
         $list = $query->get()->keyBy('ingredient_id');
@@ -55,6 +77,26 @@ class OpnameController extends Controller
         }
 
         return response()->json($list);
+    }
+
+    /**
+     * Generate sequential opname number for a given date.
+     * e.g. OPN-20261025-0001, OPN-20261025-0002
+     */
+    protected function generateNextOpnameNo(string $opnameDate): string
+    {
+        $dateClean = str_replace('-', '', $opnameDate);
+        $prefix = 'OPN-' . $dateClean . '-';
+        $latest = Opname::where('opname_no', 'like', $prefix . '%')
+            ->orderByDesc('opname_no')
+            ->value('opname_no');
+
+        $nextSeq = 1;
+        if ($latest && preg_match('/-(\d+)$/', $latest, $m)) {
+            $nextSeq = ((int)$m[1]) + 1;
+        }
+
+        return $prefix . str_pad($nextSeq, 4, '0', STR_PAD_LEFT);
     }
 
     public function upsert(Request $request)
@@ -83,11 +125,15 @@ class OpnameController extends Controller
         }
         $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
-        $existing = Opname::where('period_from', $data['period_from'])
-            ->where('period_to', $data['period_to'])
-            ->where('ingredient_id', $data['ingredient_id'])
-            ->where('outlet_id', $outletId)
-            ->first();
+        $opnameNo = (!empty($data['opname_no']) && $data['opname_no'] !== 'NEW') ? $data['opname_no'] : null;
+
+        $existing = null;
+        if ($opnameNo) {
+            $existing = Opname::where('opname_no', $opnameNo)
+                ->where('ingredient_id', $data['ingredient_id'])
+                ->where('outlet_id', $outletId)
+                ->first();
+        }
 
         // 0. Stock opname tidak boleh dilakukan jika ada shift kasir yang masih terbuka
         $openShift = $this->getActiveShift($outletId);
@@ -121,9 +167,9 @@ class OpnameController extends Controller
         // 2. Tidak boleh tanggal mundur dari sesi opname yang telah di-release sebelumnya di cabang ini
         $latestReleased = Opname::where('outlet_id', $outletId)
             ->where('is_closed', true)
-            ->where(function ($q) use ($data) {
-                if (!empty($data['opname_no'])) {
-                    $q->where('opname_no', '!=', $data['opname_no']);
+            ->where(function ($q) use ($opnameNo) {
+                if (!empty($opnameNo)) {
+                    $q->where('opname_no', '!=', $opnameNo);
                 }
             })
             ->orderByDesc('opname_date')
@@ -161,21 +207,15 @@ class OpnameController extends Controller
             return response()->json($existing);
         }
 
-        $opnameNo = $data['opname_no'] ?? ($existing?->opname_no);
         if (!$opnameNo) {
-            $dateClean = str_replace('-', '', $opnameDate);
-            $countToday = Opname::whereDate('created_at', now()->toDateString())
-                ->whereNotNull('opname_no')
-                ->distinct('opname_no')
-                ->count('opname_no') + 1;
-            $opnameNo = 'OPN-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
+            $opnameNo = $this->generateNextOpnameNo($opnameDate);
         }
 
         $isClosed = ($isOwnerOrManager && (($data['action'] ?? '') === 'RELEASE' || !empty($data['is_closed'])));
 
         // Precompute theoretical snapshot values
         $reportCtrl = app(ReportController::class);
-        $varianceRows = $reportCtrl->buildVarianceArray($data['period_from'], $data['period_to'], (int)$outletId);
+        $varianceRows = $reportCtrl->buildVarianceArray($data['period_from'], $data['period_to'], (int)$outletId, $opnameNo);
         $var = collect($varianceRows)->firstWhere('ingredient.id', (int)$data['ingredient_id']);
 
         $actualQty = isset($data['actual_qty']) && $data['actual_qty'] !== null ? (float)$data['actual_qty'] : null;
@@ -230,8 +270,7 @@ class OpnameController extends Controller
 
         $opname = Opname::updateOrCreate(
             [
-                'period_from'   => $data['period_from'],
-                'period_to'     => $data['period_to'],
+                'opname_no'     => $opnameNo,
                 'ingredient_id' => $data['ingredient_id'],
                 'outlet_id'     => $outletId,
             ],
@@ -281,13 +320,6 @@ class OpnameController extends Controller
         $opnameDate = $request->opname_date ?: now()->toDateString();
         $today      = now()->toDateString();
 
-        // 1. Untuk sesi baru, tidak boleh tanggal mundur sebelum hari ini
-        if (!$request->filled('opname_no') && ($opnameDate < $today || $periodTo < $today)) {
-            return response()->json([
-                'message' => 'Tanggal pelaksanaan opname tidak boleh di-inputkan tanggal mundur (sebelum hari ini).'
-            ], 422);
-        }
-
         $user = $request->user();
         $businessId = $user ? $user->business_id : null;
         if ($user && ($user->isPegawai() || $user->isOwnerOutlet()) && $user->outlet_id) {
@@ -297,7 +329,7 @@ class OpnameController extends Controller
         }
         $isOwnerOrManager = $this->checkIsOwnerOrManager($user);
 
-        // 0. Stock opname tidak boleh dilakukan jika ada shift kasir yang masih terbuka
+        // 0. Stock opname tidak boleh dilakukan jika ada shift kasir yang masih terbuka di cabang ini
         $openShift = $this->getActiveShift($outletId);
         if ($openShift) {
             $shiftName = $openShift->shift_name ?: "Shift #{$openShift->id}";
@@ -313,11 +345,19 @@ class OpnameController extends Controller
             ], 422);
         }
 
+        // 1. Untuk sesi baru, tidak boleh tanggal mundur sebelum hari ini
+        $isNewSession = empty($request->opname_no) || $request->opname_no === 'NEW';
+        if ($isNewSession && ($opnameDate < $today || $periodTo < $today)) {
+            return response()->json([
+                'message' => 'Tanggal pelaksanaan opname tidak boleh di-inputkan tanggal mundur (sebelum hari ini).'
+            ], 422);
+        }
+
         // 2. Tidak boleh tanggal mundur dari sesi opname yang telah di-release sebelumnya di cabang ini
         $latestReleased = Opname::where('outlet_id', $outletId)
             ->where('is_closed', true)
             ->where(function ($q) use ($request) {
-                if ($request->filled('opname_no')) {
+                if ($request->filled('opname_no') && $request->opname_no !== 'NEW') {
                     $q->where('opname_no', '!=', $request->opname_no);
                 }
             })
@@ -325,7 +365,7 @@ class OpnameController extends Controller
             ->orderByDesc('period_to')
             ->first();
 
-        if ($latestReleased && !$request->filled('opname_no')) {
+        if ($latestReleased && $isNewSession) {
             $latestDate = $latestReleased->opname_date
                 ? (is_string($latestReleased->opname_date) ? $latestReleased->opname_date : $latestReleased->opname_date->toDateString())
                 : $latestReleased->period_to;
@@ -336,59 +376,44 @@ class OpnameController extends Controller
             }
         }
 
-        // Check if any item in this period & outlet already has a released/closed session
-        $existingSession = Opname::where('outlet_id', $outletId)
-            ->where(function ($q) use ($request, $periodFrom, $periodTo) {
-                if ($request->filled('opname_no')) {
-                    $q->where('opname_no', $request->opname_no);
-                } else {
-                    $q->where('period_from', $periodFrom)->where('period_to', $periodTo);
-                }
-            })
-            ->whereNotNull('opname_no')
-            ->first();
+        // Check if the specific opname session has already been closed/released
+        if ($request->filled('opname_no') && $request->opname_no !== 'NEW') {
+            $existingSession = Opname::where('outlet_id', $outletId)
+                ->where('opname_no', $request->opname_no)
+                ->first();
 
-        if ($existingSession && $existingSession->is_closed) {
-            return response()->json([
-                'message' => "Sesi Opname ({$existingSession->opname_no}) sudah di-release dan dikunci permanen. Dokumen tidak dapat diubah lagi."
-            ], 422);
+            if ($existingSession && $existingSession->is_closed) {
+                return response()->json([
+                    'message' => "Sesi Opname ({$existingSession->opname_no}) sudah di-release dan dikunci permanen. Dokumen tidak dapat diubah lagi."
+                ], 422);
+            }
         }
 
         // Determine if this opname session is RELEASED or DRAFT
         $isClosed = ($isOwnerOrManager && ($request->action === 'RELEASE' || $request->is_closed));
 
-        $opnameNo = $request->opname_no ?? ($existingSession?->opname_no);
-        if (!$opnameNo) {
-            $dateClean = str_replace('-', '', $opnameDate);
-            $countToday = Opname::whereDate('created_at', now()->toDateString())
-                ->whereNotNull('opname_no')
-                ->distinct('opname_no')
-                ->count('opname_no') + 1;
-            $opnameNo = 'OPN-' . $dateClean . '-' . str_pad($countToday, 4, '0', STR_PAD_LEFT);
-        }
+        $opnameNo = ($request->filled('opname_no') && $request->opname_no !== 'NEW')
+            ? $request->opname_no
+            : $this->generateNextOpnameNo($opnameDate);
 
-        // Precompute theoretical snapshot values
+        // Precompute theoretical snapshot values (passing $opnameNo so prior sessions on the same date are respected)
         $reportCtrl = app(ReportController::class);
-        $varianceRows = $reportCtrl->buildVarianceArray($periodFrom, $periodTo, (int)$outletId);
+        $varianceRows = $reportCtrl->buildVarianceArray($periodFrom, $periodTo, (int)$outletId, $opnameNo);
         $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
 
         $results = [];
         foreach ($request->items as $item) {
             $existing = Opname::where('ingredient_id', $item['ingredient_id'])
                 ->where('outlet_id', $outletId)
-                ->where(function ($q) use ($opnameNo, $periodFrom, $periodTo) {
-                    if ($opnameNo) {
-                        $q->where('opname_no', $opnameNo);
-                    } else {
-                        $q->where('period_from', $periodFrom)->where('period_to', $periodTo);
-                    }
-                })
+                ->where('opname_no', $opnameNo)
                 ->first();
 
             $actualQty = isset($item['actual_qty']) && $item['actual_qty'] !== null ? (float)$item['actual_qty'] : null;
             $hasActual = $actualQty !== null;
 
             $updateData = [
+                'period_from' => $periodFrom,
+                'period_to'   => $periodTo,
                 'opname_no'   => $opnameNo,
                 'opname_date' => $opnameDate,
                 'actual_qty'  => $actualQty,
@@ -441,8 +466,7 @@ class OpnameController extends Controller
 
             $opname = Opname::updateOrCreate(
                 [
-                    'period_from'   => $periodFrom,
-                    'period_to'     => $periodTo,
+                    'opname_no'     => $opnameNo,
                     'ingredient_id' => $item['ingredient_id'],
                     'outlet_id'     => $outletId,
                 ],
@@ -536,7 +560,7 @@ class OpnameController extends Controller
 
             if (!$hasExistingSnapshot) {
                 if ($varByIng === null) {
-                    $varianceRows = $reportCtrl->buildVarianceArray($firstOpn->period_from, $firstOpn->period_to, (int)$firstOpn->outlet_id);
+                    $varianceRows = $reportCtrl->buildVarianceArray($firstOpn->period_from, $firstOpn->period_to, (int)$firstOpn->outlet_id, $opnameNo);
                     $varByIng = collect($varianceRows)->keyBy(fn($r) => $r['ingredient']->id);
                 }
                 $var = $varByIng->get($opn->ingredient_id);
@@ -725,6 +749,13 @@ class OpnameController extends Controller
 
         if ($outletId && $outletId !== 'ALL' && $outletId !== 'all') {
             $query->where('outlet_id', $outletId);
+        }
+
+        if ($request->filled('date')) {
+            $query->where(function ($q) use ($request) {
+                $q->where('opname_date', $request->date)
+                  ->orWhere(fn($sq) => $sq->whereNull('opname_date')->where('period_to', $request->date));
+            });
         }
 
         $allOpnames = $query->get();

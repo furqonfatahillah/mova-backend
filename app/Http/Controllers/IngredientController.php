@@ -28,8 +28,15 @@ class IngredientController extends Controller
         $query = Ingredient::with(['creator', 'updater', 'prepRecipe.items.ingredient', 'outletIngredients', 'categoryModel'])
             ->orderBy('code');
 
-        if ($request->filled('type') && in_array($request->type, ['RAW', 'SEMI_FINISHED'])) {
-            $query->where('type', $request->type);
+        if ($request->filled('type')) {
+            $reqType = strtoupper(trim((string)$request->type));
+            if ($reqType === 'BAHAN') {
+                $query->whereIn('type', ['RAW', 'SEMI_FINISHED']);
+            } elseif ($reqType === 'PERLENGKAPAN' || $reqType === 'PACKAGING') {
+                $query->whereIn('type', ['PERLENGKAPAN', 'PACKAGING']);
+            } elseif (in_array($reqType, ['RAW', 'SEMI_FINISHED', 'PERLENGKAPAN', 'PACKAGING'])) {
+                $query->where('type', $reqType);
+            }
         }
 
         if ($request->filled('category')) {
@@ -103,7 +110,7 @@ class IngredientController extends Controller
             'name'        => 'required|string|max:255',
             'category'    => 'nullable|string|max:100',
             'category_id' => 'nullable|integer',
-            'type'        => 'nullable|string|in:RAW,SEMI_FINISHED',
+            'type'        => 'nullable|string|in:RAW,SEMI_FINISHED,PERLENGKAPAN,PACKAGING',
             'unit_beli'   => 'required|string|max:20',
             'unit_pakai'  => 'required|string|max:20',
             'konversi'    => 'required|numeric|min:0.001',
@@ -273,7 +280,7 @@ class IngredientController extends Controller
             'name'        => 'sometimes|string|max:255',
             'category'    => 'sometimes|string|max:100',
             'category_id' => 'nullable|integer',
-            'type'        => 'nullable|string|in:RAW,SEMI_FINISHED',
+            'type'        => 'nullable|string|in:RAW,SEMI_FINISHED,PERLENGKAPAN,PACKAGING',
             'unit_beli'   => 'sometimes|string|max:20',
             'unit_pakai'  => 'sometimes|string|max:20',
             'konversi'    => 'sometimes|numeric|min:0.001',
@@ -773,15 +780,22 @@ class IngredientController extends Controller
                     $code = !empty($row['code']) ? trim($row['code']) : null;
                     $name = trim($row['name']);
 
-                    // If user didn't specify a code, auto-generate next safe code for this business without collision
+                    // If user didn't specify a code, check if ingredient with same name already exists in this business
                     if (empty($code)) {
-                        $seq = Ingredient::where('business_id', $businessId)->count() + 1;
-                        do {
-                            $candidateCode = 'BHN-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                            $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
-                            $seq++;
-                        } while ($exists);
-                        $code = $candidateCode;
+                        $existingByName = Ingredient::where('business_id', $businessId)
+                            ->whereRaw('LOWER(name) = ?', [strtolower($name)])
+                            ->first();
+                        if ($existingByName) {
+                            $code = $existingByName->code;
+                        } else {
+                            $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                            do {
+                                $candidateCode = 'BHN-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                                $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                                $seq++;
+                            } while ($exists);
+                            $code = $candidateCode;
+                        }
                     }
 
                     $categoryName = !empty($row['category']) ? trim($row['category']) : 'BAHAN_BAKU';
@@ -839,6 +853,15 @@ class IngredientController extends Controller
                         } catch (\Throwable $e) {}
                     }
 
+                    // Determine strict item type: SEMI_FINISHED, PERLENGKAPAN, or default RAW
+                    $rawType = strtoupper(trim((string)($row['type'] ?? $row['tipe'] ?? 'RAW')));
+                    $itemType = 'RAW';
+                    if (str_contains($rawType, 'SEMI')) {
+                        $itemType = 'SEMI_FINISHED';
+                    } elseif (in_array($rawType, ['PERLENGKAPAN', 'PACKAGING'])) {
+                        $itemType = 'PERLENGKAPAN';
+                    }
+
                     // Match strictly by (business_id, code) so custom codes are honored per business
                     $existingIng = Ingredient::where('business_id', $businessId)->where('code', $code)->first();
 
@@ -846,7 +869,7 @@ class IngredientController extends Controller
                         'name'                => $name,
                         'category_id'         => $cat->id,
                         'category'            => $cat->name,
-                        'type'                => !empty($row['type']) ? strtoupper($row['type']) : 'RAW',
+                        'type'                => $itemType,
                         'unit_beli'           => substr($unitBeliInfo['symbol'], 0, 20),
                         'unit_pakai'          => substr($unitPakaiInfo['symbol'], 0, 20),
                         'unit_beli_id'        => $unitBeliInfo['id'],
@@ -912,21 +935,38 @@ class IngredientController extends Controller
                         }
                         $outletRow->save();
 
-                        // Table 2: Dedicated Saldo Awal
-                        \App\Models\IngredientInitialBalance::updateOrCreate(
-                            [
-                                'outlet_id'     => $bo->id,
-                                'ingredient_id' => $ing->id,
-                            ],
-                            [
-                                'business_id'        => $businessId,
-                                'stok_awal'          => $rowStokAwal,
-                                'saldo_awal_nominal' => $rowNominal,
-                                'tanggal_saldo_awal' => $effectiveDate,
-                                'created_by'         => $user?->id,
-                                'updated_by'         => $user?->id,
-                            ]
-                        );
+                        // Table 2: Dedicated Saldo Awal (Cegah penimpaan saldo awal yang sudah ada jika stok awal tidak diisi)
+                        if ($initialStock > 0) {
+                            \App\Models\IngredientInitialBalance::updateOrCreate(
+                                [
+                                    'outlet_id'     => $bo->id,
+                                    'ingredient_id' => $ing->id,
+                                ],
+                                [
+                                    'business_id'        => $businessId,
+                                    'stok_awal'          => $rowStokAwal,
+                                    'saldo_awal_nominal' => $rowNominal,
+                                    'tanggal_saldo_awal' => $effectiveDate,
+                                    'created_by'         => $user?->id,
+                                    'updated_by'         => $user?->id,
+                                ]
+                            );
+                        } else {
+                            \App\Models\IngredientInitialBalance::firstOrCreate(
+                                [
+                                    'outlet_id'     => $bo->id,
+                                    'ingredient_id' => $ing->id,
+                                ],
+                                [
+                                    'business_id'        => $businessId,
+                                    'stok_awal'          => 0.0,
+                                    'saldo_awal_nominal' => 0.0,
+                                    'tanggal_saldo_awal' => $effectiveDate,
+                                    'created_by'         => $user?->id,
+                                    'updated_by'         => $user?->id,
+                                ]
+                            );
+                        }
                     }
 
                     $importedCount++;
@@ -998,15 +1038,22 @@ class IngredientController extends Controller
 
                     $code = !empty($row['code']) ? trim($row['code']) : null;
 
-                    // If user didn't specify a code, auto-generate next safe code for this business without collision
+                    // If user didn't specify a code, check if item with same name already exists in this business
                     if (empty($code)) {
-                        $seq = Ingredient::where('business_id', $businessId)->count() + 1;
-                        do {
-                            $candidateCode = 'PLK-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
-                            $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
-                            $seq++;
-                        } while ($exists);
-                        $code = $candidateCode;
+                        $existingByName = Ingredient::where('business_id', $businessId)
+                            ->whereRaw('LOWER(name) = ?', [strtolower($name)])
+                            ->first();
+                        if ($existingByName) {
+                            $code = $existingByName->code;
+                        } else {
+                            $seq = Ingredient::where('business_id', $businessId)->count() + 1;
+                            do {
+                                $candidateCode = 'PLK-' . str_pad($seq, 3, '0', STR_PAD_LEFT);
+                                $exists = Ingredient::where('business_id', $businessId)->where('code', $candidateCode)->exists();
+                                $seq++;
+                            } while ($exists);
+                            $code = $candidateCode;
+                        }
                     }
 
                     $categoryName = !empty($row['category']) ? trim($row['category']) : 'Perlengkapan';
@@ -1069,7 +1116,7 @@ class IngredientController extends Controller
                         'name'                => $name,
                         'category_id'         => $cat->id,
                         'category'            => $cat->name,
-                        'type'                => 'RAW',
+                        'type'                => 'PERLENGKAPAN',
                         'unit_beli'           => substr($unitBeliInfo['symbol'], 0, 20),
                         'unit_pakai'          => substr($unitPakaiInfo['symbol'], 0, 20),
                         'unit_beli_id'        => $unitBeliInfo['id'],
@@ -1135,21 +1182,38 @@ class IngredientController extends Controller
                         }
                         $outletRow->save();
 
-                        // Table 2: Dedicated Saldo Awal
-                        \App\Models\IngredientInitialBalance::updateOrCreate(
-                            [
-                                'outlet_id'     => $bo->id,
-                                'ingredient_id' => $ing->id,
-                            ],
-                            [
-                                'business_id'        => $businessId,
-                                'stok_awal'          => $rowStokAwal,
-                                'saldo_awal_nominal' => $rowNominal,
-                                'tanggal_saldo_awal' => $effectiveDate,
-                                'created_by'         => $user?->id,
-                                'updated_by'         => $user?->id,
-                            ]
-                        );
+                        // Table 2: Dedicated Saldo Awal (Cegah penimpaan saldo awal yang sudah ada jika stok awal tidak diisi)
+                        if ($initialStock > 0) {
+                            \App\Models\IngredientInitialBalance::updateOrCreate(
+                                [
+                                    'outlet_id'     => $bo->id,
+                                    'ingredient_id' => $ing->id,
+                                ],
+                                [
+                                    'business_id'        => $businessId,
+                                    'stok_awal'          => $rowStokAwal,
+                                    'saldo_awal_nominal' => $rowNominal,
+                                    'tanggal_saldo_awal' => $effectiveDate,
+                                    'created_by'         => $user?->id,
+                                    'updated_by'         => $user?->id,
+                                ]
+                            );
+                        } else {
+                            \App\Models\IngredientInitialBalance::firstOrCreate(
+                                [
+                                    'outlet_id'     => $bo->id,
+                                    'ingredient_id' => $ing->id,
+                                ],
+                                [
+                                    'business_id'        => $businessId,
+                                    'stok_awal'          => 0.0,
+                                    'saldo_awal_nominal' => 0.0,
+                                    'tanggal_saldo_awal' => $effectiveDate,
+                                    'created_by'         => $user?->id,
+                                    'updated_by'         => $user?->id,
+                                ]
+                            );
+                        }
                     }
 
                     $importedCount++;
